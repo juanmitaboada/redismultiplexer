@@ -1,0 +1,17 @@
+[package]
+name = "redismultiplexer"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+redis = { version = "0.19.0", features = ["tls", "r2d2"] }
+rand = "0.8.1"
+chrono = "*"
+serde = { version = "1.0", features = ["derive"] }
+serde_yaml = "0.8"
+thread_tryjoin = "*"
+ctrlc = "*"
+dict = "*"
+regex = "*"
