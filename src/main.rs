@@ -21,6 +21,7 @@ use serde::{Serialize, Deserialize};
 use std::sync::mpsc::{Sender, Receiver};
 use std::sync::mpsc;
 use regex::Regex;
+use sorted_list::SortedList;
 
 // use std::env;
 use std::fs;
@@ -94,8 +95,9 @@ struct Config {
     filter_until: Option<String>,
     filter_limit: Option<usize>,
     filter_replace: Option<String>,
-    ordering_buffer_time: Option<u8>,
-    ordering_limit: Option<u64>,
+    ordering: Option<String>,
+    ordering_buffer_time: Option<u64>,
+    ordering_limit: Option<usize>,
     ordering_prets: Option<String>,
     ordering_posts: Option<String>,
     clients: Vec<ClientConfig>,
@@ -117,6 +119,7 @@ impl Clone for Config {
             filter_until: self.filter_until.clone(),
             filter_limit: self.filter_limit,
             filter_replace: self.filter_replace.clone(),
+            ordering: self.ordering.clone(),
             ordering_buffer_time: self.ordering_buffer_time,
             ordering_limit: self.ordering_limit,
             ordering_prets: self.ordering_prets.clone(),
@@ -431,35 +434,39 @@ fn verify_config(config: Config) -> Result<Config, String> {
     // If some config is set, all must be set
     let mut configured = 0;
 
+    // Ordering Regex
+    match &source.ordering {
+        None => (),
+        Some(v) => configured += (v.len() > 0) as i8,
+    }
+
     // Ordering Buffer Time
     match source.ordering_buffer_time {
         None => (),
-        Some(0) => (),
-        _ => configured += 1,
+        Some(v) => configured += (v > 0) as i8,
     }
 
     // Ordering Limit
     match source.ordering_limit {
         None => (),
-        Some(0) => (),
-        _ => configured += 1,
+        Some(v) => configured += (v > 0) as i8,
     }
 
     // Ordering Pre TS
     match &source.ordering_prets {
         None => (),
-        Some(v) => configured += (v.len() > 0) as i8,
+        Some(_) => configured += 1,
     }
 
     // Ordering Post TS
     match &source.ordering_posts {
         None => (),
-        Some(v) => configured += (v.len() > 0) as i8,
+        Some(_) => configured += 1,
     }
 
     // Show error if any
     if (configured>0) && (configured<4) {
-        return Err(format!("Source '{}' is using ordering, so you must set all ordering configuration: ordering_buffer_time (bigger than 0), ordering_limit (bigger than 0), ordering_prets (not empty) and ordering_posts (not empty)", source.name));
+        return Err(format!("Source '{}' is using ordering, so you must set all ordering configuration: ordering (not empty), ordering_buffer_time (bigger than 0), ordering_limit (bigger than 0), ordering_prets and ordering_posts", source.name));
     }
 
     // Verify there are clients
@@ -603,15 +610,29 @@ fn child(id: u16, tx: Sender<Statistics>, rx: Receiver<i8>, config: Config, debu
         print_debug!(PROGRAM_NAME, stdout(), COLOR_BLUE, 0, "Child {}: Starts", id);
     }
 
-    // Render main regex
-    let source_regex: Option<Regex>;
+    // Render main filter regex
+    let filter_regex: Option<Regex>;
     let regex_str: &str;
     if let Some(r) = config.filter.clone() {
         regex_str = &r;
-        source_regex = Some(Regex::new(&regex_str).unwrap());
+        filter_regex = Some(Regex::new(&regex_str).unwrap());
     } else {
-        source_regex = None;
+        filter_regex = None;
     }
+
+    // Render main ordering regex
+    let ordering_regex: Option<Regex>;
+    let regex_str: &str;
+    if let Some(r) = config.ordering.clone() {
+        regex_str = &r;
+        ordering_regex = Some(Regex::new(&regex_str).unwrap());
+    } else {
+        ordering_regex = None;
+    }
+
+
+    // Prepare sorted list
+    let mut ordered_packages : SortedList<u128, (u64, String)> = SortedList::new();
 
     // Prepare the retention data
     let mut keepworking = true;
@@ -697,6 +718,7 @@ fn child(id: u16, tx: Sender<Statistics>, rx: Receiver<i8>, config: Config, debu
                         let item: redis::RedisResult<redis::Value> = source.blpop(config.channel.clone(), 1);
                         match &item {
                             Ok(redis::Value::Nil) => {
+                                // Refresh clients status
                                 // {println!("Nil")},
                                 for client in clients.iter_mut() {
                                     match can_send(id, client, &mut deleted, debug) {
@@ -709,16 +731,19 @@ fn child(id: u16, tx: Sender<Statistics>, rx: Receiver<i8>, config: Config, debu
                                 }
                             },
                             Ok(redis::Value::Int(_)) => {
+                                // Wrong value
                                 // println!("Int(i64)");
                                 print_debug!(PROGRAM_NAME, stderr(), COLOR_RED, 0, "Error while reading from Redis Server '{}:{}': not a queue!", config.hostname, config.port);
                                 error=true;
                             },
                             Ok(redis::Value::Data(_)) => {
+                                // Wrong value
                                 // println!("Data(Vec<u8>)");
                                 print_debug!(PROGRAM_NAME, stderr(), COLOR_RED, 0, "Error while reading from Redis Server '{}:{}': not a queue!", config.hostname, config.port);
                                 error=true;
                             },
                             Ok(redis::Value::Bulk(data)) => {
+                                // This is the expected data
                                 // println!("Bulk(Vec<Value>)");
 
                                 // Send to all clients
@@ -727,97 +752,107 @@ fn child(id: u16, tx: Sender<Statistics>, rx: Receiver<i8>, config: Config, debu
                                 // Decode package
                                 if let redis::Value::Data(val) = &data[1] {
                                     match from_utf8(val) {
-                                        Ok(dirty_bdata) => {
+                                        Ok(raw_bdata) => {
 
-                                            // Ready to send data
-                                            let total_clients = clients.len();
-                                            let mut errors = 0;
+                                            match match_ordering(ordering_regex.clone(), config.ordering_buffer_time, config.ordering_limit, config.ordering_prets.clone(), config.ordering_posts.clone(), raw_bdata.to_string(), &mut ordered_packages) {
+                                                Ok(list) => {
 
-                                            match match_filter(source_regex.clone(), config.filter_until.clone(), config.filter_limit, config.filter_replace.clone(), dirty_bdata.to_string()) {
-                                                MatchAnswer::Ok(_) => errors = total_clients,
-                                                MatchAnswer::Box(bdata) => {
+                                                    for package in list {
 
-                                                    if config.mode == "replicant" {
+                                                        // Ready to send data
+                                                        let total_clients = clients.len();
+                                                        let mut errors = 0;
 
-                                                        // Send data to all clients
-                                                        for client in clients.iter_mut() {
+                                                        match match_filter(filter_regex.clone(), config.filter_until.clone(), config.filter_limit, config.filter_replace.clone(), package.to_string()) {
+                                                            MatchAnswer::Ok(_) => errors = total_clients,
+                                                            MatchAnswer::Box(bdata) => {
 
-                                                            // If we can send to this queu
-                                                            match send(id, client, &bdata, &mut deleted, debug) {
+                                                                if config.mode == "replicant" {
 
-                                                                // Data sent
-                                                                Ok(true) => (),
+                                                                    // Send data to all clients
+                                                                    for client in clients.iter_mut() {
 
-                                                                // Not sent
-                                                                Ok(false) => {
-                                                                    errors += 1;
-                                                                },
+                                                                        // If we can send to this queu
+                                                                        match send(id, client, &bdata, &mut deleted, debug) {
 
-                                                                // There was an error
-                                                                Err(e) => {
-                                                                    // There was an error
-                                                                    print_debug!(PROGRAM_NAME, stderr(), COLOR_RED, 0, "Error while sending to '{}:{}@{}': {}", config.hostname, config.port, config.channel, e);
-                                                                    errors += 1;
-                                                                },
-                                                            }
+                                                                            // Data sent
+                                                                            Ok(true) => (),
+
+                                                                            // Not sent
+                                                                            Ok(false) => {
+                                                                                errors += 1;
+                                                                            },
+
+                                                                            // There was an error
+                                                                            Err(e) => {
+                                                                                // There was an error
+                                                                                print_debug!(PROGRAM_NAME, stderr(), COLOR_RED, 0, "Error while sending to '{}:{}@{}': {}", config.hostname, config.port, config.channel, e);
+                                                                                errors += 1;
+                                                                            },
+                                                                        }
+                                                                    }
+
+                                                                } else {
+
+                                                                    // Send data to next client
+                                                                    let mut done = false;
+
+                                                                    // We will go throught all clients until data is
+                                                                    // sent or all clients have failed
+                                                                    while (!done) && (errors < total_clients) {
+
+                                                                        // Try to send to this client
+                                                                        let client = &mut clients[0];
+
+                                                                        // If we can send to this queu
+                                                                        match send(id, client, &bdata, &mut deleted, debug) {
+
+                                                                            // Data sent
+                                                                            Ok(true) => done = true,
+
+                                                                            // Not sent
+                                                                            Ok(false) => {
+                                                                                errors += 1;
+                                                                            },
+
+                                                                            // There was an error
+                                                                            Err(e) => {
+                                                                                // There was an error
+                                                                                print_debug!(PROGRAM_NAME, stderr(), COLOR_RED, 0, "Error while sending to '{}:{}@{}': {}", config.hostname, config.port, config.channel, e);
+                                                                                errors += 1;
+                                                                            },
+                                                                        }
+
+                                                                        // Rotate
+                                                                        if total_clients > 1 {
+                                                                            for i in 0..(total_clients-1) {
+                                                                                clients.swap(i, i+1);
+                                                                            }
+                                                                        }
+
+                                                                        // Leave if we are done
+                                                                        if done {
+                                                                            break;
+                                                                        }
+                                                                    }
+                                                                }
+                                                            },
+                                                            MatchAnswer::Err(e) => print_debug!(PROGRAM_NAME, stderr(), COLOR_RED, 0, "{}: Couldn't match the package: {}", id, e),
                                                         }
 
-                                                    } else {
-
-                                                        // Send data to next client
-                                                        let mut done = false;
-
-                                                        // We will go throught all clients until data is
-                                                        // sent or all clients have failed
-                                                        while (!done) && (errors < total_clients) {
-
-                                                            // Try to send to this client
-                                                            let client = &mut clients[0];
-
-                                                            // If we can send to this queu
-                                                            match send(id, client, &bdata, &mut deleted, debug) {
-
-                                                                // Data sent
-                                                                Ok(true) => done = true,
-
-                                                                // Not sent
-                                                                Ok(false) => {
-                                                                    errors += 1;
-                                                                },
-
-                                                                // There was an error
-                                                                Err(e) => {
-                                                                    // There was an error
-                                                                    print_debug!(PROGRAM_NAME, stderr(), COLOR_RED, 0, "Error while sending to '{}:{}@{}': {}", config.hostname, config.port, config.channel, e);
-                                                                    errors += 1;
-                                                                },
-                                                            }
-
-                                                            // Rotate
-                                                            if total_clients > 1 {
-                                                                for i in 0..(total_clients-1) {
-                                                                    clients.swap(i, i+1);
-                                                                }
-                                                            }
-
-                                                            // Leave if we are done
-                                                            if done {
-                                                                break;
-                                                            }
+                                                        // If all clients have failed, drop the package and set error
+                                                        if errors == total_clients {
+                                                            // No sent at all
+                                                            dropped += 1;
+                                                        } else {
+                                                            // The package was sent at least to 1 node
+                                                            outgoing += 1;
                                                         }
                                                     }
                                                 },
-                                                MatchAnswer::Err(e) => print_debug!(PROGRAM_NAME, stderr(), COLOR_RED, 0, "{}: Couldn't match the package: {}", id, e),
+                                                Err(String) => (),
                                             }
 
-                                            // If all clients have failed, drop the package and set error
-                                            if errors == total_clients {
-                                                // No sent at all
-                                                dropped += 1;
-                                            } else {
-                                                // The package was sent at least to 1 node
-                                                outgoing += 1;
-                                            }
                                         },
                                         Err(e) => {
                                             print_debug!(PROGRAM_NAME, stderr(), COLOR_RED, 0, "Couldn't decode to UTF8: {}", e);
@@ -828,16 +863,19 @@ fn child(id: u16, tx: Sender<Statistics>, rx: Receiver<i8>, config: Config, debu
 
                             },
                             Ok(redis::Value::Status(_)) => {
+                                // Wrong value
                                 // println!("Status(String)");
                                 print_debug!(PROGRAM_NAME, stderr(), COLOR_RED, 0, "Error while reading from Redis Server '{}:{}': not a queue!", config.hostname, config.port);
                                 error=true;
                             },
                             Ok(redis::Value::Okay) => {
+                                // Wrong value
                                 // println!("Okay")
                                 print_debug!(PROGRAM_NAME, stderr(), COLOR_RED, 0, "Error while reading from Redis Server '{}:{}': not a queue!", config.hostname, config.port);
                                 error = true;
                             },
                             Err(e) => {
+                                // There was an error
                                 print_debug!(PROGRAM_NAME, stderr(), COLOR_RED, 0, "Error while reading from Redis Server '{}:{}': {}", config.hostname, config.port, e);
                                 error = true;
                             },
@@ -1168,4 +1206,63 @@ fn match_filter(regex: Option<Regex>, until: Option<String>, limit: Option<usize
         return MatchAnswer::Box(bdata);
 
     }
+}
+
+fn match_ordering(regex: Option<Regex>, time: Option<u64>, limit: Option<usize>, pretts: Option<String>, postts: Option<String>, bdata: String, buffer: &mut SortedList<u128, (u64, String)>) -> Result<Vec<String>, String> {
+
+    let mut list : Vec<String> = Vec::new();
+
+    // Attach all packages from the buffer that should be sent already
+
+
+    // Process regex
+    if let Some(re) = regex {
+
+        // Find by limit
+        let haystack: &str;
+        if let Some(l) = limit {
+            if l > 0 {
+                haystack = &bdata[..cmp::min(l, bdata.len())];
+            } else {
+                haystack = &bdata;
+            }
+        } else {
+            haystack = &bdata;
+        }
+
+        // Check if they match
+        if re.is_match(haystack) {
+
+            if let Some(r) = pretts {
+                let replaced = re.replace(haystack, r);
+                let newbdata = format!("{}{}", replaced, &bdata[haystack.len()..]);
+            }
+
+            // Post TS
+            if let Some(r) = postts {
+                let replaced = re.replace(haystack, r);
+                let newbdata = format!("{}{}", replaced, &bdata[haystack.len()..]);
+            }
+
+            // Parse to u128
+            let ts: u128 = 0;
+
+            // Insert package into the buffer
+            buffer.insert(ts, (get_current_time(), "b".to_string()));
+
+        } else {
+
+            // No TS information, jut send it
+            list.push(bdata);
+
+        }
+
+    } else {
+        // No filter available, just send it
+        list.push(bdata);
+    }
+
+    // Return the list back
+    return Ok(list);
+
 }
