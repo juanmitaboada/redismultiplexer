@@ -13,6 +13,7 @@
 // use std::mem;
 use std::thread;
 use std::cmp;
+use std::{cmp::Reverse, collections::BinaryHeap};
 use std::str::from_utf8;
 use thread_tryjoin::TryJoinHandle;
 use std::time::Duration;
@@ -21,7 +22,6 @@ use serde::{Serialize, Deserialize};
 use std::sync::mpsc::{Sender, Receiver};
 use std::sync::mpsc;
 use regex::Regex;
-use sorted_list::SortedList;
 
 // use std::env;
 use std::fs;
@@ -98,8 +98,6 @@ struct Config {
     ordering: Option<String>,
     ordering_buffer_time: Option<u64>,
     ordering_limit: Option<usize>,
-    ordering_prets: Option<String>,
-    ordering_posts: Option<String>,
     clients: Vec<ClientConfig>,
 }
 
@@ -122,8 +120,6 @@ impl Clone for Config {
             ordering: self.ordering.clone(),
             ordering_buffer_time: self.ordering_buffer_time,
             ordering_limit: self.ordering_limit,
-            ordering_prets: self.ordering_prets.clone(),
-            ordering_posts: self.ordering_posts.clone(),
             clients: self.clients.clone(),
         }
     }
@@ -139,6 +135,7 @@ struct RedisLink {
     regex: Option<Regex>,
 }
 
+#[allow(dead_code)]
 enum MatchAnswer {
     Ok(bool),
     Box(String),
@@ -184,193 +181,320 @@ fn main() {
         // Check if we can keep working
         if let Some(inconfig) = config {
 
-            // Set handler
-            let (keepworking_tx, keepworking_rx): (Sender<i8>, Receiver<i8>) = mpsc::channel();
-            ctrlc::set_handler(move || {
-                print_debug!(PROGRAM_NAME, stdout(), COLOR_GREEN, 0, "User requested to exit!");
-                keepworking_tx.send(1).unwrap();
-            }).expect("Error setting Ctrl-C handler");
+            let mut error = false;
 
-            // Let communicate with children to end
-            let (children_tx, children_rx): (Sender<Statistics>, Receiver<Statistics>) = mpsc::channel();
-
-            // Spawn a number of threads and collect their join handles
-            let mut id = 1;
-            let mut handles: Vec<thread::JoinHandle<_>> = Vec::new();
-            let mut channels: Vec<Sender<i8>> = Vec::new();
-            for _ in 0..inconfig.children {
-
-                // Get channel for the child
-                let (tx, rx): (Sender<i8>, Receiver<i8>) = mpsc::channel();
-                // Remember the channel so we can talk later with the child
-                channels.push(tx);
-
-                // Clone config and execute thread
-                let tx = children_tx.clone();
-                let child_config = inconfig.clone();
-                let handle = thread::spawn(move || {
-                    child(id, tx, rx, child_config, debug);
-                });
-                handles.push(handle);
-
-                id += 1;
-
-                // Do not rush
-                thread::sleep(Duration::from_millis(1));
+            // Render main filter regex
+            let filter_regex: Option<Regex>;
+            let regex_str: &str;
+            if let Some(r) = inconfig.filter.clone() {
+                regex_str = &r;
+                let filter_temp = Regex::new(&regex_str);
+                match filter_temp {
+                    Ok(f) => filter_regex = Some(f),
+                    Err(e) => {
+                        print_debug!(PROGRAM_NAME, stderr(), COLOR_RED, 0, "Filter Regex '{}' doesn't compile: {}", r, e);
+                        filter_regex = None;
+                        error = true;
+                    },
+                }
+            } else {
+                filter_regex = None;
             }
 
-            // Show configuration
-            print_debug!(PROGRAM_NAME, stdout(), COLOR_WHITE, 0, "> {}:{} @ {} [{}, {} children]", inconfig.hostname, inconfig.port, inconfig.channel, inconfig.mode, inconfig.children);
-            for client in &inconfig.clients {
-                print_debug!(PROGRAM_NAME, stdout(), COLOR_WHITE, 0, "  - {}:{} @ {}  [timelimit={}, checklimit={}, softlimit={}, hardlimit={}]", client.hostname, client.port, client.channel, option2string!(client.timelimit), option2string!(client.checklimit), option2string!(client.softlimit), option2string!(client.hardlimit));
+            // Render main ordering regex
+            let ordering_regex: Option<Regex>;
+            let regex_str: &str;
+            if let Some(r) = inconfig.ordering.clone() {
+                regex_str = &r;
+                let filter_temp = Regex::new(&regex_str);
+                match filter_temp {
+                    Ok(f) => ordering_regex = Some(f),
+                    Err(e) => {
+                        print_debug!(PROGRAM_NAME, stderr(), COLOR_RED, 0, "Ordering Regex '{}' doesn't compile: {}", r, e);
+                        ordering_regex = None;
+                        error = true;
+                    },
+                }
+            } else {
+                ordering_regex = None;
             }
 
-            // Create dictionary of stuck clients
-            let mut stucked = Dict::<(String, bool)>::new();
-            for client in inconfig.clients {
-                stucked.add(client.name, (client.channel, false));
-            }
+            if !error {
 
-            // Keep working while all children keep working
-            let mut lasttime = get_current_time_with_ms();
-            let mut incoming: u64 = 0;
-            let mut outgoing: u64 = 0;
-            let mut dropped: u64 = 0;
-            let mut deleted: u64 = 0;
-            let mut working = inconfig.children;
-            while working>0 {
+                // Set handler
+                let (keepworking_tx, keepworking_rx): (Sender<bool>, Receiver<bool>) = mpsc::channel();
+                ctrlc::set_handler(move || {
+                    print_debug!(PROGRAM_NAME, stdout(), COLOR_GREEN, 0, "User requested to exit!");
+                    keepworking_tx.send(false).unwrap();
+                }).expect("Error setting Ctrl-C handler");
 
-                // Check how many chidren we should have
-                working = inconfig.children;
+                // Let communicate with children to end
+                let (queue_tx, queue_rx): (Sender<(u16, Option<String>)>, Receiver<(u16, Option<String>)>) = mpsc::channel();
+                let (queue_working_tx, queue_working_rx): (Sender<bool>, Receiver<bool>) = mpsc::channel();
+                let (children_tx, children_rx): (Sender<Statistics>, Receiver<Statistics>) = mpsc::channel();
+                let mut keepworkings: Vec<Sender<bool>> = Vec::new();
+                let mut queues_channels: Vec<Sender<Vec<String>>> = Vec::new();
+                let mut children_channels: Vec<(Receiver<Vec<String>>, Receiver<bool>)> = Vec::new();
+                for _ in 0..inconfig.children {
 
-                // Check how many of them have stopped
-                for h in &handles {
-                    match h.try_timed_join(Duration::from_millis(1)) {
-                        Ok(_) => working -= 1,
-                        Err(_) => (),
-                    }
+                    // Create queue channels for every child
+                    let (qtx, qrx): (Sender<Vec<String>>, Receiver<Vec<String>>) = mpsc::channel();
+
+                    // Create channels for every child
+                    let (tx, rx): (Sender<bool>, Receiver<bool>) = mpsc::channel();
+
+                    // Save channel information
+                    children_channels.push((qrx, rx));
+
+                    // Remember the channel so we can talk later with the child
+                    queues_channels.push(qtx);
+                    keepworkings.push(tx);
                 }
 
-                // If somebody working, show up
-                if working<inconfig.children {
+                // Prepare list of handles
+                let mut handles: Vec<thread::JoinHandle<_>> = Vec::new();
+                let (queuer_stat_tx, queuer_stat_rx): (Sender<usize>, Receiver<usize>) = mpsc::channel();
 
-                    // Some child already died, show message and leave
-                    print_debug!(PROGRAM_NAME, stdout(), COLOR_YELLOW, 0, "Children {}/{}, some child closed, closing everything!", working, inconfig.children);
-                    break;
-                } else {
+                // Spawn a queue manage
+                let queue_config = inconfig.clone();
+                let queue_handler = thread::spawn(move || {
+                    queuer(ordering_regex, queue_config.clone(), queue_working_rx, queue_rx, queues_channels, queuer_stat_tx, debug)
+                });
 
-                    // Check if there is some message for us (from CTRL+C)
-                    let result_incoming = keepworking_rx.try_recv();
-                    match result_incoming {
-                        Ok(v) => {
-                            if v==1 {
-                                working = 0;
+                // Spawn a number of threads and collect their join handles
+                for id in 0..inconfig.children {
+
+                    // Get channel for the child
+                    let (qrx, rx) = children_channels.pop().unwrap();
+
+                    // Clone config and execute thread
+                    let tx = children_tx.clone();
+                    let qtx = queue_tx.clone();
+                    let child_config = inconfig.clone();
+                    let fr = filter_regex.clone();
+                    let handle = thread::spawn(move || {
+                        child(id, tx, rx, qtx, qrx, child_config, fr, debug);
+                    });
+                    handles.push(handle);
+
+                    // Do not rush
+                    thread::sleep(Duration::from_millis(1));
+                }
+
+                // Show configuration
+                print_debug!(PROGRAM_NAME, stdout(), COLOR_CYAN, 0, "> {}:{} @ {} [{}, {} children]", inconfig.hostname, inconfig.port, inconfig.channel, inconfig.mode, inconfig.children);
+                for client in &inconfig.clients {
+                    print_debug!(PROGRAM_NAME, stdout(), COLOR_CYAN, 0, "  - {}:{} @ {}  [timelimit={}, checklimit={}, softlimit={}, hardlimit={}]", client.hostname, client.port, client.channel, option2string!(client.timelimit), option2string!(client.checklimit), option2string!(client.softlimit), option2string!(client.hardlimit));
+                }
+
+                // Create dictionary of stuck clients
+                let mut stucked = Dict::<(String, bool)>::new();
+                for client in inconfig.clients {
+                    stucked.add(client.name, (client.channel, false));
+                }
+
+                // Keep working while all children keep working
+                let mut lasttime = get_current_time_with_ms();
+                let mut incoming: u64 = 0;
+                let mut outgoing: u64 = 0;
+                let mut dropped: u64 = 0;
+                let mut deleted: u64 = 0;
+                let mut working = inconfig.children;
+                let mut joined: Vec<u16> = Vec::new();
+                while working>0 {
+
+                    // Check how many chidren we should have + queuer
+                    working = inconfig.children;
+
+                    // Check how many of them have stopped
+                    let mut counter: u16 = 0;
+                    for h in &handles {
+
+                        // Check if this handle was already joined
+                        if joined.contains(&counter) {
+                            // This one is not working
+                            working -= 1;
+                        } else {
+
+                            // Try to join it
+                            match h.try_timed_join(Duration::from_millis(1)) {
+                                // It joined, it is dead!
+                                Ok(_) => {
+                                    working -= 1;
+                                    joined.push(counter);
+                                },
+                                // Didn't join, it is alive
+                                Err(_) => (),
                             }
-                        },
-                        Err(_) => (),
+                        }
+                        counter += 1;
                     }
 
-                    // If nothind changed with children
-                    if working==inconfig.children {
+                    // Check if queuer has finished
+                    let queuer_working: bool;
+                    let queuer_status: &str;
+                    let mut queuer_stat_size: usize = 0;
+                    match queue_handler.try_timed_join(Duration::from_millis(1)) {
+                        Ok(_) => {
+                            // It joined, it is dead
+                            queuer_working = false;
+                            queuer_status = "DEAD";
+                        },
+                        Err(_) => {
+                            // Didn't join, it is alive
+                            queuer_working = true;
+                            queuer_status = "ALIVE";
+                        }
+                    }
 
-                        // While we get messages, keep reading
-                        let mut got_message = true;
-                        while got_message {
+                    // If somebody working, show up
+                    if (working<(inconfig.children)) || (!queuer_working) {
 
-                            got_message = false;
-                            let result_message = children_rx.try_recv();
-                            match result_message {
-                                Ok(msg) => {
-                                    incoming += msg.incoming;
-                                    outgoing += msg.outgoing;
-                                    dropped += msg.dropped;
-                                    deleted += msg.deleted;
-                                    for (name, newstatus) in msg.stuck {
-                                        let (channel, _) = stucked.get(&name).unwrap();
-                                        let value = (channel.clone(), newstatus);
-                                        stucked.remove_key(&name).unwrap();
-                                        stucked.add(name, value);
-                                    }
-                                    got_message=true
-                                },
+                        // Some child already died, show message and leave
+                        print_debug!(PROGRAM_NAME, stdout(), COLOR_YELLOW, 0, "Children {}/{} - Queuer: {}, some child closed, closing everything!", working, inconfig.children, queuer_status);
+                        break;
+                    } else {
+
+                        // Check if there is some message for us (from CTRL+C)
+                        match keepworking_rx.try_recv() {
+                            Ok(true) => print_debug!(PROGRAM_NAME, stderr(), COLOR_RED, 0, "Error while reading message from CTRL+C, got an unexpected message!"),
+                            Ok(false) => working = 0,
+                            Err(_) => (),
+                        }
+
+                        // If nothind changed with children
+                        if working==inconfig.children {
+
+                            // While we get messages, keep reading
+                            let mut got_message = true;
+                            while got_message {
+
+                                got_message = false;
+                                let result_message = children_rx.try_recv();
+                                match result_message {
+                                    Ok(msg) => {
+                                        incoming += msg.incoming;
+                                        outgoing += msg.outgoing;
+                                        dropped += msg.dropped;
+                                        deleted += msg.deleted;
+                                        for (name, newstatus) in msg.stuck {
+                                            let (channel, _) = stucked.get(&name).unwrap();
+                                            let value = (channel.clone(), newstatus);
+                                            stucked.remove_key(&name).unwrap();
+                                            stucked.add(name, value);
+                                        }
+                                        got_message=true
+                                    },
+                                    Err(_) => (),
+                                }
+
+                            }
+
+                            // Check if there is some message for us (from CTRL+C)
+                            match queuer_stat_rx.try_recv() {
+                                Ok(v) => queuer_stat_size=v,
                                 Err(_) => (),
                             }
 
-                        }
-
-                        // Check if we should show statistics
-                        if (get_current_time_with_ms() - (STATISTICS_SECONDS*1000))  > lasttime {
-                            // Show statistics
-                            let diff:f64 = ((get_current_time_with_ms() - lasttime) as f64) / 1000.0;
-                            print_debug!(PROGRAM_NAME, stdout(), COLOR_BLUE, COLOR_NOTAIL, "{} - ", inconfig.name);
-                            print_debug!(PROGRAM_NAME, stdout(), COLOR_CYAN, COLOR_NOHEAD_NOTAIL, "Incoming: {:.1} regs/sec", (incoming as f64) / diff);
-                            print_debug!(PROGRAM_NAME, stdout(), COLOR_WHITE, COLOR_NOHEAD_NOTAIL, " | ");
-                            print_debug!(PROGRAM_NAME, stdout(), COLOR_GREEN, COLOR_NOHEAD_NOTAIL, "Outgoing: {:.1} regs/sec", (outgoing as f64) / diff);
-                            print_debug!(PROGRAM_NAME, stdout(), COLOR_WHITE, COLOR_NOHEAD_NOTAIL, " | ");
-                            print_debug!(PROGRAM_NAME, stdout(), COLOR_RED, COLOR_NOHEAD_NOTAIL, "Dropped: {:.1} regs/sec", (dropped as f64) / diff);
-                            if deleted > 0 {
+                            // Check if we should show statistics
+                            if (get_current_time_with_ms() - (STATISTICS_SECONDS*1000))  > lasttime {
+                                // Show statistics
+                                let diff:f64 = ((get_current_time_with_ms() - lasttime) as f64) / 1000.0;
+                                print_debug!(PROGRAM_NAME, stdout(), COLOR_BLUE, COLOR_NOTAIL, "{} - ", inconfig.name);
+                                print_debug!(PROGRAM_NAME, stdout(), COLOR_CYAN, COLOR_NOHEAD_NOTAIL, "Incoming: {:.1} regs/sec", (incoming as f64) / diff);
                                 print_debug!(PROGRAM_NAME, stdout(), COLOR_WHITE, COLOR_NOHEAD_NOTAIL, " | ");
-                                print_debug!(PROGRAM_NAME, stdout(), COLOR_YELLOW, COLOR_NOHEAD_NOTAIL, "Deleted: {:.1} regs/sec", (deleted as f64) / diff);
-                            }
-
-                            // Show stuck clients
-                            let mut stucks = Vec::new();
-                            for element in &stucked {
-                                let (channel, is_stuck) = element.val.clone();
-                                if is_stuck {
-                                    stucks.push(format!("{}:{}", element.key, channel));
+                                if inconfig.ordering != None {
+                                    print_debug!(PROGRAM_NAME, stdout(), COLOR_GREEN, COLOR_NOHEAD_NOTAIL, "Queue: {} regs", queuer_stat_size);
+                                    print_debug!(PROGRAM_NAME, stdout(), COLOR_WHITE, COLOR_NOHEAD_NOTAIL, " | ");
                                 }
-                            }
-                            if stucks.len() > 0 {
-                                print_debug!(PROGRAM_NAME, stdout(), COLOR_YELLOW, COLOR_NOHEAD_NOTAIL, "  -> Stucked: [ {} ]", stucks.join(", "));
+                                print_debug!(PROGRAM_NAME, stdout(), COLOR_GREEN, COLOR_NOHEAD_NOTAIL, "Outgoing: {:.1} regs/sec", (outgoing as f64) / diff);
+                                print_debug!(PROGRAM_NAME, stdout(), COLOR_WHITE, COLOR_NOHEAD_NOTAIL, " | ");
+                                print_debug!(PROGRAM_NAME, stdout(), COLOR_RED, COLOR_NOHEAD_NOTAIL, "Dropped: {:.1} regs/sec", (dropped as f64) / diff);
+                                if deleted > 0 {
+                                    print_debug!(PROGRAM_NAME, stdout(), COLOR_WHITE, COLOR_NOHEAD_NOTAIL, " | ");
+                                    print_debug!(PROGRAM_NAME, stdout(), COLOR_YELLOW, COLOR_NOHEAD_NOTAIL, "Deleted: {:.1} regs/sec", (deleted as f64) / diff);
+                                }
+
+                                // Show stuck clients
+                                let mut stucks = Vec::new();
+                                for element in &stucked {
+                                    let (channel, is_stuck) = element.val.clone();
+                                    if is_stuck {
+                                        stucks.push(format!("{}:{}", element.key, channel));
+                                    }
+                                }
+                                if stucks.len() > 0 {
+                                    print_debug!(PROGRAM_NAME, stdout(), COLOR_YELLOW, COLOR_NOHEAD_NOTAIL, "  -> Stucked: [ {} ]", stucks.join(", "));
+                                }
+
+                                // Show tail
+                                print_debug!(PROGRAM_NAME, stdout(), COLOR_WHITE, COLOR_NOHEAD, "");
+                                lasttime = get_current_time_with_ms();
+                                incoming = 0;
+                                outgoing = 0;
+                                dropped = 0;
+                                deleted = 0;
                             }
 
-                            // Show tail
-                            print_debug!(PROGRAM_NAME, stdout(), COLOR_WHITE, COLOR_NOHEAD, "");
-                            lasttime = get_current_time_with_ms();
-                            incoming = 0;
-                            outgoing = 0;
-                            dropped = 0;
-                            deleted = 0;
+                            // Sleep a sec
+                            thread::sleep(Duration::from_millis(1000));
+
                         }
+                    }
 
-                        // Sleep a sec
+                }
+
+                // Tell queuer to serve all data that is left
+                queue_working_tx.send(true).unwrap();
+
+                // Tell all children to finish their job
+                for keep in keepworkings {
+                    keep.send(false).unwrap();
+                }
+
+                // Wait for children to close
+                print_debug!(PROGRAM_NAME, stdout(), COLOR_CYAN, 0, "Closing...");
+                thread::sleep(Duration::from_millis(1000));
+
+                // Wait for all children to close
+                let mut working = 1;
+                while working>0 {
+
+                    // Not working at this moment
+                    working = 0;
+
+                    let mut counter: u16 = 0;
+                    for h in &handles {
+
+                        // Check if this handle was already joined
+                        if !joined.contains(&counter) {
+
+                            // Try to join it
+                            match h.try_timed_join(Duration::from_millis(1)) {
+                                // It joined, it is dead!
+                                Ok(_) => {
+                                    joined.push(counter);
+                                },
+                                // Didn't join, it is alive
+                                Err(_) => working += 1,
+                            }
+                        }
+                        counter += 1;
+                    }
+
+                    // If somebody working, show up
+                    if working>0 {
+                        print_debug!(PROGRAM_NAME, stdout(), COLOR_YELLOW, 0, "There are {} threads left!", working);
                         thread::sleep(Duration::from_millis(1000));
-
                     }
                 }
 
+                // Tell the Queue to close
+                queue_working_tx.send(false).unwrap();
+                queue_handler.join().unwrap();
+
+                print_debug!(PROGRAM_NAME, stdout(), COLOR_GREEN, 0, "Program finished!");
             }
-
-            // Tell all children to close
-            for channel in channels {
-                channel.send(1).unwrap();
-            }
-            thread::sleep(Duration::from_millis(1));
-
-            // Wait for children to close
-            print_debug!(PROGRAM_NAME, stdout(), COLOR_CYAN, 0, "Closing...");
-            thread::sleep(Duration::from_millis(1000));
-
-            // Wait for all children to close
-            let mut working = 1;
-            while working>0 {
-                working = 0;
-                for h in &handles {
-                    match h.try_timed_join(Duration::from_millis(1)) {
-                        Ok(_) => (),
-                        Err(_) => working += 1,
-                    }
-                }
-
-                // If somebody working, show up
-                if working>0 {
-                    print_debug!(PROGRAM_NAME, stdout(), COLOR_YELLOW, 0, "There are {} threads left!", working);
-                    thread::sleep(Duration::from_millis(1000));
-                }
-            }
-
-            print_debug!(PROGRAM_NAME, stdout(), COLOR_GREEN, 0, "Program finished!");
 
         }
 
@@ -452,21 +576,9 @@ fn verify_config(config: Config) -> Result<Config, String> {
         Some(v) => configured += (v > 0) as i8,
     }
 
-    // Ordering Pre TS
-    match &source.ordering_prets {
-        None => (),
-        Some(_) => configured += 1,
-    }
-
-    // Ordering Post TS
-    match &source.ordering_posts {
-        None => (),
-        Some(_) => configured += 1,
-    }
-
     // Show error if any
-    if (configured>0) && (configured<4) {
-        return Err(format!("Source '{}' is using ordering, so you must set all ordering configuration: ordering (not empty), ordering_buffer_time (bigger than 0), ordering_limit (bigger than 0), ordering_prets and ordering_posts", source.name));
+    if (configured>0) && (configured<2) {
+        return Err(format!("Source '{}' is using ordering, so you must set all ordering configuration: ordering (not empty), ordering_buffer_time (bigger than 0) and ordering_limit (bigger than 0)", source.name));
     }
 
     // Verify there are clients
@@ -602,40 +714,97 @@ fn get_config(path_to_config:&String, debug:bool) -> Result<Config, String> {
     }
 }
 
+/// Manage ordered packages in a centralized way
+fn queuer(ordering_regex: Option<Regex>, config: Config, keepworking_rx: Receiver<bool>, children_rx: Receiver<(u16, Option<String>)>, children_tx: Vec<Sender<Vec<String>>>, stat_tx: Sender<usize>, debug: bool) {
+
+    if debug {
+        print_debug!(PROGRAM_NAME, stdout(), COLOR_BLUE, 0, "Queue: Starts");
+    }
+
+    // Prepare main variable
+    let mut keepworking = true;
+    let mut dumpall: bool;
+    if let Some(_) = ordering_regex {
+        dumpall = false;
+    } else {
+        dumpall = true;
+    }
+
+    // Prepare sorted list
+    let mut ordered_packages: BinaryHeap<Reverse<(u128, (u64, String))>> = BinaryHeap::new();
+
+    // Prepare the retention data
+    while keepworking {
+
+        // Check if some worker requested data
+        match children_rx.try_recv() {
+            Ok((id, package)) => {
+
+                if debug {
+                    print_debug!(PROGRAM_NAME, stdout(), COLOR_BLUE, 0, "Queue: Got request from {}: {:?}", id, package);
+                }
+
+                let mut list : Vec<String>;
+                if dumpall {
+                    list = Vec::new();
+                    while let Some(Reverse(package)) = ordered_packages.pop() {
+                        list.push(package.1.1);
+                    }
+                    if let Some(p) = package {
+                        list.push(p);
+                    }
+                } else {
+                    list = match_ordering(ordering_regex.clone(), config.ordering_buffer_time, config.ordering_limit, package, &mut ordered_packages, debug);
+                }
+
+                if debug {
+                    print_debug!(PROGRAM_NAME, stdout(), COLOR_BLUE, 0, "Queue: Send answer to {}: {}", id, list.len());
+                }
+
+                // Answer to the child
+                children_tx[id as usize].send(list).unwrap();
+
+                // Send the size of the queue
+                match stat_tx.send(ordered_packages.len()) {
+                    Ok(_) => (),
+                    Err(e) => println!("{} - EEE: {}", id, e),
+                }
+                // println!("LEN: {}", ordered_packages.len()); // TODO --- On testing
+            },
+            Err(_) => {
+                thread::sleep(Duration::from_millis(1));
+            },
+        }
+
+        // Check if our father wants us to finish
+        match keepworking_rx.try_recv() {
+            Ok(true) => {
+                print_debug!(PROGRAM_NAME, stdout(), COLOR_BLUE, 0, "Queue: Prepared to die");
+                dumpall = true;
+            },
+            Ok(false) => keepworking = false,
+            Err(_) => (),
+        }
+
+    }
+
+    if debug {
+        print_debug!(PROGRAM_NAME, stdout(), COLOR_BLUE, 0, "Queue: Ends");
+    }
+
+}
 
 /// Manage the full process from a child
-fn child(id: u16, tx: Sender<Statistics>, rx: Receiver<i8>, config: Config, debug: bool) {
+fn child(id: u16, tx: Sender<Statistics>, rx: Receiver<bool>, qtx: Sender<(u16, Option<String>)>, qrx: Receiver<Vec<String>>, config: Config, filter_regex: Option<Regex>, debug: bool) {
 
     if debug {
         print_debug!(PROGRAM_NAME, stdout(), COLOR_BLUE, 0, "Child {}: Starts", id);
     }
 
-    // Render main filter regex
-    let filter_regex: Option<Regex>;
-    let regex_str: &str;
-    if let Some(r) = config.filter.clone() {
-        regex_str = &r;
-        filter_regex = Some(Regex::new(&regex_str).unwrap());
-    } else {
-        filter_regex = None;
-    }
-
-    // Render main ordering regex
-    let ordering_regex: Option<Regex>;
-    let regex_str: &str;
-    if let Some(r) = config.ordering.clone() {
-        regex_str = &r;
-        ordering_regex = Some(Regex::new(&regex_str).unwrap());
-    } else {
-        ordering_regex = None;
-    }
-
-
-    // Prepare sorted list
-    let mut ordered_packages : SortedList<u128, (u64, String)> = SortedList::new();
+    // Prepare main variable
+    let mut keepworking = true;
 
     // Prepare the retention data
-    let mut keepworking = true;
     while keepworking {
 
         // Connect to source
@@ -715,20 +884,23 @@ fn child(id: u16, tx: Sender<Statistics>, rx: Receiver<i8>, config: Config, debu
                         }
 
                         // Get a new package
-                        let item: redis::RedisResult<redis::Value> = source.blpop(config.channel.clone(), 1);
+                        let item: redis::RedisResult<redis::Value> = source.blpop(config.channel.clone(), 0);
                         match &item {
                             Ok(redis::Value::Nil) => {
-                                // Refresh clients status
                                 // {println!("Nil")},
-                                for client in clients.iter_mut() {
-                                    match can_send(id, client, &mut deleted, debug) {
-                                        Ok(_) => (),
-                                        Err(e) => {
-                                            print_debug!(PROGRAM_NAME, stderr(), COLOR_RED, 0, "{}: Couldn't check queue for {}: {}", id, client.config.channel, e);
-                                            error = true;
-                                        },
+                                // Process no data
+                                match process_package(id, &qtx, &qrx, &filter_regex, &config, &mut  clients, None, &mut outgoing, &mut dropped, &mut deleted, debug) {
+                                    Ok(true) => (),
+                                    Ok(false) => {
+                                        error = true;
+                                        print_debug!(PROGRAM_NAME, stderr(), COLOR_RED, 0, "{}: Programing Error: Unexpected answer from process_package() at child() wit no data", id);
                                     }
+                                    Err(e) => {
+                                        error = true;
+                                        print_debug!(PROGRAM_NAME, stderr(), COLOR_RED, 0, "{}: process_package() has failed: {}", id, e);
+                                    },
                                 }
+
                             },
                             Ok(redis::Value::Int(_)) => {
                                 // Wrong value
@@ -753,106 +925,17 @@ fn child(id: u16, tx: Sender<Statistics>, rx: Receiver<i8>, config: Config, debu
                                 if let redis::Value::Data(val) = &data[1] {
                                     match from_utf8(val) {
                                         Ok(raw_bdata) => {
-
-                                            match match_ordering(ordering_regex.clone(), config.ordering_buffer_time, config.ordering_limit, config.ordering_prets.clone(), config.ordering_posts.clone(), raw_bdata.to_string(), &mut ordered_packages) {
-                                                Ok(list) => {
-
-                                                    for package in list {
-
-                                                        // Ready to send data
-                                                        let total_clients = clients.len();
-                                                        let mut errors = 0;
-
-                                                        match match_filter(filter_regex.clone(), config.filter_until.clone(), config.filter_limit, config.filter_replace.clone(), package.to_string()) {
-                                                            MatchAnswer::Ok(_) => errors = total_clients,
-                                                            MatchAnswer::Box(bdata) => {
-
-                                                                if config.mode == "replicant" {
-
-                                                                    // Send data to all clients
-                                                                    for client in clients.iter_mut() {
-
-                                                                        // If we can send to this queu
-                                                                        match send(id, client, &bdata, &mut deleted, debug) {
-
-                                                                            // Data sent
-                                                                            Ok(true) => (),
-
-                                                                            // Not sent
-                                                                            Ok(false) => {
-                                                                                errors += 1;
-                                                                            },
-
-                                                                            // There was an error
-                                                                            Err(e) => {
-                                                                                // There was an error
-                                                                                print_debug!(PROGRAM_NAME, stderr(), COLOR_RED, 0, "Error while sending to '{}:{}@{}': {}", config.hostname, config.port, config.channel, e);
-                                                                                errors += 1;
-                                                                            },
-                                                                        }
-                                                                    }
-
-                                                                } else {
-
-                                                                    // Send data to next client
-                                                                    let mut done = false;
-
-                                                                    // We will go throught all clients until data is
-                                                                    // sent or all clients have failed
-                                                                    while (!done) && (errors < total_clients) {
-
-                                                                        // Try to send to this client
-                                                                        let client = &mut clients[0];
-
-                                                                        // If we can send to this queu
-                                                                        match send(id, client, &bdata, &mut deleted, debug) {
-
-                                                                            // Data sent
-                                                                            Ok(true) => done = true,
-
-                                                                            // Not sent
-                                                                            Ok(false) => {
-                                                                                errors += 1;
-                                                                            },
-
-                                                                            // There was an error
-                                                                            Err(e) => {
-                                                                                // There was an error
-                                                                                print_debug!(PROGRAM_NAME, stderr(), COLOR_RED, 0, "Error while sending to '{}:{}@{}': {}", config.hostname, config.port, config.channel, e);
-                                                                                errors += 1;
-                                                                            },
-                                                                        }
-
-                                                                        // Rotate
-                                                                        if total_clients > 1 {
-                                                                            for i in 0..(total_clients-1) {
-                                                                                clients.swap(i, i+1);
-                                                                            }
-                                                                        }
-
-                                                                        // Leave if we are done
-                                                                        if done {
-                                                                            break;
-                                                                        }
-                                                                    }
-                                                                }
-                                                            },
-                                                            MatchAnswer::Err(e) => print_debug!(PROGRAM_NAME, stderr(), COLOR_RED, 0, "{}: Couldn't match the package: {}", id, e),
-                                                        }
-
-                                                        // If all clients have failed, drop the package and set error
-                                                        if errors == total_clients {
-                                                            // No sent at all
-                                                            dropped += 1;
-                                                        } else {
-                                                            // The package was sent at least to 1 node
-                                                            outgoing += 1;
-                                                        }
-                                                    }
+                                            // Got data
+                                            match process_package(id, &qtx, &qrx, &filter_regex, &config, &mut  clients, Some(raw_bdata), &mut outgoing, &mut dropped, &mut deleted, debug) {
+                                                Ok(true) => (),
+                                                Ok(false) => {
+                                                    error = true;
+                                                    print_debug!(PROGRAM_NAME, stderr(), COLOR_RED, 0, "{}: Programing Error: Unexpected answer from process_package() at child() with data", id);
                                                 },
-                                                Err(String) => (),
+                                                Err(e) => {
+                                                    print_debug!(PROGRAM_NAME, stderr(), COLOR_RED, 0, "{}: Couldn't process package: {}", id, e);
+                                                },
                                             }
-
                                         },
                                         Err(e) => {
                                             print_debug!(PROGRAM_NAME, stderr(), COLOR_RED, 0, "Couldn't decode to UTF8: {}", e);
@@ -883,9 +966,24 @@ fn child(id: u16, tx: Sender<Statistics>, rx: Receiver<i8>, config: Config, debu
 
                         // Check if our father wants us to finish
                         match rx.try_recv() {
-                            Ok(v) => {
-                                if v==1 {
-                                    keepworking = false;
+                            Ok(true) => print_debug!(PROGRAM_NAME, stderr(), COLOR_RED, 0, "Error while reading message from Parent, got an unexpected message!"),
+                            Ok(false) => {
+                                if debug {
+                                    print_debug!(PROGRAM_NAME, stdout(), COLOR_WHITE, 0, "{}: I was told to close!", id);
+                                }
+                                keepworking = false;
+
+                                // Get data left in the queue
+                                match process_package(id, &qtx, &qrx, &filter_regex, &config, &mut  clients, None, &mut outgoing, &mut dropped, &mut deleted, debug) {
+                                    Ok(true) => (),
+                                    Ok(false) => {
+                                        error = true;
+                                        print_debug!(PROGRAM_NAME, stderr(), COLOR_RED, 0, "{}: Programing Error: Unexpected answer from process_package() at child() wit no data", id);
+                                    }
+                                    Err(e) => {
+                                        error = true;
+                                        print_debug!(PROGRAM_NAME, stderr(), COLOR_RED, 0, "{}: process_package() has failed: {}", id, e);
+                                    },
                                 }
                             },
                             Err(_) => (),
@@ -915,10 +1013,12 @@ fn child(id: u16, tx: Sender<Statistics>, rx: Receiver<i8>, config: Config, debu
 
         // Check if our father wants us to finish
         match rx.try_recv() {
-            Ok(v) => {
-                if v==1 {
-                    keepworking = false;
+            Ok(true) => print_debug!(PROGRAM_NAME, stderr(), COLOR_RED, 0, "Error while reading message from Parent, got an unexpected message!"),
+            Ok(false) => {
+                if debug {
+                    print_debug!(PROGRAM_NAME, stdout(), COLOR_WHITE, 0, "{}: I was told to close!", id);
                 }
+                keepworking = false;
             },
             Err(_) => (),
         }
@@ -966,7 +1066,14 @@ fn redis_connect(id: u16, ssl: Option<bool>, hostname: String, port: u16, passwo
     }
 }
 
-fn send_to_client(client: &mut RedisLink, data: &str, debug: bool) -> Result<bool, String> {
+fn send_to_client(client: &mut RedisLink, data: &str, indebug: bool) -> Result<bool, String> {
+
+    // Avoid debug in this function
+    if indebug {
+    }
+    let debug = false;
+
+    // Preparre channels
     let channel  = client.config.channel.clone();
     if debug {
         print_debug!(PROGRAM_NAME, stdout(), COLOR_WHITE, 0, "RPUSH {} bytes to '{}'!", data.len(), channel);
@@ -978,7 +1085,12 @@ fn send_to_client(client: &mut RedisLink, data: &str, debug: bool) -> Result<boo
     };
 }
 
-fn can_check_queue(timelimit: Option<u64>, checklimit: Option<u64>, packages: u64, lastcheck: u64, debug:bool) -> bool {
+fn can_check_queue(timelimit: Option<u64>, checklimit: Option<u64>, packages: u64, lastcheck: u64, indebug:bool) -> bool {
+
+    // Avoid debug in this function
+    if indebug {
+    }
+    let debug = false;
 
     // Debugger
     if debug {
@@ -1030,7 +1142,12 @@ fn can_check_queue(timelimit: Option<u64>, checklimit: Option<u64>, packages: u6
     return false;
 }
 
-fn can_send(id: u16, client: &mut RedisLink, deleted: &mut u64, debug: bool) -> Result<bool, String> {
+fn can_send(id: u16, client: &mut RedisLink, deleted: &mut u64, indebug: bool) -> Result<bool, String> {
+
+    // Avoid debug in this function
+    if indebug {
+    }
+    let debug = false;
 
     // Check if we can check queue
     if can_check_queue(
@@ -1128,7 +1245,8 @@ fn send(id: u16, client: &mut RedisLink, dirty_bdata: &str, deleted: &mut u64, d
 
 
     match match_filter(client.regex.clone(), client.config.filter_until.clone(), client.config.filter_limit, client.config.filter_replace.clone(), dirty_bdata.to_string()) {
-        MatchAnswer::Ok(_) => return Ok(false),
+        MatchAnswer::Ok(true) => return Err("Programing Error: Unexpected answer from match_filter() at send()".to_string()),
+        MatchAnswer::Ok(false) => return Ok(false),
         MatchAnswer::Box(bdata) => {
             // If we can send to this queue
             match can_send(id, client, deleted, debug) {
@@ -1208,61 +1326,247 @@ fn match_filter(regex: Option<Regex>, until: Option<String>, limit: Option<usize
     }
 }
 
-fn match_ordering(regex: Option<Regex>, time: Option<u64>, limit: Option<usize>, pretts: Option<String>, postts: Option<String>, bdata: String, buffer: &mut SortedList<u128, (u64, String)>) -> Result<Vec<String>, String> {
+fn match_ordering(regex: Option<Regex>, time: Option<u64>, limit: Option<usize>, bdata: Option<String>, buffer: &mut BinaryHeap<Reverse<(u128, (u64, String))>>, debug: bool) -> Vec<String> {
 
     let mut list : Vec<String> = Vec::new();
 
-    // Attach all packages from the buffer that should be sent already
+    // If we got a package
+    if let Some(data) = bdata {
 
+        // Process regex
+        if let Some(re) = regex {
 
-    // Process regex
-    if let Some(re) = regex {
-
-        // Find by limit
-        let haystack: &str;
-        if let Some(l) = limit {
-            if l > 0 {
-                haystack = &bdata[..cmp::min(l, bdata.len())];
+            // Find by limit
+            let haystack: &str;
+            if let Some(l) = limit {
+                if l > 0 {
+                    haystack = &data[..cmp::min(l, data.len())];
+                } else {
+                    haystack = &data;
+                }
             } else {
-                haystack = &bdata;
+                haystack = &data;
             }
+
+            // Check if they match
+            match re.captures(haystack) {
+                Some(x) => {
+                    let ts = x.name("ts").map_or("", |m| m.as_str());
+                    match ts.parse::<u128>() {
+                        Ok(n) => {
+                            // Insert package into the buffer
+                            buffer.push(Reverse((n, (get_current_time(), data.to_string()))));
+                        },
+                        Err(_) => {
+                            // No TS information, jut send it
+                            print_debug!(PROGRAM_NAME, stderr(), COLOR_YELLOW, 0, "Found a package with ordering information but 'ts' couldn't be parsed to u128");
+                            list.push(data.to_string());
+                        },
+                    }
+                },
+                None => {
+                    // No TS information, jut send it
+                    print_debug!(PROGRAM_NAME, stderr(), COLOR_YELLOW, 0, "Found a package without ordering information");
+                    list.push(data.to_string());
+                },
+            }
+
         } else {
-            haystack = &bdata;
+            // No filter available, just send it
+            list.push(data.to_string());
         }
-
-        // Check if they match
-        if re.is_match(haystack) {
-
-            if let Some(r) = pretts {
-                let replaced = re.replace(haystack, r);
-                let newbdata = format!("{}{}", replaced, &bdata[haystack.len()..]);
-            }
-
-            // Post TS
-            if let Some(r) = postts {
-                let replaced = re.replace(haystack, r);
-                let newbdata = format!("{}{}", replaced, &bdata[haystack.len()..]);
-            }
-
-            // Parse to u128
-            let ts: u128 = 0;
-
-            // Insert package into the buffer
-            buffer.insert(ts, (get_current_time(), "b".to_string()));
-
-        } else {
-
-            // No TS information, jut send it
-            list.push(bdata);
-
-        }
-
-    } else {
-        // No filter available, just send it
-        list.push(bdata);
     }
 
-    // Return the list back
-    return Ok(list);
+    // Attach all packages from the buffer that should be sent already
+    let control;
+    if let Some(timer) = time {
+        control = get_current_time() - timer;
+    } else {
+        // Make sure control is in the future (1s for security + 1s for strict < on comparison)
+        control = get_current_time() + 2;
+    }
+    while let Some(Reverse(package)) = buffer.peek() {
+        if package.1.0 < control {
+            let Reverse(p) = buffer.pop().unwrap();
+            list.push(p.1.1);
+        } else {
+            break;
+        }
+    }
 
+    // if debug {
+    //     println!("BUFFER: {:?}", buffer);
+    //     println!("LIST:   {:?}", list);
+    // }
+
+    // Return the list back
+    return list;
+
+}
+
+fn process_package(id: u16, qtx: &Sender<(u16, Option<String>)>, qrx: &Receiver<Vec<String>>, filter_regex: &Option<Regex>, config: &Config, clients: &mut Vec<RedisLink>, data: Option<&str>, outgoing: &mut u64, dropped: &mut u64, deleted: &mut u64, debug: bool) -> Result<bool, String> {
+
+    if debug {
+        print_debug!(PROGRAM_NAME, stdout(), COLOR_CYAN, 0, "{}: Start process_package(): data={:?}", id, data);
+    }
+
+    // Check if we got a package
+    if let Some(package) = data {
+        // Send it to queuer
+        qtx.send((id, Some(package.to_string()))).unwrap();
+    } else {
+        // Just say we didn't get anything
+        qtx.send((id, None)).unwrap();
+    }
+
+    if debug {
+        print_debug!(PROGRAM_NAME, stdout(), COLOR_CYAN, 0, "{}: Sent request to Queuer process_package()", id);
+    }
+
+    /*
+    let mut list : Vec<String> = Vec::new();
+    let mut w = true;
+    while w {
+        match qrx.try_recv() {
+            Ok(l) => {
+                list = l;
+                println!("{} ===> {}", id, list.len());
+                w = false;
+            },
+            Err(e) => {
+                println!("{} - ERROR: {}", id, e);
+                thread::sleep(Duration::from_millis(10));   // TODO <--- check it out
+            }
+        }
+    }
+    */
+
+    // Check if there is some work to be done
+    let list:Vec<String> = qrx.recv().unwrap();
+
+    if debug {
+        print_debug!(PROGRAM_NAME, stdout(), COLOR_CYAN, 0, "{}: Got answer from Queuer process_package(): data={:?}", id, data);
+    }
+
+    // Check if we got packages to send
+    if list.len() > 0 {
+
+        for package in list {
+
+            // Ready to send data
+            let total_clients = clients.len();
+            let mut errors = 0;
+
+            match match_filter(filter_regex.clone(), config.filter_until.clone(), config.filter_limit, config.filter_replace.clone(), package.to_string()) {
+                MatchAnswer::Ok(true) => {
+                    if debug {
+                        print_debug!(PROGRAM_NAME, stdout(), COLOR_CYAN, 0, "{}: End unexpected process_package()", id);
+                    }
+                    return Err("Programing Error: Unexpected answer from match_filter() at process_package()".to_string());
+                },
+                MatchAnswer::Ok(false) => errors = total_clients,
+                MatchAnswer::Box(bdata) => {
+
+                    if config.mode == "replicant" {
+
+                        // Send data to all clients
+                        for client in clients.iter_mut() {
+
+                            // If we can send to this queu
+                            match send(id, client, &bdata, deleted, debug) {
+
+                                // Data sent
+                                Ok(true) => (),
+
+                                // Not sent
+                                Ok(false) => {
+                                    errors += 1;
+                                },
+
+                                // There was an error
+                                Err(e) => {
+                                    // There was an error
+                                    print_debug!(PROGRAM_NAME, stderr(), COLOR_RED, 0, "Error while sending to '{}:{}@{}': {}", config.hostname, config.port, config.channel, e);
+                                    errors += 1;
+                                },
+                            }
+                        }
+
+                    } else {
+
+                        // Send data to next client
+                        let mut done = false;
+
+                        // We will go throught all clients until data is
+                        // sent or all clients have failed
+                        while (!done) && (errors < total_clients) {
+
+                            // Try to send to this client
+                            let client = &mut clients[0];
+
+                            // If we can send to this queu
+                            match send(id, client, &bdata, deleted, debug) {
+
+                                // Data sent
+                                Ok(true) => done = true,
+
+                                // Not sent
+                                Ok(false) => {
+                                    errors += 1;
+                                },
+
+                                // There was an error
+                                Err(e) => {
+                                    // There was an error
+                                    print_debug!(PROGRAM_NAME, stderr(), COLOR_RED, 0, "Error while sending to '{}:{}@{}': {}", config.hostname, config.port, config.channel, e);
+                                    errors += 1;
+                                },
+                            }
+
+                            // Rotate
+                            if total_clients > 1 {
+                                for i in 0..(total_clients-1) {
+                                    clients.swap(i, i+1);
+                                }
+                            }
+
+                            // Leave if we are done
+                            if done {
+                                break;
+                            }
+                        }
+                    }
+                },
+                MatchAnswer::Err(e) => print_debug!(PROGRAM_NAME, stderr(), COLOR_RED, 0, "{}: Couldn't match the package: {}", id, e),
+            }
+
+            // If all clients have failed, drop the package and set error
+            if errors == total_clients {
+                // No sent at all
+                *dropped += 1;
+            } else {
+                // The package was sent at least to 1 node
+                *outgoing += 1;
+            }
+        }
+    } else {
+        // Refresh clients status
+        for client in clients.iter_mut() {
+            match can_send(id, client, deleted, debug) {
+                Ok(_) => (),  // We do not care if it can send or not (just wanted to refresh client information)
+                Err(e) => {
+                    if debug {
+                        print_debug!(PROGRAM_NAME, stdout(), COLOR_CYAN, 0, "{}: End unexpected process_package()", id);
+                    }
+                    return Err(format!("couldn't check queue for {}: {}", client.config.channel, e));
+                },
+            }
+        }
+    }
+
+    if debug {
+        print_debug!(PROGRAM_NAME, stdout(), COLOR_CYAN, 0, "{}: End process_package()", id);
+    }
+
+    return Ok(true);
 }
