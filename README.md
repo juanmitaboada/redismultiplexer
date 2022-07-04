@@ -48,6 +48,19 @@ Every configuration will have
 - `filter_limit`: the header of the package will be as long until these total bytes is reached (the minimum between filter\_until and filter\_limit will be used)
 - `filter_replace`: if this filter option is defined the Regular Expression will be replaced with this string (which may contain $X groups from Regex)
 
+As an example:
+- For the incoming string "Hello world"
+- We would like the filter to stop analizying after 11 bytes or "r"
+- We would like to filter "ell"
+- We would like the filtered string being replaced with ELL, so the result would e "HELLo world"
+- We would use the configuration:
+```yaml
+filter: "ell"
+filter_until: "r"
+filter_limit: 11
+filter_replace: "ELL"
+```
+
 ### Limits are optional:
 
 - `timelimit`: the size of the queue will be checked every n-seconds
@@ -60,19 +73,20 @@ Every configuration will have
 
 When several servers are dumping their information to the same queue the packages maybe disordered since the casuality of the real-time procesing. Let's imagine that you need to process this data by a Machine Learning system and because it is unordered the ML will may learn the future of its actions. It would be very easy to avoid this problem if the Queue gets ordered before being processed.
 
-This feature take care of ordering the incoming queue before being processed, it keeps a timed buffer of few seconds and use a prefix and postfix to find a string that can be parsed to be used for comparing with other packages. RedisMultiplexer will extract the first `ordering_limit` bytes from the package and it will look for `ordering_prets`, then it will look for `ordering_postts`, the timed substring will be the one between the end of `ordering_prets` and the beginning of `ordering_postts` after being parsed as u128:
+This feature take care of ordering the incoming queue before being processed, it keeps a timed buffer of few seconds and use a prefix and postfix to find a string that can be parsed to be used for comparing with other packages. RedisMultiplexer will extract the first `ordering_limit` bytes from the package and it will look for `ordering` Regular Expression matching the named group "ts" as the timestamp used for ordering the list of packages. The ts string extracted will be parsed as u128:
 
-- `ordering`: what is the Regular Expression used to parse the times substring
-- `ordering_buffer_time`: total of seconds that will be
+- `ordering`: what is the Regular Expression used to parse the times substring (matching with group 'ts' will be required in your Regex expression (Ex: ```'.*"ts": *(?P<ts>\d+),.*#'``` )
+- `ordering_buffer_time`: total of seconds that new packages must stay in the buffer so they get ordered
 - `ordering_limit`: how many bytes to process during the extraction of the substring
-- `ordering_prets`: what is the Regular Expression of the prefix of the substring to be removed
-- `ordering_postts`: what is the Regular Expression of the sufix of the substring to be removed
 
 As an example:
 - For the package: '{"a": "abc", "ts": 12345678, "b": 88}'
 - Where "ts" is the key holding the timed string
-- `ordering_prets` would be: '"ts": '
-- `ordering_postts` would be: ','
+```yaml`
+ordering: '.*"ts": *(?P<ts>\d+),.*#'
+ordering_buffer_time: 30
+ordering_limit: 200
+```
 
 ## How all of this works
 
@@ -114,18 +128,15 @@ port        : 6379
 password    : "abcdefghijklmnopqrstuvwxyz"
 channel     : "SourceQueue"
 children    : 2
-mode        : "replicant"       # <--- choose between: "replicant" and "spreader"
-# pid         : "config.pid"    <--- not available
-# filter      : "ola"           <--- optional
-# filter_until: "r"             <--- optional
-# filter_limit: 11              <--- optional
-# filter_replace: "OLA"         <--- optional
-# ordering: '({|,)\ *"ts":\ *\d(,|})'   <--- not available
-# ordering_buffer_time: 5               <--- not available
-# ordering_limit: 200                   <--- not available
-# ordering_prets: '^({|,})\ *"ts":\ *'  <--- not available
-# ordering_posts: '(,|})$'              <--- not available
-# ordering_parser: 'int'                <--- not available (int, float, str)
+mode        : "replicant"               # choose between: "replicant" and "spreader"
+# pid         : "config.pid"            # optional
+# filter      : "ola"                   # optional
+# filter_until: "r"                     # optional
+# filter_limit: 11                      # optional
+# filter_replace: "OLA"                 # optional
+# ordering: '.*"ts": *(?P<ts>\d+),.*#'  # optional
+# ordering_buffer_time: 5               # optional
+# ordering_limit: 200                   # optional
 
 clients:
   - name        : "Target 1"
@@ -133,19 +144,19 @@ clients:
     port        : 6379
     password    : "abcdefghijklmnopqrstuvwxyz"
     channel     : "TargetQueue1"
-    timelimit   : 5             # <--- optional
-    checklimit  : 100           # <--- optional
-    softlimit   : 400           # <--- optional
-    hardlimit   : 410           # <--- optional
-    deleteblock : 100           # <--- optional
-    # filter      : "ola"         <--- optional
-    # filter_until: "r"           <--- optional
-    # filter_limit: 11            <--- optional
-    # filter_replace: "OLA"       <--- optional
-    # filter      : "^(1|3)"      <--- optional
-    # filter_until: "#"           <--- optional
-    # filter_limit: 1             <--- optional
-    # filter_replace: ""          <--- optional
+    timelimit   : 5                     # optional
+    checklimit  : 100                   # optional
+    softlimit   : 400                   # optional
+    hardlimit   : 410                   # optional
+    deleteblock : 100                   # optional
+    # filter      : "ola"               # optional
+    # filter_until: "r"                 # optional
+    # filter_limit: 11                  # optional
+    # filter_replace: "OLA"             # optional
+    # filter      : "^(1|3)"            # optional
+    # filter_until: "#"                 # optional
+    # filter_limit: 1                   # optional
+    # filter_replace: ""                # optional
   - name        : "DB2"
     hostname    : "127.0.0.1"
     port        : 6379

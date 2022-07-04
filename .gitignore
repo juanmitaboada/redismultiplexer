@@ -10,5 +10,8 @@ Cargo.lock
 **/*.rs.bk
 
 *.swp
+*.pid
+*.stat
+
 etc/
 inject.sh
