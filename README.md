@@ -75,7 +75,10 @@ When several servers are dumping their information to the same queue the package
 
 This feature take care of ordering the incoming queue before being processed, it keeps a timed buffer of few seconds and use a prefix and postfix to find a string that can be parsed to be used for comparing with other packages. RedisMultiplexer will extract the first `ordering_limit` bytes from the package and it will look for `ordering` Regular Expression matching the named group "ts" as the timestamp used for ordering the list of packages. The ts string extracted will be parsed as u128:
 
-- `ordering`: what is the Regular Expression used to parse the times substring (matching with group 'ts' will be required in your Regex expression (Ex: ```'.*"ts": *(?P<ts>\d+),.*#'``` )
+- `ordering`: what is the Regular Expression used to parse the times substring (matching with group 'ts' will be required in your Regex expression. Example:
+```yaml
+ordering: '.*"ts": *(?P<ts>\d+),.*#'
+``` 
 - `ordering_buffer_time`: total of seconds that new packages must stay in the buffer so they get ordered
 - `ordering_limit`: how many bytes to process during the extraction of the substring
 
