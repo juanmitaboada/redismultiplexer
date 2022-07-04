@@ -85,7 +85,7 @@ ordering: '.*"ts": *(?P<ts>\d+),.*#'
 As an example:
 - For the package: '{"a": "abc", "ts": 12345678, "b": 88}'
 - Where "ts" is the key holding the timed string
-```yaml`
+```yaml
 ordering: '.*"ts": *(?P<ts>\d+),.*#'
 ordering_buffer_time: 30
 ordering_limit: 200
