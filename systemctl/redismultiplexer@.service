@@ -1,0 +1,20 @@
+[Unit]
+Description=Redis Multiplexer from %i
+Documentation=man:redismultiplexer(8)
+ReloadPropagatedFrom=redismultiplexer.service
+PartOf=redismultiplexer.service
+After=redismultiplexer.service
+
+[Service]
+Type=simple
+User=redismultiplexer
+ExecStart=/usr/bin/redismultiplexer %i systemd
+PIDFile=/run/redismultiplexer/%i.pid
+WorkingDirectory=/etc/redismultiplexer
+StandardOutput=file:/var/log/redismultiplexer/%i.log
+StandardError=file:/var/log/redismultiplexer/%i.log
+LimitNOFILE=200000
+Restart=always
+
+[Install]
+WantedBy=redismultiplexer.service

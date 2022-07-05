@@ -1,4 +1,4 @@
-# redismultiplexer
+# RedisMultiplexer
 
 This is a program to transfer data from queues (push/pop) between different Redis server
 
@@ -23,8 +23,10 @@ The configuration has 2 defined zones, the first one is the source server which 
 - Optional `Filters`: explained below
 - Optional `Ordering`: explained below
 - `pid`: pid file of the executing RedisMultiplexer
+- `status`: status file will contains a JSON string with the statistics of the program while working
 - `children`: total of threads or workers to be started for processing (usually 2 is enought)
 - `mode`: there 2 working modes: replicant and spreader, explained before
+- `clients`: will have as many target servers as desired
 
 Inside the `clients` entry of the YAML configuration:
 - `General configuration`: explained below
@@ -132,14 +134,15 @@ password    : "abcdefghijklmnopqrstuvwxyz"
 channel     : "SourceQueue"
 children    : 2
 mode        : "replicant"               # choose between: "replicant" and "spreader"
-# pid         : "config.pid"            # optional
-# filter      : "ola"                   # optional
-# filter_until: "r"                     # optional
-# filter_limit: 11                      # optional
-# filter_replace: "OLA"                 # optional
-# ordering: '.*"ts": *(?P<ts>\d+),.*#'  # optional
-# ordering_buffer_time: 5               # optional
-# ordering_limit: 200                   # optional
+pid         : "config.pid"              # optional
+status      : "config.stat"             # optional
+filter      : "ell"                     # optional
+filter_until: "r"                       # optional
+filter_limit: 11                        # optional
+filter_replace: "ELL"                   # optional
+ordering: '.*"ts": *(?P<ts>\d+),.*#'    # optional
+ordering_buffer_time: 30                # optional
+ordering_limit: 200                     # optional
 
 clients:
   - name        : "Target 1"
@@ -152,21 +155,21 @@ clients:
     softlimit   : 400                   # optional
     hardlimit   : 410                   # optional
     deleteblock : 100                   # optional
-    # filter      : "ola"               # optional
-    # filter_until: "r"                 # optional
-    # filter_limit: 11                  # optional
-    # filter_replace: "OLA"             # optional
-    # filter      : "^(1|3)"            # optional
-    # filter_until: "#"                 # optional
-    # filter_limit: 1                   # optional
-    # filter_replace: ""                # optional
+    filter      : "^(1|3|5|7|9)#"       # optional
+    filter_until: "#"                   # optional
+    filter_limit: 100                   # optional
+    filter_replace: ""                  # optional
   - name        : "DB2"
     hostname    : "127.0.0.1"
     port        : 6379
     password    : "abcdefghijklmnopqrstuvwxyz"
     channel     : "TargetQueue2"
-    timelimit   : 5
-    checklimit  : 100
-    softlimit   : 400
-    hardlimit   : 410
+    timelimit   : 5                     # optional
+    checklimit  : 100                   # optional
+    softlimit   : 400                   # optional
+    hardlimit   : 410                   # optional
+    filter      : "^(0|2|4|6|8)#"       # optional
+    filter_until: "#"                   # optional
+    filter_limit: 100                   # optional
+    filter_replace: ""                  # optional
 ```

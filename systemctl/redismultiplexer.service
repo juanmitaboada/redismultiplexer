@@ -1,0 +1,23 @@
+# This service is actually a systemd target,
+# but we are using a service since targets cannot be reloaded.
+
+[Unit]
+Description=Redis Multiplexer
+After=network.target
+
+[Service]
+Type=oneshot
+User=redismultiplexer
+RemainAfterExit=yes
+ExecStart=/bin/true
+ExecReload=/bin/true
+WorkingDirectory=/etc/redismultiplexer
+
+RuntimeDirectory=redismultiplexer
+RuntimeDirectoryMode=0750
+RuntimeDirectoryPreserve=yes
+
+[Install]
+WantedBy=multi-user.target
+
+

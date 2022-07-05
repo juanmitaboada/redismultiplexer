@@ -1,0 +1,13 @@
+#!/bin/sh
+
+rmdir /run/redismultiplexer 2>/dev/null || echo "I couldn't remove '/run/redismultiplexer' folder because is not empty!"
+rmdir /var/log/redismultiplexer 2>/dev/null || echo "I couldn't remove '/var/log/redismultiplexer' folder because is not empty!"
+
+echo -n "Disable RedisMultiplexer in systemd..."
+systemctl disable $CODENAME
+
+echo -n "Restarting systemd..."
+systemctl daemon-reload
+echo "done"
+
+exit 0

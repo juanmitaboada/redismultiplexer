@@ -1,0 +1,92 @@
+#!/bin/sh
+
+USERNAME="redismultiplexer"
+GROUP="redismultiplexer"
+APP="redismultiplexer"
+CODENAME="redismultiplexer"
+FOLDERS="/etc /run"
+LOG=" /var/log"
+ARCHS=""
+ERROR=""
+
+cat /etc/passwd | grep "${USERNAME}:" >/dev/null 2>&1
+if [ $? -eq 0 ] ; then
+    echo "User '${USERNAME}' already exists!"
+else
+    echo "Creating user '${USERNAME}'..."
+    useradd --no-create-home -s /bin/false ${USERNAME}
+    passwd -d ${USERNAME}
+    passwd -l ${USERNAME}
+fi
+
+cat /etc/group | grep "${GROUP}:" >/dev/null 2>&1
+if [ $? -eq 0 ] ; then
+    echo "Group '${GROUP}' already exists!"
+else
+    echo "Creating group '${GROUP}'..."
+    addgroup ${GROUP} >/dev/null
+fi
+
+for folder in $FOLDERS ; do
+    if [ ! -e $FOLDER ] ; then
+        echo -n "Setting up folder '${folder}' ... [mkdir"
+        mkdir -p ${folder}/${APP} || exit 1
+        echo -n ", chown:${USERNAME}"
+        chown ${USERNAME} -R ${folder}/${APP} || exit 1
+        echo -n ", chgrp:${GROUP}"
+        chgrp ${GROUP} -R ${folder}/${APP} || exit 1
+        echo -n ", chmod:770"
+        chmod 770 ${folder}/${APP} || exit 1
+        echo "] => done"
+    fi
+done
+
+echo -n "Setting up log folder '${LOG}' ... [mkdir"
+mkdir -p ${LOG}/${APP} || exit 1
+echo -n ", chown:${USERNAME}"
+chown ${USERNAME} -R ${LOG}/${APP} || exit 1
+echo -n ", chrp:${GROUP}"
+chgrp ${GROUP} -R ${LOG}/${APP} || exit 1
+echo -n ", chmod:750"
+chmod 750 ${LOG}/${APP} || exit 1
+echo "] => done"
+
+# General test
+${APP} --version > /dev/null 2>&1 || ERROR="1"
+if [ -z "$ERROR" ] ; then
+
+    # Reload systemd
+    echo -n "Reloading systemd..."
+    systemctl daemon-reload || ERROR="1"
+    if [ -z "$ERROR" ] ; then
+        echo "done"
+
+        # Make sure service is enabled
+        echo -n "Enable $CODENAME..."
+        systemctl enable $CODENAME || ERROR="1"
+        if [ -z "$ERROR" ] ; then
+            echo "done"
+
+            # Restart service
+            echo -n "Restarting $CODENAME..."
+            systemctl restart $CODENAME || ERROR="1"
+            if [ -z "$ERROR" ] ; then
+                echo "done"
+            fi
+        fi
+    fi
+
+    if [ ! -z "$ERROR" ] ; then
+        echo "ERROR"
+    fi
+
+else
+    echo "ERROR: selftest has failed! (Binary was: ${APP})"
+fi
+
+# Return final status
+if [ -z "$ERROR" ] ; then
+    exit 0
+else
+    exit 1
+fi

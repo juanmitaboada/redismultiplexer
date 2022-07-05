@@ -2,8 +2,35 @@
 name = "redismultiplexer"
 version = "1.0.0"
 edition = "2021"
+description = "This is a program to transfer data from queues (push/pop) between different Redis server"
+license = "Apache-2.0"
+homepage = "https://github.com/juanmitaboada/redismultiplexer"
+repository = "https://github.com/juanmitaboada/redismultiplexer"
+documentation = "https://github.com/juanmitaboada/redismultiplexer"
+readme = "README.md"
+authors = ["Juanmi Taboada <juanmi@juanmitaboada.com>"]
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[package.metadata.deb]
+maintainer = "Juanmi Taboada <juanmi@juanmitaboada.com>"
+copyright = "2022, Juanmi Taboada <juanmi@juanmitaboada.com>"
+license-file = ["LICENSE", "4"]
+extended-description = """\
+RedisMultiplexer will take care of your queues in Redis. \
+The purpose is to move packages from a source queue to a \
+target queue that may be or not be in the same server and \
+port."""
+depends = "$auto"
+section = "utility"
+priority = "optional"
+assets = [
+    ["target/release/redismultiplexer", "usr/bin/", "755"],
+    ["README.md", "usr/share/doc/redismultiplexer/README", "644"],
+    ["etc/default.yaml-orig", "etc/redismultiplexer/", "644"],
+    ["systemctl/redismultiplexer.service", "lib/systemd/system/", "644"],
+    ["systemctl/redismultiplexer@.service", "lib/systemd/system/", "644"],
+]
+maintainer-scripts = "scripts/"
+changelog = "CHANGELOG"
 
 [dependencies]
 redis = { version = "0.19.0", features = ["tls", "r2d2"] }
@@ -17,3 +44,4 @@ dict = "*"
 regex = "*"
 sorted-list = "*"
 serde_json = "*"
+build-time = "*"
