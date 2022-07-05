@@ -1,3 +1,9 @@
+redismultiplexer (1.0.1-1) stable; urgency=medium
+
+  * Version corrected
+
+ -- Juanmi Taboada <juanmio@juanmitaboada.com>  Wed, 05 Jul 2022 19:48:15 +0200
+
 redismultiplexer (1.0.0-1) stable; urgency=medium
 
   * Initial release
