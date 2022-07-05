@@ -1,3 +1,9 @@
+rust-redismultiplexer (1.0.4-1) stable; urgency=medium
+
+  * Changelog repaired
+
+ -- Juanmi Taboada <juanmi@juanmitaboada.com>  Tue, 05 Jul 2022 21:06:10 +0200
+
 rust-redismultiplexer (1.0.3-1) stable; urgency=medium
 
   * Changelog repaired
