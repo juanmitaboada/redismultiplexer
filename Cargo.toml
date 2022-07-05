@@ -34,14 +34,12 @@ changelog = "CHANGELOG"
 
 [dependencies]
 redis = { version = "0.19.0", features = ["tls", "r2d2"] }
-rand = "0.8.1"
-chrono = "*"
+chrono = "0.4.19"
 serde = { version = "1.0", features = ["derive"] }
 serde_yaml = "0.8"
-thread_tryjoin = "*"
-ctrlc = "*"
-dict = "*"
-regex = "*"
-sorted-list = "*"
-serde_json = "*"
-build-time = "*"
+thread_tryjoin = "0.3.0"
+ctrlc = "3.2.2"
+dict = "0.1.5"
+regex = "1.5.6"
+serde_json = "1.0.82"
+build-time = "0.1.1"
