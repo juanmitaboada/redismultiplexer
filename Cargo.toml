@@ -1,6 +1,6 @@
 [package]
 name = "redismultiplexer"
-version = "1.0.1"
+version = "1.0.2"
 edition = "2021"
 description = "This is a program to transfer data from queues (push/pop) between different Redis server"
 license = "Apache-2.0"
