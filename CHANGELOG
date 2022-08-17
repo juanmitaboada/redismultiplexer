@@ -1,3 +1,9 @@
+rust-redismultiplexer (1.0.6-1) stable; urgency=medium
+
+  * Now DEBUG doesn't impact on performance if not being used
+
+ -- Juanmi Taboada <juanmi@juanmitaboada.com>  Tue, 16 Ago 2022 23:11:02 +0200
+
 rust-redismultiplexer (1.0.5-1) stable; urgency=medium
 
   * Now DEBUG doesn't impact on performance if not being used

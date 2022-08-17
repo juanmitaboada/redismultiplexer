@@ -1,5 +1,5 @@
 name: redismultiplexer
-version: '1.0.5'
+version: '1.0.6'
 grade: stable
 summary: A flexible Redis queue manager written in Rust
 description: |
