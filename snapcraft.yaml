@@ -15,6 +15,9 @@ contact: https://www.juanmitaboada.com/contact/
 confinement: classic
 base: core20
 
+architectures:
+  - amd64
+
 parts:
   redismultiplexer:
     plugin: rust
