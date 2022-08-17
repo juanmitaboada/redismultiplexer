@@ -12,7 +12,7 @@ license: Apache-2.0
 website: https://www.juanmitaboada.com/
 contact: https://www.juanmitaboada.com/contact/
 
-confinement: strict
+confinement: classic
 base: core20
 
 parts:
