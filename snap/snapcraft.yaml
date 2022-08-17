@@ -1,6 +1,6 @@
 name: redismultiplexer
+base: core20
 version: '1.0.6'
-grade: stable
 summary: A flexible Redis queue manager written in Rust
 description: |
   RedisMultiplexer will take care of your queues in Redis.
@@ -12,8 +12,8 @@ license: Apache-2.0
 website: https://www.juanmitaboada.com/
 contact: https://www.juanmitaboada.com/contact/
 
+grade: stable
 confinement: classic
-base: core20
 
 architectures:
   - amd64
