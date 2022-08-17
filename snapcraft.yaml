@@ -1,0 +1,28 @@
+name: redismultiplexer
+version: '1.0.4'
+grade: stable
+summary: A flexible Redis queue manager written in Rust
+description: |
+  RedisMultiplexer will take care of your queues in Redis.
+  The purpose is to move packages from a source queue to
+  a target queue that may be or not be in the same server
+  and port.
+icon: redismultiplexer.png
+license: Apache-2.0
+website: https://www.juanmitaboada.com/
+contact: https://www.juanmitaboada.com/contact/
+
+confinement: strict
+base: core20
+
+parts:
+  redismultiplexer:
+    plugin: rust
+    source: https://github.com/juanmitaboada/redismultiplexer.git
+    build-packages:
+      - pkg-config
+      - librust-openssl-dev
+
+apps:
+  redismultiplexer:
+    command: bin/redismultiplexer

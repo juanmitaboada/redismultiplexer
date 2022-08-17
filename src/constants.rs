@@ -1,7 +1,6 @@
 use build_time::build_time_utc;
 
 pub static PROGRAM_NAME: &str = "RedisMultiplexer";
-pub static DEBUG: bool = false;
 pub static STATISTICS_SECONDS: u128 = 10;
 pub static DEFAULT_CHECK_SECONDS: u64 = 1;
 pub static MAX_QUEUE_SIZE: isize = 100000000;

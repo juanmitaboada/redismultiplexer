@@ -176,11 +176,8 @@ fn main() {
             // Welcome
             print_debug!(PROGRAM_NAME, stdout(), COLOR_CYAN, 0, "{} v{} ({})", PROGRAM_NAME, VERSION, BUILD_DATE);
 
-            // Set debug
-            let debug = DEBUG || (args.len() == 3) && (args[2] == "debug");
-            if debug {
-                print_debug!(PROGRAM_NAME, stdout(), COLOR_YELLOW, 0, "Debug is enabled!");
-            }
+            #[cfg(feature="debug")]
+            print_debug!(PROGRAM_NAME, stdout(), COLOR_YELLOW, 0, "Debug is enabled!");
 
             // Is a systemd call
             let systemd = (args.len() == 3) && (args[2] == "systemd");
@@ -195,7 +192,7 @@ fn main() {
 
             // Read config
             let mut config : Option<Config> = None;
-            match get_config(final_path, debug) {
+            match get_config(final_path) {
                 Ok(c) => config = Some(c),
                 Err(e) => print_debug!(PROGRAM_NAME, stderr(), COLOR_RED, 0, "Error while processing configuration: {}", e),
             }
@@ -325,7 +322,7 @@ fn main() {
                         // Spawn a queue manage
                         let queue_config = inconfig.clone();
                         let queue_handler = thread::spawn(move || {
-                            queuer(is_ordering_regex, queue_config.clone(), queue_working_rx, queue_rx, queues_channels, queuer_stat_tx, debug)
+                            queuer(is_ordering_regex, queue_config.clone(), queue_working_rx, queue_rx, queues_channels, queuer_stat_tx)
                         });
 
                         // Spawn a number of threads and collect their join handles
@@ -341,7 +338,7 @@ fn main() {
                             let fr = filter_regex.clone();
                             let or = ordering_regex.clone();
                             let handle = thread::spawn(move || {
-                                child(id, or, inconfig.ordering_limit, tx, rx, qtx, &qrx, child_config, fr, debug);
+                                child(id, or, inconfig.ordering_limit, tx, rx, qtx, &qrx, child_config, fr);
                             });
                             handles.push(handle);
 
@@ -759,7 +756,7 @@ fn verify_config(config: Config) -> Result<Config, String> {
 }
 
 /// Read configuration and parse it from YAML format to Struct
-fn get_config(path_to_config:String, debug:bool) -> Result<Config, String> {
+fn get_config(path_to_config:String) -> Result<Config, String> {
 
     // It this is a systemd call
     let pathconfig = Path::new(&path_to_config);
@@ -768,9 +765,8 @@ fn get_config(path_to_config:String, debug:bool) -> Result<Config, String> {
     if pathconfig.exists() {
         if pathconfig.is_file() {
 
-            if debug {
-                print_debug!(PROGRAM_NAME, stdout(), COLOR_BLUE, 0, "CONFIG: Opened {}", path_to_config);
-            }
+            #[cfg(feature="debug")]
+            print_debug!(PROGRAM_NAME, stdout(), COLOR_BLUE, 0, "CONFIG: Opened {}", path_to_config);
 
             // Read file
             let data;
@@ -801,11 +797,10 @@ fn get_config(path_to_config:String, debug:bool) -> Result<Config, String> {
 }
 
 /// Manage ordered packages in a centralized way
-fn queuer(is_ordering_regex: bool, config: Config, keepworking_rx: Receiver<bool>, children_rx: Receiver<(u16, Option<u128>, Option<String>)>, children_tx: Vec<Sender<Vec<String>>>, stat_tx: Sender<Option<usize>>, debug: bool) {
+fn queuer(is_ordering_regex: bool, config: Config, keepworking_rx: Receiver<bool>, children_rx: Receiver<(u16, Option<u128>, Option<String>)>, children_tx: Vec<Sender<Vec<String>>>, stat_tx: Sender<Option<usize>>) {
 
-    if debug {
-        print_debug!(PROGRAM_NAME, stdout(), COLOR_BLUE, 0, "Queue: Starts");
-    }
+    #[cfg(feature="debug")]
+    print_debug!(PROGRAM_NAME, stdout(), COLOR_BLUE, 0, "Queue: Starts");
 
     // Prepare main variable
     let mut keepworking = true;
@@ -826,9 +821,8 @@ fn queuer(is_ordering_regex: bool, config: Config, keepworking_rx: Receiver<bool
         match children_rx.try_recv() {
             Ok((id, ts, package)) => {
 
-                if debug {
-                    print_debug!(PROGRAM_NAME, stdout(), COLOR_BLUE, 0, "Queue: Got request from {}: {:?}", id, package);
-                }
+                #[cfg(feature="debug")]
+                print_debug!(PROGRAM_NAME, stdout(), COLOR_BLUE, 0, "Queue: Got request from {}: {:?}", id, package);
 
                 let mut list : Vec<String>;
                 if dumpall {
@@ -840,12 +834,11 @@ fn queuer(is_ordering_regex: bool, config: Config, keepworking_rx: Receiver<bool
                         list.push(p);
                     }
                 } else {
-                    list = match_ordering(ts, config.ordering_buffer_time, package, &mut ordered_packages, debug);
+                    list = match_ordering(ts, config.ordering_buffer_time, package, &mut ordered_packages);
                 }
 
-                if debug {
-                    print_debug!(PROGRAM_NAME, stdout(), COLOR_BLUE, 0, "Queue: Send answer to {}: {}", id, list.len());
-                }
+                #[cfg(feature="debug")]
+                print_debug!(PROGRAM_NAME, stdout(), COLOR_BLUE, 0, "Queue: Send answer to {}: {}", id, list.len());
 
                 // Answer to the child
                 children_tx[id as usize].send(list).unwrap();
@@ -873,18 +866,16 @@ fn queuer(is_ordering_regex: bool, config: Config, keepworking_rx: Receiver<bool
     // Say we are done
     stat_tx.send(None).unwrap();
 
-    if debug {
-        print_debug!(PROGRAM_NAME, stdout(), COLOR_BLUE, 0, "Queue: Ends");
-    }
+    #[cfg(feature="debug")]
+    print_debug!(PROGRAM_NAME, stdout(), COLOR_BLUE, 0, "Queue: Ends");
 
 }
 
 /// Manage the full process from a child
-fn child(id: u16, ordering_regex: Option<Regex>, ordering_limit: Option<usize>, tx: Sender<Statistics>, rx: Receiver<bool>, qtx: Sender<(u16, Option<u128>, Option<String>)>, qrx: &Receiver<Vec<String>>, config: Config, filter_regex: Option<Regex>, debug: bool) {
+fn child(id: u16, ordering_regex: Option<Regex>, ordering_limit: Option<usize>, tx: Sender<Statistics>, rx: Receiver<bool>, qtx: Sender<(u16, Option<u128>, Option<String>)>, qrx: &Receiver<Vec<String>>, config: Config, filter_regex: Option<Regex>) {
 
-    if debug {
-        print_debug!(PROGRAM_NAME, stdout(), COLOR_BLUE, 0, "Child {}: Starts", id);
-    }
+    #[cfg(feature="debug")]
+    print_debug!(PROGRAM_NAME, stdout(), COLOR_BLUE, 0, "Child {}: Starts", id);
 
     // Prepare main variable
     let mut keepworking = true;
@@ -897,9 +888,9 @@ fn child(id: u16, ordering_regex: Option<Regex>, ordering_limit: Option<usize>, 
         match rx.try_recv() {
             Ok(true) => print_debug!(PROGRAM_NAME, stderr(), COLOR_RED, 0, "Error while reading message from Parent, got an unexpected message!"),
             Ok(false) => {
-                if debug {
-                    print_debug!(PROGRAM_NAME, stdout(), COLOR_WHITE, 0, "{}: I was told to close!", id);
-                }
+
+                #[cfg(feature="debug")]
+                print_debug!(PROGRAM_NAME, stdout(), COLOR_WHITE, 0, "{}: I was told to close!", id);
                 request_finish = true;
             },
             Err(_) => (),
@@ -907,15 +898,15 @@ fn child(id: u16, ordering_regex: Option<Regex>, ordering_limit: Option<usize>, 
 
         // Connect to source
         let mut source: redis::Connection;
-        match redis_connect(id, config.ssl, config.hostname.clone(), config.port, config.password.clone(), false, debug) {
+        let mut error = false;
+        match redis_connect(id, config.ssl, config.hostname.clone(), config.port, config.password.clone(), false) {
             Ok(link) => {
-                let mut error = false;
                 source = link;
 
                 // Connect to targets
                 let mut clients: Vec<RedisLink> = Vec::new();
                 for client in &config.clients {
-                    match redis_connect(id, client.ssl, client.hostname.clone(), client.port, client.password.clone(), true, debug) {
+                    match redis_connect(id, client.ssl, client.hostname.clone(), client.port, client.password.clone(), true) {
                         Ok(link) => {
                             let regex: Option<Regex>;
                             let regex_str: &str;
@@ -935,7 +926,7 @@ fn child(id: u16, ordering_regex: Option<Regex>, ordering_limit: Option<usize>, 
                             })
                         },
                         Err(e) => {
-                            print_debug!(PROGRAM_NAME, stderr(), COLOR_RED, 0, "Error while connecting to Redis Server: {}", e);
+                            print_debug!(PROGRAM_NAME, stderr(), COLOR_RED, 0, "Error while connecting to target Redis Server: {}", e);
                             error = true;
                             break;
                         },
@@ -946,7 +937,6 @@ fn child(id: u16, ordering_regex: Option<Regex>, ordering_limit: Option<usize>, 
                 if !error {
 
                     // Keep working while allowed
-                    let mut jobdone: bool=true;
                     let mut incoming: u64= 0;
                     let mut outgoing: u64= 0;
                     let mut dropped: u64= 0;
@@ -983,107 +973,116 @@ fn child(id: u16, ordering_regex: Option<Regex>, ordering_limit: Option<usize>, 
                             lasttime = get_current_time();
                         }
 
-                        // Get a new package
-                        let item: redis::RedisResult<redis::Value> = source.blpop(config.channel.clone(), 1);
-                        match &item {
-                            Ok(redis::Value::Nil) => {
-                                // {println!("Nil")},
-                                // Process no data
-                                match process_package(id, &ordering_regex, ordering_limit, &qtx, &qrx, &filter_regex, &config, &mut  clients, None, &mut outgoing, &mut dropped, &mut deleted, debug) {
-                                    Ok(v) => jobdone = v,
-                                    Err(e) => {
-                                        error = true;
-                                        print_debug!(PROGRAM_NAME, stderr(), COLOR_RED, 0, "{}: process_package() has failed: {}", id, e);
-                                    },
-                                }
+                        // Check if we got requested to finish
+                        if !request_finish {
 
-                            },
-                            Ok(redis::Value::Int(_)) => {
-                                // Wrong value
-                                // println!("Int(i64)");
-                                print_debug!(PROGRAM_NAME, stderr(), COLOR_RED, 0, "Error while reading from Redis Server '{}:{}': not a queue!", config.hostname, config.port);
-                                error=true;
-                            },
-                            Ok(redis::Value::Data(_)) => {
-                                // Wrong value
-                                // println!("Data(Vec<u8>)");
-                                print_debug!(PROGRAM_NAME, stderr(), COLOR_RED, 0, "Error while reading from Redis Server '{}:{}': not a queue!", config.hostname, config.port);
-                                error=true;
-                            },
-                            Ok(redis::Value::Bulk(data)) => {
-                                // This is the expected data
-                                // println!("Bulk(Vec<Value>)");
-
-                                // Send to all clients
-                                incoming += 1;
-
-                                // Decode package
-                                if let redis::Value::Data(val) = &data[1] {
-                                    match from_utf8(val) {
-                                        Ok(raw_bdata) => {
-                                            // Got data
-                                            match process_package(id, &ordering_regex, ordering_limit, &qtx, &qrx, &filter_regex, &config, &mut  clients, Some(raw_bdata), &mut outgoing, &mut dropped, &mut deleted, debug) {
-                                                Ok(v) => jobdone = v,
-                                                Err(e) => {
-                                                    print_debug!(PROGRAM_NAME, stderr(), COLOR_RED, 0, "{}: Couldn't process package: {}", id, e);
-                                                },
-                                            }
-                                        },
+                            // Get a new package
+                            let item: redis::RedisResult<redis::Value> = source.blpop(config.channel.clone(), 1);
+                            match &item {
+                                Ok(redis::Value::Nil) => {
+                                    // {println!("Nil")},
+                                    // Process no data
+                                    match process_package(id, &ordering_regex, ordering_limit, &qtx, &qrx, &filter_regex, &config, &mut  clients, None, &mut outgoing, &mut dropped, &mut deleted) {
+                                        Ok(_) => (),
                                         Err(e) => {
-                                            print_debug!(PROGRAM_NAME, stderr(), COLOR_RED, 0, "Couldn't decode to UTF8: {}", e);
                                             error = true;
+                                            print_debug!(PROGRAM_NAME, stderr(), COLOR_RED, 0, "{}: process_package() has failed: {}", id, e);
+                                        },
+                                    }
+
+                                },
+                                Ok(redis::Value::Int(_)) => {
+                                    // Wrong value
+                                    // println!("Int(i64)");
+                                    print_debug!(PROGRAM_NAME, stderr(), COLOR_RED, 0, "Error while reading from Redis Server '{}:{}': not a queue!", config.hostname, config.port);
+                                    error=true;
+                                },
+                                Ok(redis::Value::Data(_)) => {
+                                    // Wrong value
+                                    // println!("Data(Vec<u8>)");
+                                    print_debug!(PROGRAM_NAME, stderr(), COLOR_RED, 0, "Error while reading from Redis Server '{}:{}': not a queue!", config.hostname, config.port);
+                                    error=true;
+                                },
+                                Ok(redis::Value::Bulk(data)) => {
+                                    // This is the expected data
+                                    // println!("Bulk(Vec<Value>)");
+
+                                    // Send to all clients
+                                    incoming += 1;
+
+                                    // Decode package
+                                    if let redis::Value::Data(val) = &data[1] {
+                                        match from_utf8(val) {
+                                            Ok(raw_bdata) => {
+                                                // Got data
+                                                match process_package(id, &ordering_regex, ordering_limit, &qtx, &qrx, &filter_regex, &config, &mut  clients, Some(raw_bdata), &mut outgoing, &mut dropped, &mut deleted) {
+                                                    Ok(_) => (),
+                                                    Err(e) => {
+                                                        print_debug!(PROGRAM_NAME, stderr(), COLOR_RED, 0, "{}: Couldn't process package: {}", id, e);
+                                                    },
+                                                }
+                                            },
+                                            Err(e) => {
+                                                print_debug!(PROGRAM_NAME, stderr(), COLOR_RED, 0, "Couldn't decode to UTF8: {}", e);
+                                                error = true;
+                                            }
                                         }
                                     }
-                                }
 
-                            },
-                            Ok(redis::Value::Status(_)) => {
-                                // Wrong value
-                                // println!("Status(String)");
-                                print_debug!(PROGRAM_NAME, stderr(), COLOR_RED, 0, "Error while reading from Redis Server '{}:{}': not a queue!", config.hostname, config.port);
-                                error=true;
-                            },
-                            Ok(redis::Value::Okay) => {
-                                // Wrong value
-                                // println!("Okay")
-                                print_debug!(PROGRAM_NAME, stderr(), COLOR_RED, 0, "Error while reading from Redis Server '{}:{}': not a queue!", config.hostname, config.port);
-                                error = true;
-                            },
-                            Err(e) => {
-                                // There was an error
-                                print_debug!(PROGRAM_NAME, stderr(), COLOR_RED, 0, "Error while reading from Redis Server '{}:{}': {}", config.hostname, config.port, e);
-                                error = true;
-                            },
-                        }
+                                },
+                                Ok(redis::Value::Status(_)) => {
+                                    // Wrong value
+                                    // println!("Status(String)");
+                                    print_debug!(PROGRAM_NAME, stderr(), COLOR_RED, 0, "Error while reading from Redis Server '{}:{}': not a queue!", config.hostname, config.port);
+                                    error=true;
+                                },
+                                Ok(redis::Value::Okay) => {
+                                    // Wrong value
+                                    // println!("Okay")
+                                    print_debug!(PROGRAM_NAME, stderr(), COLOR_RED, 0, "Error while reading from Redis Server '{}:{}': not a queue!", config.hostname, config.port);
+                                    error = true;
+                                },
+                                Err(e) => {
+                                    // There was an error
+                                    print_debug!(PROGRAM_NAME, stderr(), COLOR_RED, 0, "Error while reading from Redis Server '{}:{}': {}", config.hostname, config.port, e);
+                                    error = true;
+                                },
+                            }
 
-                        // Check if our father wants us to finish
-                        match rx.try_recv() {
-                            Ok(true) => print_debug!(PROGRAM_NAME, stderr(), COLOR_RED, 0, "Error while reading message from Parent, got an unexpected message!"),
-                            Ok(false) => {
+                            // Check if our father wants us to finish
+                            match rx.try_recv() {
+                                Ok(true) => print_debug!(PROGRAM_NAME, stderr(), COLOR_RED, 0, "Error while reading message from Parent, got an unexpected message!"),
+                                Ok(false) => {
 
-                                // We are requested to finish
-                                if debug {
+                                    // We are requested to finish
+                                    #[cfg(feature="debug")]
                                     print_debug!(PROGRAM_NAME, stdout(), COLOR_WHITE, 0, "{}: I was told to close!", id);
-                                }
-                                request_finish = true;
+                                    request_finish = true;
 
-                                // Get data left in the queue
-                                match process_package(id, &ordering_regex, ordering_limit, &qtx, &qrx, &filter_regex, &config, &mut  clients, None, &mut outgoing, &mut dropped, &mut deleted, debug) {
-                                    Ok(v) => jobdone = v,
-                                    Err(e) => {
-                                        error = true;
-                                        print_debug!(PROGRAM_NAME, stderr(), COLOR_RED, 0, "{}: process_package() has failed: {}", id, e);
-                                    },
-                                }
-                            },
-                            Err(_) => (),
+                                },
+                                Err(_) => (),
+                            }
+
+                        } else {
+
+                            // Get data left in the queue
+                            let jobdone;
+                            match process_package(id, &ordering_regex, ordering_limit, &qtx, &qrx, &filter_regex, &config, &mut  clients, None, &mut outgoing, &mut dropped, &mut deleted) {
+                                Ok(v) => jobdone = v,
+                                Err(e) => {
+                                    jobdone = false;
+                                    error = true;
+                                    print_debug!(PROGRAM_NAME, stderr(), COLOR_RED, 0, "{}: process_package() has failed: {}", id, e);
+                                },
+                            }
+
+                            // Decide about keep working (if requested to finish and nothing to do)
+                            keepworking = jobdone && !error;
+
                         }
-
-                        // Decide about keep working (if requested to finish and nothing to do)
-                        keepworking = (!request_finish) || jobdone;
 
                         // Error found while processing
-                        if error && keepworking {
+                        if error {
                             thread::sleep(Duration::from_millis(1000));
                             break;
                         }
@@ -1092,6 +1091,7 @@ fn child(id: u16, ordering_regex: Option<Regex>, ordering_limit: Option<usize>, 
 
                     // If we won't keep working
                     if !keepworking {
+
                         // Calculate stucked connections
                         let mut stucked: Vec<(String, bool)> = Vec::new();
                         for client in clients.iter_mut() {
@@ -1120,21 +1120,38 @@ fn child(id: u16, ordering_regex: Option<Regex>, ordering_limit: Option<usize>, 
 
             },
             Err(e) => {
-                print_debug!(PROGRAM_NAME, stderr(), COLOR_RED, 0, "Error while connecting to Redis Server '{}:{}': {}", config.hostname, config.port, e);
+
+                // Show error
+                print_debug!(PROGRAM_NAME, stderr(), COLOR_RED, 0, "Error while connecting to source Redis Server '{}:{}': {}", config.hostname, config.port, e);
                 thread::sleep(Duration::from_millis(1000));
+
             },
         }
+
+        // Check if our father wants us to finish
+        match rx.try_recv() {
+            Ok(true) => print_debug!(PROGRAM_NAME, stderr(), COLOR_RED, 0, "Error while reading message from Parent, got an unexpected message!"),
+            Ok(false) => {
+
+                // We are requested to finish
+                #[cfg(feature="debug")]
+                print_debug!(PROGRAM_NAME, stdout(), COLOR_WHITE, 0, "{}: I was told to close!", id);
+                keepworking = false;
+
+            },
+            Err(_) => (),
+        }
+
     }
 
     // Sleep a sec
     thread::sleep(Duration::from_millis(1500));
 
-    if debug {
-        print_debug!(PROGRAM_NAME, stdout(), COLOR_BLUE, 0, "Child {}: Ends", id);
-    }
+    #[cfg(feature="debug")]
+    print_debug!(PROGRAM_NAME, stdout(), COLOR_BLUE, 0, "Child {}: Ends", id);
 }
 
-fn redis_connect(id: u16, ssl: Option<bool>, hostname: String, port: u16, password: String, is_client: bool, debug: bool) -> Result<redis::Connection, String> {
+fn redis_connect(_id: u16, ssl: Option<bool>, hostname: String, port: u16, password: String, _is_client: bool) -> Result<redis::Connection, String> {
 
     // If Redis server needs secure connection
     let mut uri_scheme = "redis";
@@ -1147,7 +1164,8 @@ fn redis_connect(id: u16, ssl: Option<bool>, hostname: String, port: u16, passwo
     // Prepare URL
     let redis_conn_url = format!("{}://:{}@{}:{}", uri_scheme, password, hostname, port);
 
-    if debug {
+    #[cfg(feature="debug")]
+    {
         let password_debug: String;
         if password.len()>3 {
             password_debug = format!("{}***", &password[..3]);
@@ -1155,10 +1173,10 @@ fn redis_connect(id: u16, ssl: Option<bool>, hostname: String, port: u16, passwo
             password_debug = String::from("***");
         }
         let redis_conn_url_debug = format!("{}://:{}@{}:{}", uri_scheme, password_debug, hostname, port);
-        if is_client {
-            print_debug!(PROGRAM_NAME, stdout(), COLOR_CYAN, 0, "Child {}: Connecting to client: {}", id, redis_conn_url_debug);
+        if _is_client {
+            print_debug!(PROGRAM_NAME, stdout(), COLOR_CYAN, 0, "Child {}: Connecting to client: {}", _id, redis_conn_url_debug);
         } else {
-            print_debug!(PROGRAM_NAME, stdout(), COLOR_BLUE, 0, "Child {}: Connecting: {}", id, redis_conn_url_debug);
+            print_debug!(PROGRAM_NAME, stdout(), COLOR_BLUE, 0, "Child {}: Connecting: {}", _id, redis_conn_url_debug);
         }
     }
 
@@ -1170,18 +1188,14 @@ fn redis_connect(id: u16, ssl: Option<bool>, hostname: String, port: u16, passwo
     }
 }
 
-fn send_to_client(client: &mut RedisLink, data: &str, indebug: bool) -> Result<bool, String> {
-
-    // Avoid debug in this function
-    if indebug {
-    }
-    let debug = false;
+fn send_to_client(client: &mut RedisLink, data: &str) -> Result<bool, String> {
 
     // Preparre channels
     let channel  = client.config.channel.clone();
-    if debug {
-        print_debug!(PROGRAM_NAME, stdout(), COLOR_WHITE, 0, "RPUSH {} bytes to '{}'!", data.len(), channel);
-    }
+
+    #[cfg(feature="debug")]
+    print_debug!(PROGRAM_NAME, stdout(), COLOR_WHITE, 0, "RPUSH {} bytes to '{}'!", data.len(), channel);
+
     let result: redis::RedisResult<i32> = client.link.rpush(&channel, data);
     match result {
         Ok(_) => return Ok(true),
@@ -1189,24 +1203,16 @@ fn send_to_client(client: &mut RedisLink, data: &str, indebug: bool) -> Result<b
     };
 }
 
-fn can_check_queue(timelimit: Option<u64>, checklimit: Option<u64>, packages: u64, lastcheck: u64, indebug:bool) -> bool {
+fn can_check_queue(timelimit: Option<u64>, checklimit: Option<u64>, packages: u64, lastcheck: u64) -> bool {
 
-    // Avoid debug in this function
-    if indebug {
-    }
-    let debug = false;
-
-    // Debugger
-    if debug {
-        print_debug!(PROGRAM_NAME, stdout(), COLOR_CYAN, 0, "can_check_queue(): timelimit={:?}  checklimit={:?}   packages={}   lastcheck:{}", timelimit, checklimit, packages, lastcheck);
-    }
+    #[cfg(feature="debug")]
+    print_debug!(PROGRAM_NAME, stdout(), COLOR_CYAN, 0, "can_check_queue(): timelimit={:?}  checklimit={:?}   packages={}   lastcheck:{}", timelimit, checklimit, packages, lastcheck);
 
     // No config
     if (timelimit==None) && (checklimit==None) {
         // No configuration set, using default CHECK SECONDS
-        if debug {
-            print_debug!(PROGRAM_NAME, stdout(), COLOR_WHITE, 0, "can_check_queue(): No configuration set, using DEFAULT_CHECK_SECONDS={} -> {:?}", DEFAULT_CHECK_SECONDS, (lastcheck + DEFAULT_CHECK_SECONDS) < get_current_time());
-        }
+        #[cfg(feature="debug")]
+        print_debug!(PROGRAM_NAME, stdout(), COLOR_WHITE, 0, "can_check_queue(): No configuration set, using DEFAULT_CHECK_SECONDS={} -> {:?}", DEFAULT_CHECK_SECONDS, (lastcheck + DEFAULT_CHECK_SECONDS) < get_current_time());
         return (lastcheck + DEFAULT_CHECK_SECONDS) < get_current_time();
     } else {
 
@@ -1215,11 +1221,11 @@ fn can_check_queue(timelimit: Option<u64>, checklimit: Option<u64>, packages: u6
             None => (),
             Some(ts) => {
                 if (lastcheck + ts) < get_current_time() {
-                    if debug {
-                        print_debug!(PROGRAM_NAME, stdout(), COLOR_GREEN, 0, "can_check_queue(): timelimit=true");
-                    }
+                    #[cfg(feature="debug")]
+                    print_debug!(PROGRAM_NAME, stdout(), COLOR_GREEN, 0, "can_check_queue(): timelimit=true");
                     return true;
-                } else if debug {
+                } else {
+                    #[cfg(feature="debug")]
                     print_debug!(PROGRAM_NAME, stdout(), COLOR_RED, 0, "can_check_queue(): timelimit=false");
                 }
             }
@@ -1229,29 +1235,24 @@ fn can_check_queue(timelimit: Option<u64>, checklimit: Option<u64>, packages: u6
             None => (),
             Some(_) => {
                 if packages == 0 {
-                    if debug {
-                        print_debug!(PROGRAM_NAME, stdout(), COLOR_GREEN, 0, "can_check_queue(): packages=true");
-                    }
+                    #[cfg(feature="debug")]
+                    print_debug!(PROGRAM_NAME, stdout(), COLOR_GREEN, 0, "can_check_queue(): packages=true");
                     return true;
-                } else if debug {
+                } else {
+                    #[cfg(feature="debug")]
                     print_debug!(PROGRAM_NAME, stdout(), COLOR_RED, 0, "can_check_queue(): packages=false");
                 }
             }
         }
     }
 
-    if debug {
-        print_debug!(PROGRAM_NAME, stdout(), COLOR_RED, 0, "can_check_queue(): default=false");
-    }
+    #[cfg(feature="debug")]
+    print_debug!(PROGRAM_NAME, stdout(), COLOR_RED, 0, "can_check_queue(): default=false");
+
     return false;
 }
 
-fn can_send(id: u16, client: &mut RedisLink, deleted: &mut u64, indebug: bool) -> Result<bool, String> {
-
-    // Avoid debug in this function
-    if indebug {
-    }
-    let debug = false;
+fn can_send(id: u16, client: &mut RedisLink, deleted: &mut u64) -> Result<bool, String> {
 
     // Check if we can check queue
     if can_check_queue(
@@ -1259,7 +1260,6 @@ fn can_send(id: u16, client: &mut RedisLink, deleted: &mut u64, indebug: bool) -
         client.config.checklimit,
         client.packages,
         client.lastcheck,
-        debug
     ) {
 
         // Reset timers
@@ -1314,7 +1314,8 @@ fn can_send(id: u16, client: &mut RedisLink, deleted: &mut u64, indebug: bool) -
                     }
                 }
 
-                if debug {
+                #[cfg(feature="debug")]
+                {
                     if client.sleeping_from==0 {
                         print_debug!(PROGRAM_NAME, stdout(), COLOR_GREEN, 0, "{}: can_send(): not stuck yet :: len={}   softlimit={}   hardlimit{}   =>   true", id, len, client.config.softlimit.unwrap(), client.config.hardlimit.unwrap());
                     } else {
@@ -1332,7 +1333,8 @@ fn can_send(id: u16, client: &mut RedisLink, deleted: &mut u64, indebug: bool) -
         // Count down packages
         client.packages -= 1;
 
-        if debug {
+        #[cfg(feature="debug")]
+        {
             if client.sleeping_from==0 {
                 print_debug!(PROGRAM_NAME, stdout(), COLOR_GREEN, 0, "{}: can_send(): not stucked :: packages={}   =>   true", id, client.packages);
             } else {
@@ -1345,7 +1347,7 @@ fn can_send(id: u16, client: &mut RedisLink, deleted: &mut u64, indebug: bool) -
     }
 }
 
-fn send(id: u16, client: &mut RedisLink, dirty_bdata: &str, deleted: &mut u64, debug: bool) -> Result<bool, String> {
+fn send(id: u16, client: &mut RedisLink, dirty_bdata: &str, deleted: &mut u64) -> Result<bool, String> {
 
 
     match match_filter(client.regex.clone(), client.config.filter_until.clone(), client.config.filter_limit, client.config.filter_replace.clone(), dirty_bdata.to_string()) {
@@ -1353,13 +1355,13 @@ fn send(id: u16, client: &mut RedisLink, dirty_bdata: &str, deleted: &mut u64, d
         MatchAnswer::Ok(false) => return Ok(false),
         MatchAnswer::Box(bdata) => {
             // If we can send to this queue
-            match can_send(id, client, deleted, debug) {
+            match can_send(id, client, deleted) {
 
                 // Allowed to send
                 Ok(true) => {
 
                     // Try to send to this client
-                    match send_to_client(client, &bdata, debug) {
+                    match send_to_client(client, &bdata) {
                         Ok(true) => return Ok(true),
                         Ok(false) => return Ok(false),
                         Err(e) => return Err(format!("error while sending to the client: {}", e)),
@@ -1430,12 +1432,7 @@ fn match_filter(regex: Option<Regex>, until: Option<String>, limit: Option<usize
     }
 }
 
-fn match_ordering(ts: Option<u128>, time: Option<u64>, bdata: Option<String>, buffer: &mut BinaryHeap<Reverse<(u128, (u64, String))>>, indebug: bool) -> Vec<String> {
-
-    // Avoid debug in this function
-    if indebug {
-    }
-    // let debug = false;
+fn match_ordering(ts: Option<u128>, time: Option<u64>, bdata: Option<String>, buffer: &mut BinaryHeap<Reverse<(u128, (u64, String))>>) -> Vec<String> {
 
     let mut list : Vec<String> = Vec::new();
 
@@ -1469,7 +1466,8 @@ fn match_ordering(ts: Option<u128>, time: Option<u64>, bdata: Option<String>, bu
         }
     }
 
-    // if debug {
+    // #[cfg(feature="debug")]
+    // {
     //     println!("BUFFER: {:?}", buffer);
     //     println!("LIST:   {:?}", list);
     // }
@@ -1479,11 +1477,10 @@ fn match_ordering(ts: Option<u128>, time: Option<u64>, bdata: Option<String>, bu
 
 }
 
-fn process_package(id: u16, ordering_regex: &Option<Regex>, ordering_limit: Option<usize>, qtx: &Sender<(u16, Option<u128>, Option<String>)>, qrx: &Receiver<Vec<String>>, filter_regex: &Option<Regex>, config: &Config, clients: &mut Vec<RedisLink>, package: Option<&str>, outgoing: &mut u64, dropped: &mut u64, deleted: &mut u64, debug: bool) -> Result<bool, String> {
+fn process_package(id: u16, ordering_regex: &Option<Regex>, ordering_limit: Option<usize>, qtx: &Sender<(u16, Option<u128>, Option<String>)>, qrx: &Receiver<Vec<String>>, filter_regex: &Option<Regex>, config: &Config, clients: &mut Vec<RedisLink>, package: Option<&str>, outgoing: &mut u64, dropped: &mut u64, deleted: &mut u64) -> Result<bool, String> {
 
-    if debug {
-        print_debug!(PROGRAM_NAME, stdout(), COLOR_CYAN, 0, "{}: Start process_package(): data={:?}", id, package);
-    }
+    #[cfg(feature="debug")]
+    print_debug!(PROGRAM_NAME, stdout(), COLOR_CYAN, 0, "{}: Start process_package(): data={:?}", id, package);
 
     // Check if we got a package
     if let Some(data) = package {
@@ -1537,16 +1534,14 @@ fn process_package(id: u16, ordering_regex: &Option<Regex>, ordering_limit: Opti
         qtx.send((id, None, None)).unwrap();
     }
 
-    if debug {
-        print_debug!(PROGRAM_NAME, stdout(), COLOR_CYAN, 0, "{}: Sent request to Queuer process_package()", id);
-    }
+    #[cfg(feature="debug")]
+    print_debug!(PROGRAM_NAME, stdout(), COLOR_CYAN, 0, "{}: Sent request to Queuer process_package()", id);
 
     // Check if there is some work to be done
     let list:Vec<String> = qrx.recv().unwrap();
 
-    if debug {
-        print_debug!(PROGRAM_NAME, stdout(), COLOR_CYAN, 0, "{}: Got answer from Queuer process_package(): {}", id, list.len());
-    }
+    #[cfg(feature="debug")]
+    print_debug!(PROGRAM_NAME, stdout(), COLOR_CYAN, 0, "{}: Got answer from Queuer process_package(): {}", id, list.len());
 
     // Check if we got packages to send
     let jobdone: bool;
@@ -1560,9 +1555,10 @@ fn process_package(id: u16, ordering_regex: &Option<Regex>, ordering_limit: Opti
 
             match match_filter(filter_regex.clone(), config.filter_until.clone(), config.filter_limit, config.filter_replace.clone(), package.to_string()) {
                 MatchAnswer::Ok(true) => {
-                    if debug {
-                        print_debug!(PROGRAM_NAME, stdout(), COLOR_CYAN, 0, "{}: End unexpected process_package()", id);
-                    }
+
+                    #[cfg(feature="debug")]
+                    print_debug!(PROGRAM_NAME, stdout(), COLOR_CYAN, 0, "{}: End unexpected process_package()", id);
+
                     return Err("Programing Error: Unexpected answer from match_filter() at process_package()".to_string());
                 },
                 MatchAnswer::Ok(false) => errors = total_clients,
@@ -1574,7 +1570,7 @@ fn process_package(id: u16, ordering_regex: &Option<Regex>, ordering_limit: Opti
                         for client in clients.iter_mut() {
 
                             // If we can send to this queu
-                            match send(id, client, &bdata, deleted, debug) {
+                            match send(id, client, &bdata, deleted) {
 
                                 // Data sent
                                 Ok(true) => (),
@@ -1606,7 +1602,7 @@ fn process_package(id: u16, ordering_regex: &Option<Regex>, ordering_limit: Opti
                             let client = &mut clients[0];
 
                             // If we can send to this queu
-                            match send(id, client, &bdata, deleted, debug) {
+                            match send(id, client, &bdata, deleted) {
 
                                 // Data sent
                                 Ok(true) => done = true,
@@ -1656,12 +1652,13 @@ fn process_package(id: u16, ordering_regex: &Option<Regex>, ordering_limit: Opti
     } else {
         // Refresh clients status
         for client in clients.iter_mut() {
-            match can_send(id, client, deleted, debug) {
+            match can_send(id, client, deleted) {
                 Ok(_) => (),  // We do not care if it can send or not (just wanted to refresh client information)
                 Err(e) => {
-                    if debug {
-                        print_debug!(PROGRAM_NAME, stdout(), COLOR_CYAN, 0, "{}: End unexpected process_package()", id);
-                    }
+
+                    #[cfg(feature="debug")]
+                    print_debug!(PROGRAM_NAME, stdout(), COLOR_CYAN, 0, "{}: End unexpected process_package()", id);
+
                     return Err(format!("couldn't check queue for {}: {}", client.config.channel, e));
                 },
             }
@@ -1669,9 +1666,8 @@ fn process_package(id: u16, ordering_regex: &Option<Regex>, ordering_limit: Opti
         jobdone = false;
     }
 
-    if debug {
-        print_debug!(PROGRAM_NAME, stdout(), COLOR_CYAN, 0, "{}: End process_package() - JOBDONE: {:?}", id, jobdone);
-    }
+    #[cfg(feature="debug")]
+    print_debug!(PROGRAM_NAME, stdout(), COLOR_CYAN, 0, "{}: End process_package() - JOBDONE: {:?}", id, jobdone);
 
     // Send if we did or didn't do the job
     return Ok(jobdone);
