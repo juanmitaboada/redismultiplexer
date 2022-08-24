@@ -29,3 +29,6 @@ parts:
 apps:
   redismultiplexer:
     command: bin/redismultiplexer
+    plugs:
+      - home
+      - network
