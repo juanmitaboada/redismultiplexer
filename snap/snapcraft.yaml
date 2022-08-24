@@ -13,7 +13,6 @@ website: https://www.juanmitaboada.com/
 contact: https://www.juanmitaboada.com/contact/
 
 grade: stable
-confinement: classic
 
 architectures:
   - amd64
