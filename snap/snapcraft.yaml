@@ -1,7 +1,7 @@
 name: redismultiplexer
 base: core20
 version: '1.0.6'
-summary: A flexible Redis queue manager written in Rust
+summary: A flexible Redis queue manager
 description: |
   RedisMultiplexer will take care of your queues in Redis.
   The purpose is to move packages from a source queue to

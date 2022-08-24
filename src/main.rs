@@ -169,8 +169,23 @@ fn main() {
 
         // Check if version is requested
         if (args[1] == "version") || (args[1] == "--version") {
-            // Answer with out version
+            // Answer with our version
             println!("{} v{}", PROGRAM_NAME, VERSION);
+        } else if (args[1] == "help") || (args[1] == "--help") || (args[1] == "-h") {
+
+            // Welcome
+            print_debug!(PROGRAM_NAME, stdout(), COLOR_CYAN, COLOR_NOHEAD, "{} v{} ({})", PROGRAM_NAME, VERSION, BUILD_DATE);
+
+            // Missing argument, show some help
+            print_debug!(PROGRAM_NAME, stderr(), COLOR_CYAN, COLOR_NOHEAD, "");
+            print_debug!(PROGRAM_NAME, stderr(), COLOR_YELLOW, COLOR_NOHEAD, "Usage: redismultiplexer <path_to_config.yaml> [debug]");
+            print_debug!(PROGRAM_NAME, stderr(), COLOR_CYAN, COLOR_NOHEAD, "");
+            print_debug!(PROGRAM_NAME, stderr(), COLOR_WHITE, COLOR_NOHEAD, "Documentation at: https://github.com/juanmitaboada/redismultiplexer");
+            print_debug!(PROGRAM_NAME, stderr(), COLOR_CYAN, COLOR_NOHEAD, "");
+
+            // Answer with out version
+            println!("");
+
         } else {
 
             // Welcome
@@ -573,16 +588,18 @@ fn main() {
     } else {
 
         // Welcome
-        print_debug!(PROGRAM_NAME, stdout(), COLOR_CYAN, 0, "{} v{} ({})", PROGRAM_NAME, VERSION, BUILD_DATE);
+        print_debug!(PROGRAM_NAME, stdout(), COLOR_CYAN, COLOR_NOHEAD, "{} v{} ({})", PROGRAM_NAME, VERSION, BUILD_DATE);
 
         // Missing argument, show some help
-        print_debug!(PROGRAM_NAME, stderr(), COLOR_CYAN, 0, "");
-        print_debug!(PROGRAM_NAME, stderr(), COLOR_YELLOW, 0, "Usage: {} <path_to_config.yaml> [debug]", args[0]);
-        print_debug!(PROGRAM_NAME, stderr(), COLOR_CYAN, 0, "");
-        print_debug!(PROGRAM_NAME, stderr(), COLOR_YELLOW, 0, "Systemd: {} <config_prefix> start", args[0]);
-        print_debug!(PROGRAM_NAME, stderr(), COLOR_YELLOW, 0, "    <config_prefix>: is the configuration at /etc/redismultiplexer/<config_prefix>.yaml");
-        print_debug!(PROGRAM_NAME, stderr(), COLOR_YELLOW, 0, "    pid configuration entry will be set as /run/redismultiplexer/<config_prefix>.pid");
-        print_debug!(PROGRAM_NAME, stderr(), COLOR_YELLOW, 0, "    status configuration entry will be set as /run/redismultiplexer/<config_prefix>.status");
+        print_debug!(PROGRAM_NAME, stderr(), COLOR_CYAN, COLOR_NOHEAD, "");
+        print_debug!(PROGRAM_NAME, stderr(), COLOR_YELLOW, COLOR_NOHEAD, "Usage: redismultiplexer <path_to_config.yaml> [debug]");
+        print_debug!(PROGRAM_NAME, stderr(), COLOR_WHITE, COLOR_NOHEAD, "");
+        print_debug!(PROGRAM_NAME, stderr(), COLOR_WHITE, COLOR_NOHEAD, "Documentation at: https://github.com/juanmitaboada/redismultiplexer");
+        print_debug!(PROGRAM_NAME, stderr(), COLOR_WHITE, COLOR_NOHEAD, "");
+        print_debug!(PROGRAM_NAME, stderr(), COLOR_CYAN, COLOR_NOHEAD, "Systemd: redismultiplexer <config_prefix> start");
+        print_debug!(PROGRAM_NAME, stderr(), COLOR_WHITE, COLOR_NOHEAD, "    <config_prefix>: is the configuration at /etc/redismultiplexer/<config_prefix>.yaml");
+        print_debug!(PROGRAM_NAME, stderr(), COLOR_WHITE, COLOR_NOHEAD, "    pid configuration entry will be set as /run/redismultiplexer/<config_prefix>.pid");
+        print_debug!(PROGRAM_NAME, stderr(), COLOR_WHITE, COLOR_NOHEAD, "    status configuration entry will be set as /run/redismultiplexer/<config_prefix>.status");
     }
 }
 
