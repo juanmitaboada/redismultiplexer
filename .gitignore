@@ -13,6 +13,9 @@ Cargo.lock
 *.pid
 *.stat
 
+.bzr
+.bzrignore
+
 etc/
 inject.sh
 test.sh
