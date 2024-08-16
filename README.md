@@ -2,6 +2,8 @@
 
 This is a program to transfer data from queues (push/pop) between different Redis server
 
+[![Get it from the Snap Store](https://snapcraft.io/static/images/badges/en/snap-store-black.svg)](https://snapcraft.io/redismultiplexer)
+
 ## Description
 
 RedisMultiplexer will take care of your queues in Redis. The purpose is to move packages from a source queue to a target queue that may be or not be in the same server and port.
