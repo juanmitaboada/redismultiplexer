@@ -2,21 +2,80 @@ name: Rust
 
 on:
   push:
-    branches: [ "main" ]
+    branches: [ "main", "m*" ]
   pull_request:
     branches: [ "main" ]
 
 env:
   CARGO_TERM_COLOR: always
+  RM_TEST_REDIS_URL: redis://127.0.0.1:6379
+  RM_BENCH_REDIS_URL: redis://127.0.0.1:6379
 
 jobs:
-  build:
-
+  check:
+    name: stable
     runs-on: ubuntu-latest
 
+    services:
+      redis:
+        # Minimum Redis version supported by 2.0.
+        image: redis:6.2
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 6379:6379
+
     steps:
-    - uses: actions/checkout@v3
-    - name: Build
-      run: cargo build --verbose
-    - name: Run tests
-      run: cargo test --verbose
+    - uses: actions/checkout@v7
+    - name: Toolchain
+      run: |
+        rustup toolchain install stable --profile minimal --component rustfmt,clippy
+        rustup default stable
+        rustc --version
+        python3 --version
+    - name: Format
+      run: cargo fmt --all -- --check
+    - name: Clippy
+      run: cargo clippy --locked --all-targets -- -D warnings
+    - name: Test
+      # Release build: debug builds hit A-C4 (see tests/common/mod.rs).
+      run: cargo test --locked --release
+    - name: Bench harness unit tests
+      run: python3 -m unittest discover -s bench -p 'test_*.py'
+    - name: Bench smoke
+      run: >-
+        python3 bench/rmbench.py run --tag smoke --label ci
+        --cmd 'target/release/redismultiplexer {config}'
+        --results "$RUNNER_TEMP/bench"
+
+  msrv:
+    name: MSRV (rust-version in Cargo.toml)
+    runs-on: ubuntu-latest
+
+    services:
+      redis:
+        image: redis:6.2
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 6379:6379
+
+    steps:
+    - uses: actions/checkout@v7
+    - name: Toolchain
+      run: |
+        msrv=$(sed -n 's/^rust-version = "\(.*\)"$/\1/p' Cargo.toml)
+        test -n "$msrv"
+        rustup toolchain install "$msrv" --profile minimal --component clippy
+        rustup default "$msrv"
+        rustc --version
+    - name: Clippy
+      run: cargo clippy --locked --all-targets -- -D warnings
+    - name: Test
+      run: cargo test --locked --release
