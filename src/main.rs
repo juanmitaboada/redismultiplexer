@@ -440,7 +440,8 @@ fn main() {
                         // Spawn a number of threads and collect their join handles
                         for id in 0..inconfig.children {
                             // Get channel for the child
-                            let (qrx, rx) = children_channels.pop().unwrap();
+                            // Take channels in creation order: the queuer answers child id on queues_channels[id]
+                            let (qrx, rx) = children_channels.remove(0);
 
                             // Clone config and execute thread
                             let tx = children_tx.clone();
