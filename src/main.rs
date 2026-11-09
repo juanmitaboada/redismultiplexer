@@ -43,7 +43,7 @@ use std::io::{stderr, stdout, Write};
 use std::process;
 use std::str::from_utf8;
 use std::sync::mpsc;
-use std::sync::mpsc::{Receiver, Sender};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::thread;
 use std::time::Duration;
 use std::{cmp::Reverse, collections::BinaryHeap};
@@ -1151,7 +1151,7 @@ fn queuer(
     // Prepare the retention data
     while keepworking {
         // Check if some worker requested data
-        match children_rx.try_recv() {
+        match children_rx.recv_timeout(Duration::from_millis(1)) {
             Ok((id, ts, package)) => {
                 #[cfg(feature = "debug")]
                 print_debug!(
@@ -1199,7 +1199,9 @@ fn queuer(
                 // Send the size of the queue
                 stat_tx.send(Some(ordered_packages.len())).unwrap();
             }
-            Err(_) => {
+            Err(RecvTimeoutError::Timeout) => (),
+            Err(RecvTimeoutError::Disconnected) => {
+                // Unreachable while main holds queue_tx; pause so it cannot spin
                 thread::sleep(Duration::from_millis(1));
             }
         }
