@@ -1,3 +1,10 @@
+rust-redismultiplexer (1.0.8-1) stable; urgency=medium
+
+  * Queuer waits on its channel instead of polling every millisecond (throughput)
+  * Each child reads its own queuer replies (fixes a hang on stop with 2+ children)
+
+ -- Juanmi Taboada <juanmi@juanmitaboada.com>  Tue, 10 Nov 2026 00:15:50 +0100
+
 rust-redismultiplexer (1.0.7-1) stable; urgency=medium
 
   * Help command added

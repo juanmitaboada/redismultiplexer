@@ -1,6 +1,6 @@
 [package]
 name = "redismultiplexer"
-version = "1.0.7"
+version = "1.0.8"
 edition = "2021"
 rust-version = "1.85"
 description = "This is a program to transfer data from queues (push/pop) between different Redis server"

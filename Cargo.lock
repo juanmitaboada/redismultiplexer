@@ -681,7 +681,7 @@ dependencies = [
 
 [[package]]
 name = "redismultiplexer"
-version = "1.0.7"
+version = "1.0.8"
 dependencies = [
  "build-time",
  "chrono",
