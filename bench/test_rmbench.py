@@ -5,6 +5,7 @@ Run: python3 -m unittest discover -s bench -p 'test_*.py'
 
 from __future__ import annotations
 
+import argparse
 import json
 import re
 import socket
@@ -89,7 +90,10 @@ instances = [{ mode = "spreader", clients = 3 }, { ordering = true }]
         for run in runs:
             rmbench.validate(run, 1 << 30)
         tags = {t for r in runs for t in r.tags}
-        self.assertEqual(tags, {"smoke", "quick", "full"})
+        self.assertEqual(tags, {"smoke", "fast", "quick", "full"})
+        fast = [r for r in runs if "fast" in r.tags]
+        self.assertTrue(fast and all(r.duration > 0 for r in fast))
+        self.assertTrue(all(r.duration == 0 for r in runs if "fast" not in r.tags))
 
     def test_expected_counts(self) -> None:
         inst = {"count": 100, "mode": "replicant", "clients": 3, "filter": "client"}
@@ -99,6 +103,25 @@ instances = [{ mode = "spreader", clients = 3 }, { ordering = true }]
         self.assertEqual(rmbench.expected_total(inst), 99)
         inst = {"count": 100, "mode": "replicant", "clients": 2, "filter": "root"}
         self.assertEqual(rmbench.expected_total(inst), 100)
+
+    def test_expected_counts_for_first_n(self) -> None:
+        # k = seq mod 10; the first 15 packages hold k 0-4 ten times.
+        self.assertEqual(rmbench.matching(15), 10)
+        self.assertEqual(rmbench.matching(14), 9)
+        inst = {"count": 900, "mode": "replicant", "clients": 2, "filter": "client"}
+        self.assertEqual(rmbench.expected_per_target(inst, 15), [10, 15])
+        inst = {"count": 900, "mode": "spreader", "clients": 3, "filter": "root"}
+        self.assertEqual(rmbench.expected_total(inst, 15), 10)
+
+    def test_duration(self) -> None:
+        runs = rmbench.expand(doc(BASE + '[[scenario]]\nname = "t"\nduration = 5\n[[scenario]]\nname = "d"\n'))
+        self.assertEqual([r.duration for r in runs], [5.0, 0.0])
+        self.assertNotIn("duration", runs[0].instances[0])
+        self.assertEqual(rmbench.run_duration(runs[0], argparse.Namespace(duration=None)), 5.0)
+        self.assertEqual(rmbench.run_duration(runs[0], argparse.Namespace(duration=0.0)), 0.0)
+        self.assertEqual(rmbench.run_duration(runs[1], argparse.Namespace(duration=3.0)), 3.0)
+        with self.assertRaises(rmbench.BenchError):
+            rmbench.expand(doc(BASE + '[[scenario]]\nname = "t"\nduration = -1\n'))
 
 
 class PayloadTests(unittest.TestCase):
@@ -194,6 +217,44 @@ class RespTests(unittest.TestCase):
             srv.close()
 
 
+class WindowTests(unittest.TestCase):
+    ENV = {"redis_version": "7", "host_cpus": 2}
+
+    def proc(self, **kw: object) -> rmbench.Proc:
+        inst = {"transport": "list", "count": 900, "payload": 200, "children": 2, "mode": "replicant",
+                "clients": 1, "ordering": False, "filter": "off", "limits": "off"}
+        p = rmbench.Proc(0, inst, "src", ["t0"])
+        p.popen = object()  # type: ignore[assignment]
+        for k, v in kw.items():
+            setattr(p, k, v)
+        return p
+
+    def row(self, run: rmbench.Run, p: rmbench.Proc, duration: float | None = None) -> dict:
+        args = argparse.Namespace(label="x", duration=duration)
+        return rmbench.build_rows(run, 0, "id", [p], args, self.ENV, 0.0)[0]
+
+    def test_time_boxed_counts_the_window(self) -> None:
+        run = rmbench.Run("t", ["fast"], [], duration=5.0)
+        # At the box: 500 taken, 480 delivered; after the stop: 510 taken, all delivered.
+        p = self.proc(t0=10.0, t_change=14.9, t_end=15.0, win=(400, 480), src_left=390, counts=[510])
+        r = self.row(run, p)
+        self.assertEqual((r["msg_s"], r["mib_s"], r["drain_s"]), ("100.0", "0.018", "5.000"))
+        self.assertEqual((r["expected_total"], r["delivered_total"], r["missing"]), (510, 510, 0))
+        self.assertEqual(r["duration_s"], "5")
+
+    def test_drain_run_unchanged(self) -> None:
+        run = rmbench.Run("d", ["quick"], [])
+        p = self.proc(t0=10.0, t_change=12.0, t_end=12.0, win=(0, 900), src_left=0, counts=[900])
+        r = self.row(run, p)
+        self.assertEqual((r["msg_s"], r["drain_s"], r["missing"], r["duration_s"]), ("450.0", "2.000", 0, ""))
+
+    def test_duration_override_turns_box_off(self) -> None:
+        run = rmbench.Run("t", ["fast"], [], duration=5.0)
+        p = self.proc(t0=0.0, t_change=3.0, t_end=3.0, win=(0, 900), src_left=0, counts=[900])
+        r = self.row(run, p, duration=0.0)
+        self.assertEqual((r["msg_s"], r["duration_s"]), ("300.0", ""))
+
+
 class ReportTests(unittest.TestCase):
     def rows(self, label: str, msg: list[str]) -> list[dict]:
         return [{"label": label, "scenario": "s", "status": "ok", "msg_s": m, "missing": "0"} for m in msg]
@@ -214,6 +275,13 @@ class ReportTests(unittest.TestCase):
                 rmbench.read_results(p, None)
             label, groups = rmbench.read_results(p, "y")
             self.assertEqual((label, list(groups)), ("y", ["s"]))
+
+    def test_append_refuses_other_columns(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "r.csv"
+            p.write_text("ts_utc,label\n")
+            with self.assertRaises(rmbench.BenchError):
+                rmbench.append_csv(p, [dict.fromkeys(rmbench.CSV_FIELDS, "")])
 
 
 if __name__ == "__main__":

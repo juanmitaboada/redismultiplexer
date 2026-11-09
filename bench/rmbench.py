@@ -64,7 +64,7 @@ CSV_FIELDS = [
     "payload", "children", "mode", "clients", "ordering", "filter", "limits", "repeat_idx",
     "status", "reason", "msg_s", "mib_s", "drain_s", "stop_s", "wall_s", "expected_total",
     "delivered_total", "missing", "per_target", "status_file_drop", "cpu_user_s", "cpu_sys_s",
-    "max_rss_kib", "harness_cpu_s", "redis_version", "host_cpus",
+    "max_rss_kib", "harness_cpu_s", "redis_version", "host_cpus", "duration_s",
 ]
 
 
@@ -81,6 +81,7 @@ class Run:
     tags: list[str]
     instances: list[dict[str, Any]]
     mixed: bool = False
+    duration: float = 0.0  # > 0: time-boxed run of this many seconds; 0: drain the source
 
 
 def _fmt(v: Any) -> str:
@@ -98,6 +99,9 @@ def expand(doc: dict[str, Any], scale: float = 1.0) -> list[Run]:
         if "name" not in sc:
             raise BenchError("scenario without name")
         base = {**defaults, **{k: v for k, v in sc.items() if k not in ("name", "tags", "instances")}}
+        duration = float(base.get("duration", 0))
+        if duration < 0:
+            raise BenchError(f"{sc['name']}: duration must be 0 or positive")
         axes = [k for k in AXES if isinstance(base.get(k), list)]
         for combo in itertools.product(*(base[k] for k in axes)):
             params = dict(base)
@@ -108,9 +112,9 @@ def expand(doc: dict[str, Any], scale: float = 1.0) -> list[Run]:
             seen.add(name)
             if "instances" in sc:
                 insts = [_scaled({**params, **inst}, scale) for inst in sc["instances"]]
-                runs.append(Run(name, list(sc.get("tags", [])), insts, mixed=True))
+                runs.append(Run(name, list(sc.get("tags", [])), insts, mixed=True, duration=duration))
             else:
-                runs.append(Run(name, list(sc.get("tags", [])), [_scaled(params, scale)]))
+                runs.append(Run(name, list(sc.get("tags", [])), [_scaled(params, scale)], duration=duration))
     return runs
 
 
@@ -121,23 +125,30 @@ def _scaled(params: dict[str, Any], scale: float) -> dict[str, Any]:
     return p
 
 
-def expected_per_target(inst: dict[str, Any]) -> list[int] | None:
-    """Expected count per target (replicant), or None when only the total is known."""
-    n = inst["count"]
-    passed = n // 2 if inst["filter"] == "root" else n
+def matching(n: int) -> int:
+    """Packages with k in 0-4 among the first n (k = seq mod 10): the filter regexes match these."""
+    return (n // 10) * 5 + min(n % 10, 5)
+
+
+def expected_per_target(inst: dict[str, Any], n: int | None = None) -> list[int] | None:
+    """Expected count per target (replicant) for the first n packages (default: all), or None
+    when only the total is known."""
+    n = inst["count"] if n is None else n
+    passed = matching(n) if inst["filter"] == "root" else n
     if inst["mode"] == "spreader":
         return None
     out = []
     for i in range(inst["clients"]):
-        out.append(passed // 2 if (inst["filter"] == "client" and i == 0) else passed)
+        out.append(matching(passed) if (inst["filter"] == "client" and i == 0) else passed)
     return out
 
 
-def expected_total(inst: dict[str, Any]) -> int:
-    per = expected_per_target(inst)
+def expected_total(inst: dict[str, Any], n: int | None = None) -> int:
+    n = inst["count"] if n is None else n
+    per = expected_per_target(inst, n)
     if per is not None:
         return sum(per)
-    return inst["count"] // 2 if inst["filter"] == "root" else inst["count"]
+    return matching(n) if inst["filter"] == "root" else n
 
 
 def validate(run: Run, max_bytes: int) -> None:
@@ -255,6 +266,8 @@ class Proc:
     status_drop: str = ""
     cfg: Path | None = None
     hwm_kib: int = 0
+    t_end: float = 0.0  # end of the measured window: last change (drain) or the time box
+    win: tuple[int, ...] = ()  # list lengths (source, targets...) at t_end
 
 
 def load_source(r: Redis, key: str, count: int, size: int) -> None:
@@ -367,6 +380,7 @@ def run_once(run: Run, rep: int, args: argparse.Namespace, r: Redis, env: dict[s
     for p in procs:
         load_source(r, p.src, p.inst["count"], p.inst["payload"])
 
+    duration = run_duration(run, args)
     settle = args.settle
     if any(p.inst["ordering"] for p in procs):
         settle += ORDERING["buffer_time"] + 1
@@ -400,7 +414,9 @@ def run_once(run: Run, rep: int, args: argparse.Namespace, r: Redis, env: dict[s
             if vals != p.last:
                 p.last, p.t_change = vals, now
             src_left, delivered = vals[0], sum(vals[1:])
-            if src_left == 0 and delivered >= expected_total(p.inst):
+            if duration and now - p.t0 >= duration:
+                p.done, p.t_end, p.win = True, now, vals
+            elif src_left == 0 and delivered >= expected_total(p.inst):
                 p.done = True
             elif src_left == 0 and now - p.t_change >= settle:
                 p.done = True
@@ -415,6 +431,10 @@ def run_once(run: Run, rep: int, args: argparse.Namespace, r: Redis, env: dict[s
                     p.reason = f"exited early with code {p.exit_code}"
     h1 = resource.getrusage(resource.RUSAGE_SELF)
     harness_cpu = (h1.ru_utime - h0.ru_utime) + (h1.ru_stime - h0.ru_stime)
+    for p in procs:
+        if not p.win:
+            # Drained, settled, timed out or failed before the time box: the window ends at the last change.
+            p.t_end, p.win = p.t_change, p.last
 
     for p in procs:
         stop(p)
@@ -442,16 +462,40 @@ def run_once(run: Run, rep: int, args: argparse.Namespace, r: Redis, env: dict[s
     return build_rows(run, rep, run_id, procs, args, env, harness_cpu)
 
 
+def run_duration(run: Run, args: argparse.Namespace) -> float:
+    """Time box in seconds (0 = drain): --duration overrides the scenario's value."""
+    d = getattr(args, "duration", None)
+    return run.duration if d is None else d
+
+
+def _window(p: Proc, timed: bool) -> tuple[float, int, int]:
+    """Measured span, packages consumed and packages delivered in it.
+
+    Drain runs keep their 1.0 definition: consumed counts the source as left after exit.
+    Time-boxed runs count what the lists held when the time box closed; packages still in
+    flight then are delivered during the stop and count as delivered, not as throughput.
+    """
+    span = p.t_end - p.t0
+    if timed:
+        return span, p.inst["count"] - p.win[0], sum(p.win[1:])
+    return span, p.inst["count"] - p.src_left, sum(p.counts)
+
+
 def build_rows(run: Run, rep: int, run_id: str, procs: list[Proc], args: argparse.Namespace,
                env: dict[str, Any], harness_cpu: float) -> list[dict[str, Any]]:
     ts = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    duration = run_duration(run, args)
+    timed = duration > 0
     out = []
     for p in procs:
         inst = p.inst
-        drain = p.t_change - p.t0 if p.popen is not None else 0.0
-        consumed = inst["count"] - p.src_left if p.popen is not None else 0
+        drain, consumed, delivered_w = _window(p, timed) if p.popen is not None else (0.0, 0, 0)
         delivered = sum(p.counts)
-        exp = expected_total(inst)
+        # A time-boxed run leaves packages in the source: only those taken from it are expected.
+        if timed and p.popen is not None:
+            exp = expected_total(inst, inst["count"] - p.src_left)
+        else:
+            exp = expected_total(inst)
         row = {
             "ts_utc": ts, "label": args.label, "run_id": run_id,
             "scenario": f"{run.name}.i{p.idx}" if run.mixed else run.name,
@@ -461,7 +505,7 @@ def build_rows(run: Run, rep: int, run_id: str, procs: list[Proc], args: argpars
             "ordering": _fmt(inst["ordering"]), "filter": inst["filter"], "limits": inst["limits"],
             "repeat_idx": rep, "status": p.status, "reason": p.reason,
             "msg_s": f"{consumed / drain:.1f}" if drain > 0 and p.status != "n/a" else "",
-            "mib_s": f"{delivered * inst['payload'] / drain / 1048576:.3f}" if drain > 0 and p.status != "n/a" else "",
+            "mib_s": f"{delivered_w * inst['payload'] / drain / 1048576:.3f}" if drain > 0 and p.status != "n/a" else "",
             "drain_s": f"{drain:.3f}" if p.popen is not None else "",
             "stop_s": f"{p.stop_s:.3f}" if p.popen is not None else "",
             "wall_s": f"{drain + p.stop_s:.3f}" if p.popen is not None else "",
@@ -475,13 +519,15 @@ def build_rows(run: Run, rep: int, run_id: str, procs: list[Proc], args: argpars
             "max_rss_kib": p.hwm_kib or "",
             "harness_cpu_s": f"{harness_cpu:.3f}" if p.popen is not None else "",
             "redis_version": env["redis_version"], "host_cpus": env["host_cpus"],
+            "duration_s": f"{duration:g}" if timed else "",
         }
         out.append(row)
     if run.mixed and any(p.popen is not None for p in procs):
         started = [p for p in procs if p.popen is not None]
-        span = max(p.t_change for p in started) - min(p.t0 for p in started)
-        consumed = sum(p.inst["count"] - p.src_left for p in started)
-        delivered_bytes = sum(sum(p.counts) * p.inst["payload"] for p in started)
+        span = max(p.t_end for p in started) - min(p.t0 for p in started)
+        windows = [_window(p, timed) for p in started]
+        consumed = sum(w[1] for w in windows)
+        delivered_bytes = sum(w[2] * p.inst["payload"] for w, p in zip(windows, started))
         status = "ok" if all(p.status == "ok" for p in procs) else next(p.status for p in procs if p.status != "ok")
         agg = dict(out[0])
         agg.update({
@@ -509,6 +555,11 @@ def build_rows(run: Run, rep: int, run_id: str, procs: list[Proc], args: argpars
 
 def append_csv(path: Path, rows: list[dict[str, Any]]) -> None:
     new = not path.exists()
+    if not new:
+        with open(path, newline="") as f:
+            header = next(csv.reader(f), [])
+        if header != CSV_FIELDS:
+            raise BenchError(f"{path} has different columns (older harness?); use a new --results directory")
     with open(path, "a", newline="") as f:
         w = csv.DictWriter(f, fieldnames=CSV_FIELDS)
         if new:
@@ -595,7 +646,8 @@ def cmd_list(args: argparse.Namespace) -> int:
             f"k{i['count']} p{i['payload']} c{i['children']} {i['mode']} n{i['clients']} "
             f"o{_fmt(i['ordering'])} f{i['filter']} l{i['limits']}" for i in run.instances
         )
-        print(f"{run.name:28} {','.join(run.tags):8} {desc}")
+        box = f" (time box {run.duration:g} s)" if run.duration else ""
+        print(f"{run.name:28} {','.join(run.tags):8} {desc}{box}")
     print(f"{len(runs)} runs")
     return 0
 
@@ -621,8 +673,12 @@ def cmd_run(args: argparse.Namespace) -> int:
     runs = select(load_scenarios(Path(args.scenarios), args.scale), args.tag, args.scenario)
     if not runs:
         raise BenchError("no scenario selected")
+    if args.duration is not None and args.duration < 0:
+        raise BenchError("--duration must be 0 or positive")
     for run in runs:
         validate(run, args.max_bytes)
+        if run_duration(run, args) >= args.timeout:
+            raise BenchError(f"{run.name}: duration must be shorter than --timeout")
     results = Path(args.results)
     results.mkdir(parents=True, exist_ok=True)
     csv_path = results / "results.csv"
@@ -685,6 +741,8 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--settle", type=float, default=2.0, help="seconds without progress that end a run")
     p.add_argument("--max-bytes", type=int, default=1 << 30, help="Redis memory budget per run")
     p.add_argument("--keep-keys", action="store_true", help="keep the run's keys after it ends")
+    p.add_argument("--duration", type=float, default=None,
+                   help="time box in seconds for every selected run (0 = drain); default: the scenario's")
     p.set_defaults(func=cmd_run)
 
     p = sub.add_parser("list", help="list the expanded runs")

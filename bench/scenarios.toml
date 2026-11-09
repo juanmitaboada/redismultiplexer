@@ -23,6 +23,32 @@ tags = ["smoke"]
 count = 500
 children = 1
 
+# --- fast: time-boxed, about one minute per build whatever its speed ---
+# Each run lasts `duration` seconds and reports what it moved in that time;
+# count only has to outlast the box (900000 x 200 B = 172 MiB per source).
+
+[[scenario]]
+name = "fast"
+tags = ["fast"]
+duration = 5
+count = 900000
+children = [1, 2, 8]
+
+[[scenario]]
+name = "fast_fanout"
+tags = ["fast"]
+duration = 5
+count = 900000
+mode = "spreader"
+clients = 3
+
+[[scenario]]
+name = "fast_ordering"
+tags = ["fast"]
+duration = 5
+count = 900000
+ordering = true
+
 # --- quick: routine runs, under five minutes ---
 
 [[scenario]]

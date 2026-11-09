@@ -13,12 +13,12 @@ Requirements: Python 3.11 or newer (standard library only, `tomllib`), a Redis
 ## Commands
 
 ```
-python3 bench/rmbench.py list [--tag quick|full|smoke] [--scenario GLOB]
+python3 bench/rmbench.py list [--tag fast|quick|full|smoke] [--scenario GLOB]
 python3 bench/rmbench.py run --cmd 'target/release/redismultiplexer {config}' \
     --label rust-1.0.7 --redis redis://127.0.0.1:6390 --results DIR \
     [--tag T ...] [--scenario GLOB ...] [--repeat N] [--scale F] \
     [--renderer CMD] [--config-ext .yaml] \
-    [--timeout 120] [--settle 2] [--max-bytes BYTES] [--keep-keys]
+    [--timeout 120] [--settle 2] [--max-bytes BYTES] [--keep-keys] [--duration S]
 python3 bench/rmbench.py clean --redis URL
 python3 bench/rmbench.py compare A.csv B.csv [--label-a X] [--label-b Y] [--scenario GLOB ...]
 python3 -m unittest discover -s bench -p 'test_*.py'
@@ -28,6 +28,8 @@ python3 -m unittest discover -s bench -p 'test_*.py'
   without a shell, in its own session (SIGINT goes to its process group). The
   program must stay in the foreground.
 - `--redis` defaults to `$RM_BENCH_REDIS_URL`, then `redis://127.0.0.1:6379`.
+- `--duration S` time-boxes every selected run to S seconds (`0` drains the
+  source instead); without it each scenario's own `duration` applies.
 - `run` exits 1 if any run ended in `error` (renderer failure, program not
   starting or exiting early, non-zero exit after SIGINT), 2 on harness errors.
   Timeouts and missing packages are results, not errors.
@@ -54,10 +56,21 @@ aggregate row.
 | ordering | `true`: regex `"ts": *(?P<ts>\d+),`, buffer 1 s, limit 64 |
 | filter | `off`; `root`: `"k": [0-4],` on the first 64 bytes (half pass); `client`: same regex on target 0 with replacement `"K": $1,` (replicant only) |
 | limits | `off`; `countdown`: checklimit 1000, timelimit 3600; `time`: timelimit 1, checklimit 1000000; soft and hard limits are never reached |
+| duration | `0` (default): drain the source; `S` > 0: time-boxed run of S seconds (not a matrix axis) |
 
-Tags: `smoke` (CI), `quick` (routine, about 1.5 min with 1.0.7 on 2 vCPU),
-`full` (whole matrix, about 10-12 min). `--scale F` multiplies every count
-(rounded to a multiple of 30) for when runs get too short to measure.
+Tags: `smoke` (CI), `fast` (five time-boxed runs of 5 s, about one minute per
+build whatever its speed: the quick read of an improvement), `quick` (routine,
+about 1.5 min with 1.0.7 on 2 vCPU), `full` (whole matrix, about 10-12 min).
+`--scale F` multiplies every count (rounded to a multiple of 30) for when runs
+get too short to measure; for a deep comparison of fast builds use
+`--tag quick --repeat 3 --scale 30 --max-bytes 2147483648` (1.0.7 takes about
+an hour).
+
+Drain runs measure how long a fixed amount of work takes, so their length
+grows with how slow the build is. Time-boxed runs measure how much work a
+build does in a fixed time: the source holds more than any build moves in the
+box (`count` is only a cap), the program gets SIGINT when the box closes, and
+what is left in the source is not expected anywhere.
 
 Package format (ASCII, exactly `payload` bytes, deterministic):
 `{"ts": <seq>, "k": <seq mod 10>, "seq": <seq>, "p": "aaa..."}`.
@@ -96,9 +109,9 @@ One row per run and repetition (plus an aggregate row for mixed runs).
 
 | Column | Meaning |
 |---|---|
-| msg_s | source packages consumed / drain_s |
-| mib_s | payload bytes delivered / drain_s |
-| drain_s | from process start to the last change in any watched list |
+| msg_s | source packages consumed / drain_s (time-boxed: consumed when the box closed) |
+| mib_s | payload bytes delivered / drain_s (time-boxed: delivered when the box closed) |
+| drain_s | from process start to the last change in any watched list (time-boxed: to the end of the box, or earlier if the source ran dry) |
 | stop_s | from SIGINT to process exit |
 | wall_s | drain_s + stop_s |
 | expected_total, delivered_total, missing | expected packages in the targets, packages found there after exit, difference |
@@ -107,11 +120,18 @@ One row per run and repetition (plus an aggregate row for mixed runs).
 | cpu_user_s, cpu_sys_s | from `wait4` of the started process (includes children it waited for) |
 | max_rss_kib | peak VmHWM of the started process, sampled every 100 ms from /proc |
 | harness_cpu_s | CPU used by the harness itself while the program was draining |
+| duration_s | time box of the run; empty for drain runs |
 
 A run ends when the targets hold the expected count and the source is empty,
 or when the source is empty and nothing has changed for `--settle` seconds
-(plus the ordering buffer time), or at `--timeout` (`status = timeout`).
-Packages delivered after that point still count in `delivered_total`.
+(plus the ordering buffer time), or at `--timeout` (`status = timeout`), or,
+for a time-boxed run, when its box closes. Packages delivered after that point
+still count in `delivered_total`; for a time-boxed run `expected_total` covers
+every package taken from the source before the program exited.
+
+`results.csv` keeps one set of columns; `run` refuses to append to a file
+written with other columns (an older harness) and asks for a new `--results`
+directory.
 
 Per-run files go to `DIR/logs/<run_id>/`: spec, rendered config, stdout,
 stderr. Each invocation also writes `DIR/report-<label>-<time>.md` with the
