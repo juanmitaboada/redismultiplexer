@@ -126,6 +126,31 @@ But let's go farther, you will need a test data and a learning data in disjoint 
 
 Each of this queues you just made are still in the same server, so you would use one RedisMultiplexer by each of those queues to put data out from that server to another remote server, in this way you would be using RedisMultiplexer as a rentention system in case there are network issues.
 
+## Testing and benchmarking
+
+Unit tests live in `src/main.rs`; integration tests under `tests/` start the
+real binary against a Redis server given by `RM_TEST_REDIS_URL` (default
+`redis://127.0.0.1:6379`, database 0) and use keys under `rmtest:`. They
+need a release build for now, because in debug builds a client without limits
+hits an integer underflow check in `can_send`:
+
+```sh
+redis-server --port 6390 --save '' --appendonly no &
+RM_TEST_REDIS_URL=redis://127.0.0.1:6390 cargo test --release
+```
+
+`bench/` holds a black-box throughput bench (Python 3.11+, standard library
+only) driven by a scenario matrix, with keys under `rmbench:`:
+
+```sh
+python3 bench/rmbench.py run --tag quick --label local \
+    --cmd 'target/release/redismultiplexer {config}' \
+    --redis redis://127.0.0.1:6390 --results /tmp/rmbench
+```
+
+See `bench/README.md` for scenarios, metrics and the renderer contract, and
+`bench/BASELINE.md` for the reference numbers.
+
 ## Full example configuration
 
 ```yaml
