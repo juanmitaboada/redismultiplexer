@@ -13,38 +13,37 @@ pub static COLOR_NOHEADER_NOTAIL: u8 = 3;
 #[allow(dead_code)]
 pub static COLOR_CLOSE: &[u8; 6] = b"\x1B[1;0m";
 #[allow(dead_code)]
-pub static COLOR_SIMPLE_GREY: &[u8; 7] =     b"\x1B[0;30m"; // 0, 30"
+pub static COLOR_SIMPLE_GREY: &[u8; 7] = b"\x1B[0;30m"; // 0, 30"
 #[allow(dead_code)]
-pub static COLOR_SIMPLE_RED: &[u8; 7] =      b"\x1B[0;31m"; // 0, 31"
+pub static COLOR_SIMPLE_RED: &[u8; 7] = b"\x1B[0;31m"; // 0, 31"
 #[allow(dead_code)]
-pub static COLOR_SIMPLE_GREEN: &[u8; 7] =    b"\x1B[0;32m"; // 0, 32"
+pub static COLOR_SIMPLE_GREEN: &[u8; 7] = b"\x1B[0;32m"; // 0, 32"
 #[allow(dead_code)]
-pub static COLOR_SIMPLE_YELLOW: &[u8; 7] =   b"\x1B[0;33m"; // 0, 33"
+pub static COLOR_SIMPLE_YELLOW: &[u8; 7] = b"\x1B[0;33m"; // 0, 33"
 #[allow(dead_code)]
-pub static COLOR_SIMPLE_BLUE: &[u8; 7] =     b"\x1B[0;34m"; // 0, 34"
+pub static COLOR_SIMPLE_BLUE: &[u8; 7] = b"\x1B[0;34m"; // 0, 34"
 #[allow(dead_code)]
-pub static COLOR_SIMPLE_PURPLE: &[u8; 7] =   b"\x1B[0;35m"; // 0, 35"
+pub static COLOR_SIMPLE_PURPLE: &[u8; 7] = b"\x1B[0;35m"; // 0, 35"
 #[allow(dead_code)]
-pub static COLOR_SIMPLE_CYAN: &[u8; 7] =     b"\x1B[0;36m"; // 0, 36"
+pub static COLOR_SIMPLE_CYAN: &[u8; 7] = b"\x1B[0;36m"; // 0, 36"
 #[allow(dead_code)]
-pub static COLOR_SIMPLE_WHITE: &[u8; 7] =    b"\x1B[0;37m"; // 0, 37"
+pub static COLOR_SIMPLE_WHITE: &[u8; 7] = b"\x1B[0;37m"; // 0, 37"
 #[allow(dead_code)]
-pub static COLOR_GREY: &[u8; 7] =           b"\x1B[1;30m"; // 1, 30"
+pub static COLOR_GREY: &[u8; 7] = b"\x1B[1;30m"; // 1, 30"
 #[allow(dead_code)]
-pub static COLOR_RED: &[u8; 7] =            b"\x1B[1;31m"; // 1, 31"
+pub static COLOR_RED: &[u8; 7] = b"\x1B[1;31m"; // 1, 31"
 #[allow(dead_code)]
-pub static COLOR_GREEN: &[u8; 7] =          b"\x1B[1;32m"; // 1, 32"
+pub static COLOR_GREEN: &[u8; 7] = b"\x1B[1;32m"; // 1, 32"
 #[allow(dead_code)]
-pub static COLOR_YELLOW: &[u8; 7] =         b"\x1B[1;33m"; // 1, 33"
+pub static COLOR_YELLOW: &[u8; 7] = b"\x1B[1;33m"; // 1, 33"
 #[allow(dead_code)]
-pub static COLOR_BLUE: &[u8; 7] =           b"\x1B[1;34m"; // 1, 34"
+pub static COLOR_BLUE: &[u8; 7] = b"\x1B[1;34m"; // 1, 34"
 #[allow(dead_code)]
-pub static COLOR_PURPLE: &[u8; 7] =         b"\x1B[1;35m"; // 1, 35"
+pub static COLOR_PURPLE: &[u8; 7] = b"\x1B[1;35m"; // 1, 35"
 #[allow(dead_code)]
-pub static COLOR_CYAN: &[u8; 7] =           b"\x1B[1;36m"; // 1, 36"
+pub static COLOR_CYAN: &[u8; 7] = b"\x1B[1;36m"; // 1, 36"
 #[allow(dead_code)]
-pub static COLOR_WHITE: &[u8; 7] =          b"\x1B[1;37m"; // 1, 37"
-
+pub static COLOR_WHITE: &[u8; 7] = b"\x1B[1;37m"; // 1, 37"
 
 macro_rules! print_debug {
     ($program_name: expr, $output: expr, $color: expr, $format: expr, $msg: expr) => {{
