@@ -1,0 +1,148 @@
+# Bench scenario matrix. See bench/README.md.
+#
+# Every [[scenario]] inherits [defaults]. A list value (except tags and
+# instances) is a matrix axis: the scenario expands to the cartesian product
+# and each run is named "<name>.<axis><value>...".
+
+[defaults]
+transport = "list"      # only "list" today; pub/sub and streams are later milestones
+count = 20000
+payload = 200           # bytes per package
+children = 2
+mode = "replicant"      # replicant | spreader
+clients = 1
+ordering = false        # true: ts regex, buffer 1 s, limit 64
+filter = "off"          # off | root | client
+limits = "off"          # off | countdown | time
+
+# --- smoke (CI) ---
+
+[[scenario]]
+name = "smoke"
+tags = ["smoke"]
+count = 500
+children = 1
+
+# --- quick: routine runs, under five minutes ---
+
+[[scenario]]
+name = "q_base"
+tags = ["quick"]
+count = 5000
+children = [1, 2, 8]
+
+[[scenario]]
+name = "q_fanout"
+tags = ["quick"]
+count = 5000
+mode = "spreader"
+clients = 3
+
+[[scenario]]
+name = "q_limits"
+tags = ["quick"]
+count = 5000
+limits = "countdown"
+
+[[scenario]]
+name = "q_payload4k"
+tags = ["quick"]
+count = 5000
+payload = 4096
+
+[[scenario]]
+name = "q_ordering"
+tags = ["quick"]
+count = 5000
+ordering = true
+
+[[scenario]]
+name = "q_filter"
+tags = ["quick"]
+count = 5000
+filter = ["root", "client"]
+
+[[scenario]]
+name = "q_mixed_plain"
+tags = ["quick"]
+count = 5000
+instances = [
+  { mode = "replicant", clients = 1 },
+  { mode = "spreader", clients = 3 },
+  { limits = "countdown" },
+]
+
+[[scenario]]
+name = "q_mixed"
+tags = ["quick"]
+count = 5000
+instances = [
+  { mode = "replicant", clients = 1 },
+  { mode = "spreader", clients = 3 },
+  { ordering = true },
+  { filter = "root" },
+]
+
+# --- full matrix ---
+
+[[scenario]]
+name = "payload"
+tags = ["full"]
+payload = [64, 200, 4096]
+children = [1, 2, 4, 8]
+
+[[scenario]]
+name = "payload64k"
+tags = ["full"]
+count = 2000
+payload = 65536
+children = [1, 2, 4, 8]
+
+[[scenario]]
+name = "fanout"
+tags = ["full"]
+mode = ["replicant", "spreader"]
+clients = [1, 3]
+children = [1, 4, 8]
+
+[[scenario]]
+name = "limits"
+tags = ["full"]
+limits = "countdown"
+clients = [1, 3]
+
+[[scenario]]
+name = "limits_time"
+tags = ["full"]
+limits = "time"
+
+[[scenario]]
+name = "ordering"
+tags = ["full"]
+ordering = true
+children = [1, 2, 8]
+
+[[scenario]]
+name = "filter"
+tags = ["full"]
+filter = ["root", "client"]
+children = [1, 2, 8]
+
+[[scenario]]
+name = "mixed_plain"
+tags = ["full"]
+instances = [
+  { mode = "replicant", clients = 1 },
+  { mode = "spreader", clients = 3 },
+  { limits = "countdown" },
+]
+
+[[scenario]]
+name = "mixed"
+tags = ["full"]
+instances = [
+  { mode = "replicant", clients = 1 },
+  { mode = "spreader", clients = 3 },
+  { ordering = true },
+  { filter = "root" },
+]

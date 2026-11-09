@@ -16,3 +16,6 @@
 etc/
 inject.sh
 test.sh
+
+# Python bytecode from the bench harness
+__pycache__/
