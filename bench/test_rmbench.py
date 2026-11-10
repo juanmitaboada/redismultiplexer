@@ -276,12 +276,100 @@ class ReportTests(unittest.TestCase):
             label, groups = rmbench.read_results(p, "y")
             self.assertEqual((label, list(groups)), ("y", ["s"]))
 
+    def full_row(self, missing: str, rep: int = 0) -> dict:
+        return dict.fromkeys(rmbench.CSV_FIELDS, "") | {
+            "label": "a", "scenario": "s", "status": "ok", "msg_s": "100", "missing": missing,
+            "repeat_idx": rep, "count": "900", "duration_s": "5"}
+
+    def test_report_and_compare_show_the_worst_missing(self) -> None:
+        # One lossy repetition out of three must not disappear behind the median (M2R-4).
+        rows = [self.full_row(m, i) for i, m in enumerate(["0", "26955", "0"])]
+        self.assertIn("| 26955 |", rmbench.markdown_report(rows, "a"))
+        table = rmbench.compare_table("a", {"s": rows}, "b", {"s": [self.full_row("0")]})
+        self.assertIn("| s | 100 | 100 | 1.00 | 26955 | 0 |", table)
+        # Duplicates (negative missing) are reported as well.
+        self.assertIn("| -2 |", rmbench.markdown_report([self.full_row("0"), self.full_row("-2")], "a"))
+
+    def test_lossy_rows(self) -> None:
+        rows = [self.full_row("0"), self.full_row("7", 1), self.full_row(""), self.full_row("-1", 2)]
+        self.assertEqual([r["repeat_idx"] for r in rmbench.lossy(rows)], [1, 2])
+
+    def test_run_exit_code(self) -> None:
+        self.assertEqual(rmbench.run_exit_code([self.full_row("0"), self.full_row("0")]), 0)
+        self.assertEqual(rmbench.run_exit_code([self.full_row("0"), self.full_row("3")]), rmbench.EXIT_MISSING)
+        self.assertEqual(rmbench.run_exit_code([self.full_row("3"), self.full_row("0") | {"status": "error"}]), 1)
+
+    def test_count_mismatches(self) -> None:
+        a = {"s": [self.full_row("0")], "only_a": [self.full_row("0")]}
+        b = {"s": [self.full_row("0") | {"count": "27000"}]}
+        self.assertEqual(rmbench.count_mismatches(a, b), ["s: count 900 vs 27000"])
+        b = {"s": [self.full_row("0") | {"duration_s": ""}]}
+        self.assertEqual(rmbench.count_mismatches(a, b), ["s: duration_s 5 vs -"])
+        self.assertEqual(rmbench.count_mismatches(a, {"s": [self.full_row("0")]}), [])
+
     def test_append_refuses_other_columns(self) -> None:
         with tempfile.TemporaryDirectory() as d:
             p = Path(d) / "r.csv"
             p.write_text("ts_utc,label\n")
             with self.assertRaises(rmbench.BenchError):
                 rmbench.append_csv(p, [dict.fromkeys(rmbench.CSV_FIELDS, "")])
+
+
+
+class FakeRedis:
+    """Stand-in for resp.Redis in run_once: the source loses `step` packages per LLEN round
+    and they appear in the first target, so every package is accounted for."""
+
+    def __init__(self, step: int) -> None:
+        self.step = step
+        self.lists: dict[str, int] = {}
+        self.src = ""
+
+    def pipeline(self, cmds: list[list[object]]) -> list[object]:
+        out: list[object] = []
+        if cmds and cmds[0][0] == "LLEN":
+            src, tgt = str(cmds[0][1]), str(cmds[1][1])
+            moved = min(self.step, self.lists.get(src, 0))
+            self.lists[src] = self.lists.get(src, 0) - moved
+            self.lists[tgt] = self.lists.get(tgt, 0) + moved
+        for cmd in cmds:
+            name, key = cmd[0], str(cmd[1])
+            if name == "RPUSH":
+                self.lists[key] = self.lists.get(key, 0) + len(cmd) - 2
+                out.append(self.lists[key])
+            elif name == "LLEN":
+                out.append(self.lists.get(key, 0))
+            else:  # DEL, UNLINK
+                self.lists.pop(key, None)
+                out.append(0)
+        return out
+
+
+class RunOnceTests(unittest.TestCase):
+    """run_once end to end with a fake Redis and a program that only waits for SIGINT (M2R-3)."""
+
+    PROGRAM = (f"{sys.executable} -c 'import signal, sys, time; "
+               f"signal.signal(signal.SIGINT, lambda *a: sys.exit(0)); time.sleep(60)' {{config}}")
+
+    def run_box(self, box: float) -> dict:
+        run = rmbench.expand(doc(BASE + f'[[scenario]]\nname = "t"\nduration = {box}\ncount = 900000\n'))[0]
+        with tempfile.TemporaryDirectory() as d:
+            args = argparse.Namespace(
+                label="x", results=d, renderer=rmbench.DEFAULT_RENDERER, config_ext=".yaml",
+                redis="redis://127.0.0.1:6379", cmd=self.PROGRAM, settle=2.0, timeout=10.0,
+                keep_keys=False, duration=None)
+            rows = rmbench.run_once(run, 0, args, FakeRedis(step=100), {"redis_version": "7", "host_cpus": 2})
+        self.assertEqual(len(rows), 1)
+        return rows[0]
+
+    def test_time_box_closes_the_run(self) -> None:
+        r = self.run_box(0.5)
+        self.assertEqual((r["status"], r["duration_s"], r["missing"]), ("ok", "0.5", 0))
+        # The box closes at the first poll after 0.5 s; a doubled or ignored box fails here.
+        self.assertGreaterEqual(float(r["drain_s"]), 0.5)
+        self.assertLess(float(r["drain_s"]), 0.9)
+        self.assertGreater(int(r["delivered_total"]), 0)
+        self.assertGreater(float(r["msg_s"]), 0.0)
 
 
 if __name__ == "__main__":

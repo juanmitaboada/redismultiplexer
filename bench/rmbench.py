@@ -41,6 +41,7 @@ POLL_S = 0.010
 EXIT_WAIT_S = 30.0
 LOAD_CHUNK_BYTES = 8 << 20
 RENDER_UNSUPPORTED = 3
+EXIT_MISSING = 3  # `run`: no run failed, but some repetition did not deliver exactly what was expected
 
 AXES = ("transport", "count", "payload", "children", "mode", "clients", "ordering", "filter", "limits")
 ABBREV = {
@@ -572,6 +573,17 @@ def _median(vals: list[str]) -> float | None:
     return statistics.median(nums) if nums else None
 
 
+def _max_missing(rows: list[dict[str, Any]]) -> float | None:
+    """Worst `missing` across repetitions: a median would hide one lossy repetition (M2R-4)."""
+    nums = [float(r["missing"]) for r in rows if r.get("missing") not in ("", None)]
+    return max(nums, key=abs) if nums else None
+
+
+def lossy(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Rows whose targets did not receive exactly the expected packages."""
+    return [r for r in rows if r.get("missing") not in ("", None) and int(r["missing"]) != 0]
+
+
 def _num(v: float | None, fmt: str = "{:.0f}") -> str:
     return "n/a" if v is None else fmt.format(v)
 
@@ -583,7 +595,7 @@ def markdown_report(rows: list[dict[str, Any]], label: str) -> str:
     lines = [
         f"## {label}",
         "",
-        "| scenario | status | msg/s | MiB/s | drain s | stop s | missing | cpu user s | cpu sys s | max RSS MiB |",
+        "| scenario | status | msg/s | MiB/s | drain s | stop s | missing (worst) | cpu user s | cpu sys s | max RSS MiB |",
         "|---|---|---|---|---|---|---|---|---|---|",
     ]
     for name, rs in groups.items():
@@ -594,7 +606,7 @@ def markdown_report(rows: list[dict[str, Any]], label: str) -> str:
             f"| {name} | {','.join(statuses)} "
             f"| {_num(_median([r['msg_s'] for r in ok]))} | {_num(_median([r['mib_s'] for r in ok]), '{:.2f}')} "
             f"| {_num(_median([r['drain_s'] for r in ok]), '{:.2f}')} | {_num(_median([r['stop_s'] for r in ok]), '{:.2f}')} "
-            f"| {_num(_median([str(r['missing']) for r in ok]))} "
+            f"| {_num(_max_missing(rs))} "
             f"| {_num(_median([r['cpu_user_s'] for r in ok]), '{:.2f}')} | {_num(_median([r['cpu_sys_s'] for r in ok]), '{:.2f}')} "
             f"| {_num(None if rss is None else rss / 1024, '{:.1f}')} |"
         )
@@ -619,7 +631,7 @@ def read_results(path: Path, label: str | None) -> tuple[str, dict[str, list[dic
 def compare_table(a_label: str, a: dict[str, list[dict[str, str]]], b_label: str,
                   b: dict[str, list[dict[str, str]]]) -> str:
     lines = [
-        f"| scenario | {a_label} msg/s | {b_label} msg/s | ratio {b_label}/{a_label} | {a_label} missing | {b_label} missing |",
+        f"| scenario | {a_label} msg/s | {b_label} msg/s | ratio {b_label}/{a_label} | {a_label} missing (worst) | {b_label} missing (worst) |",
         "|---|---|---|---|---|---|",
     ]
     for name in list(dict.fromkeys([*a, *b])):
@@ -631,9 +643,23 @@ def compare_table(a_label: str, a: dict[str, list[dict[str, str]]], b_label: str
         ratio = f"{mb / ma:.2f}" if ma and mb is not None else "n/a"
         lines.append(
             f"| {name} | {_num(ma)} | {_num(mb)} | {ratio} "
-            f"| {_num(stat(a.get(name), 'missing'))} | {_num(stat(b.get(name), 'missing'))} |"
+            f"| {_num(_max_missing(a.get(name, [])))} | {_num(_max_missing(b.get(name, [])))} |"
         )
     return "\n".join(lines) + "\n"
+
+
+def count_mismatches(a: dict[str, list[dict[str, str]]], b: dict[str, list[dict[str, str]]]) -> list[str]:
+    """Scenarios present in both files whose package counts or time boxes differ (M2F-2)."""
+    out = []
+    for name in a:
+        if name not in b:
+            continue
+        for col in ("count", "duration_s"):
+            va = sorted({r.get(col, "") for r in a[name]})
+            vb = sorted({r.get(col, "") for r in b[name]})
+            if va != vb:
+                out.append(f"{name}: {col} {','.join(va) or '-'} vs {','.join(vb) or '-'}")
+    return out
 
 
 # ---------------------------------------------------------------- commands
@@ -687,14 +713,12 @@ def cmd_run(args: argparse.Namespace) -> int:
         version = next((ln.split(":", 1)[1].strip() for ln in info.splitlines() if ln.startswith("redis_version:")), "")
         env = {"redis_version": version, "host_cpus": os.cpu_count()}
         all_rows: list[dict[str, Any]] = []
-        errors = 0
         for run in runs:
             for rep in range(args.repeat):
                 rows = run_once(run, rep, args, r, env)
                 append_csv(csv_path, rows)
                 all_rows.extend(rows)
                 for row in rows:
-                    errors += row["status"] == "error"
                     print(f"{row['scenario']:32} r{rep} {row['status']:7} msg/s={row['msg_s'] or '-':>9} "
                           f"missing={row['missing']!s:>6} {row['reason']}", flush=True)
     stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
@@ -702,7 +726,16 @@ def cmd_run(args: argparse.Namespace) -> int:
     md_path.write_text(markdown_report(all_rows, args.label))
     print(f"\nCSV: {csv_path}\nreport: {md_path}\n")
     print(md_path.read_text())
-    return 1 if errors else 0
+    for row in lossy(all_rows):
+        print(f"MISSING: {row['scenario']} r{row['repeat_idx']} missing={row['missing']}", file=sys.stderr)
+    return run_exit_code(all_rows)
+
+
+def run_exit_code(rows: list[dict[str, Any]]) -> int:
+    """1 if any run ended in error, EXIT_MISSING if any repetition lost or duplicated packages."""
+    if any(r["status"] == "error" for r in rows):
+        return 1
+    return EXIT_MISSING if lossy(rows) else 0
 
 
 def cmd_compare(args: argparse.Namespace) -> int:
@@ -714,6 +747,8 @@ def cmd_compare(args: argparse.Namespace) -> int:
         b = {k: v for k, v in b.items() if keep(k)}
     if la == lb:
         la, lb = f"A:{la}", f"B:{lb}"
+    for warning in count_mismatches(a, b):
+        print(f"warning: not comparable, {warning}", file=sys.stderr)
     print(compare_table(la, a, lb, b), end="")
     return 0
 

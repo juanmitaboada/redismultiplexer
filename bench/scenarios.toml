@@ -49,6 +49,20 @@ duration = 5
 count = 900000
 ordering = true
 
+[[scenario]]
+name = "fast_filter"
+tags = ["fast"]
+duration = 5
+count = 900000
+filter = "root"
+
+[[scenario]]
+name = "fast_limits"
+tags = ["fast"]
+duration = 5
+count = 900000
+limits = "countdown"
+
 # --- quick: routine runs, under five minutes ---
 
 [[scenario]]

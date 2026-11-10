@@ -31,8 +31,12 @@ python3 -m unittest discover -s bench -p 'test_*.py'
 - `--duration S` time-boxes every selected run to S seconds (`0` drains the
   source instead); without it each scenario's own `duration` applies.
 - `run` exits 1 if any run ended in `error` (renderer failure, program not
-  starting or exiting early, non-zero exit after SIGINT), 2 on harness errors.
-  Timeouts and missing packages are results, not errors.
+  starting or exiting early, non-zero exit after SIGINT), 3 if no run failed
+  but some repetition has `missing` other than 0 (each one is listed on
+  stderr as `MISSING: ...`), 2 on harness errors. Timeouts are results, not
+  errors.
+- `compare` prints `warning: not comparable, ...` on stderr for every scenario
+  whose package count or time box differs between the two files.
 - `clean` deletes every `rmbench:*` key with SCAN and UNLINK, never KEYS.
 
 ## Scenarios
@@ -58,8 +62,9 @@ aggregate row.
 | limits | `off`; `countdown`: checklimit 1000, timelimit 3600; `time`: timelimit 1, checklimit 1000000; soft and hard limits are never reached |
 | duration | `0` (default): drain the source; `S` > 0: time-boxed run of S seconds (not a matrix axis) |
 
-Tags: `smoke` (CI), `fast` (five time-boxed runs of 5 s, about one minute per
-build whatever its speed: the quick read of an improvement), `quick` (routine,
+Tags: `smoke` (CI), `fast` (seven time-boxed runs of 5 s: plain with 1, 2 and 8
+children, spreader, ordering, root filter and countdown limits; about 1.5 min
+per build whatever its speed: the quick read of an improvement), `quick` (routine,
 about 1.5 min with 1.0.7 on 2 vCPU), `full` (whole matrix, about 10-12 min).
 `--scale F` multiplies every count (rounded to a multiple of 30) for when runs
 get too short to measure; for a deep comparison of fast builds use
@@ -135,4 +140,6 @@ directory.
 
 Per-run files go to `DIR/logs/<run_id>/`: spec, rendered config, stdout,
 stderr. Each invocation also writes `DIR/report-<label>-<time>.md` with the
-median of the repetitions per scenario.
+median of the repetitions per scenario, except `missing`, where the report and
+`compare` show the worst repetition (largest absolute value), so a single lossy
+repetition is never hidden.
