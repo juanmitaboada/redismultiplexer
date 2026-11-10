@@ -1386,7 +1386,7 @@ fn child(
                         if !request_finish {
                             // Get a new package
                             let item: redis::RedisResult<redis::Value> =
-                                source.blpop(config.channel.clone(), 1);
+                                blpop_cmd(&config.channel).query(&mut source);
                             match &item {
                                 Ok(redis::Value::Nil) => {
                                     // {println!("Nil")},
@@ -1426,13 +1426,13 @@ fn child(
                                     print_debug!(PROGRAM_NAME, stderr(), COLOR_RED, 0, "Error while reading from Redis Server '{}:{}': not a queue!", config.hostname, config.port);
                                     error = true;
                                 }
-                                Ok(redis::Value::Data(_)) => {
+                                Ok(redis::Value::BulkString(_)) => {
                                     // Wrong value
                                     // println!("Data(Vec<u8>)");
                                     print_debug!(PROGRAM_NAME, stderr(), COLOR_RED, 0, "Error while reading from Redis Server '{}:{}': not a queue!", config.hostname, config.port);
                                     error = true;
                                 }
-                                Ok(redis::Value::Bulk(data)) => {
+                                Ok(redis::Value::Array(data)) => {
                                     // This is the expected data
                                     // println!("Bulk(Vec<Value>)");
 
@@ -1440,7 +1440,7 @@ fn child(
                                     incoming += 1;
 
                                     // Decode package
-                                    if let redis::Value::Data(val) = &data[1] {
+                                    if let redis::Value::BulkString(val) = &data[1] {
                                         match from_utf8(val) {
                                             Ok(raw_bdata) => {
                                                 // Got data
@@ -1486,7 +1486,7 @@ fn child(
                                         }
                                     }
                                 }
-                                Ok(redis::Value::Status(_)) => {
+                                Ok(redis::Value::SimpleString(_)) => {
                                     // Wrong value
                                     // println!("Status(String)");
                                     print_debug!(PROGRAM_NAME, stderr(), COLOR_RED, 0, "Error while reading from Redis Server '{}:{}': not a queue!", config.hostname, config.port);
@@ -1495,6 +1495,11 @@ fn child(
                                 Ok(redis::Value::Okay) => {
                                     // Wrong value
                                     // println!("Okay")
+                                    print_debug!(PROGRAM_NAME, stderr(), COLOR_RED, 0, "Error while reading from Redis Server '{}:{}': not a queue!", config.hostname, config.port);
+                                    error = true;
+                                }
+                                Ok(_) => {
+                                    // RESP3-only reply types, never sent to a RESP2 connection: handled as a wrong value
                                     print_debug!(PROGRAM_NAME, stderr(), COLOR_RED, 0, "Error while reading from Redis Server '{}:{}': not a queue!", config.hostname, config.port);
                                     error = true;
                                 }
@@ -1703,6 +1708,14 @@ fn redis_connect(
         Ok(c) => return Ok(c),
         Err(e) => return Err(format!("Couldn't connect to Redis Server: {}", e)),
     }
+}
+
+/// BLPOP with a one second timeout, sent as an integer as redis 0.19 did:
+/// Commands::blpop takes an f64 and sends "1.0", which servers before 6.0 reject
+fn blpop_cmd(channel: &str) -> redis::Cmd {
+    let mut cmd = redis::cmd("BLPOP");
+    cmd.arg(channel).arg(1);
+    cmd
 }
 
 fn send_to_client(client: &mut RedisLink, data: &str) -> Result<bool, String> {
@@ -2447,6 +2460,16 @@ mod tests {
             MatchAnswer::Ok(true) => panic!("match_filter returned Ok(true)"),
             MatchAnswer::Err(e) => panic!("match_filter returned Err({})", e),
         }
+    }
+
+    // --- redis commands ---
+
+    #[test]
+    fn blpop_sends_an_integer_timeout() {
+        assert_eq!(
+            blpop_cmd("src").get_packed_command(),
+            b"*3\r\n$5\r\nBLPOP\r\n$3\r\nsrc\r\n$1\r\n1\r\n".to_vec()
+        );
     }
 
     // --- match_filter ---

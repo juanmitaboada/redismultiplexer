@@ -38,7 +38,7 @@ debug = []
 #default = ["debug"]
 
 [dependencies]
-redis = { version = "0.19.0", features = ["tls", "r2d2"] }
+redis = { version = "0.32.7", default-features = false, features = ["tls-native-tls"] }
 chrono = "0.4.19"
 serde = { version = "1.0", features = ["derive"] }
 serde_yaml = "0.8"
