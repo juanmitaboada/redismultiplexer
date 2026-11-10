@@ -55,6 +55,28 @@ jobs:
         python3 bench/rmbench.py run --tag smoke --label ci
         --cmd 'target/release/redismultiplexer {config}'
         --results "$RUNNER_TEMP/bench"
+    - name: Bench time box smoke
+      # --scale 400 loads 200010 packages, more than any build moves in 1 s, so the
+      # time box closes before the source drains; without it the run ends as a drain run.
+      run: >-
+        python3 bench/rmbench.py run --tag smoke --duration 1 --scale 400 --label ci-timebox
+        --cmd 'target/release/redismultiplexer {config}'
+        --results "$RUNNER_TEMP/bench-timebox"
+    - name: Check the time box closed
+      run: |
+        python3 - "$RUNNER_TEMP/bench-timebox/results.csv" <<'EOF'
+        import csv
+        import sys
+
+        rows = list(csv.DictReader(open(sys.argv[1], newline="")))
+        assert len(rows) == 1, f"expected 1 row, got {len(rows)}"
+        r = rows[0]
+        print({k: r[k] for k in ("status", "duration_s", "count", "expected_total", "missing")})
+        assert r["status"] == "ok", r["status"]
+        assert r["duration_s"] == "1", r["duration_s"]
+        assert int(r["expected_total"]) < int(r["count"]), "source drained before the time box closed"
+        assert int(r["missing"]) == 0, r["missing"]
+        EOF
 
   msrv:
     name: MSRV (rust-version in Cargo.toml)
