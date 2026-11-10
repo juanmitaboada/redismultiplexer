@@ -1,5 +1,8 @@
 # RedisMultiplexer
 
+[![CI](https://github.com/juanmitaboada/redismultiplexer/actions/workflows/rust.yml/badge.svg?branch=main)](https://github.com/juanmitaboada/redismultiplexer/actions/workflows/rust.yml)
+[![Quality Gate](https://sonarcloud.io/api/project_badges/measure?project=juanmitaboada_redismultiplexer&metric=alert_status)](https://sonarcloud.io/summary/new_code?id=juanmitaboada_redismultiplexer)
+
 This is a program to transfer data from queues (push/pop) between different Redis server
 
 [![Get it from the Snap Store](https://snapcraft.io/static/images/badges/en/snap-store-black.svg)](https://snapcraft.io/redismultiplexer)
