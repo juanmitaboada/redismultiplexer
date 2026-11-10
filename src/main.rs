@@ -1095,7 +1095,7 @@ fn get_config(path_to_config: String) -> Result<Config, String> {
                 }
             }
 
-            match serde_yaml::from_str(&data[..]) {
+            match parse_yaml(&data) {
                 Ok(v) => {
                     // Do basic verifications on configuration
                     match verify_config(v) {
@@ -1123,6 +1123,11 @@ fn get_config(path_to_config: String) -> Result<Config, String> {
         let error = format!("Configuration at '{}' not found!", path_to_config);
         return Err(error);
     }
+}
+
+/// Parse the YAML text of a configuration, without any check of its values
+fn parse_yaml(data: &str) -> Result<Config, String> {
+    serde_norway::from_str(data).map_err(|e| e.to_string())
 }
 
 /// Manage ordered packages in a centralized way
@@ -2460,6 +2465,119 @@ mod tests {
             MatchAnswer::Ok(true) => panic!("match_filter returned Ok(true)"),
             MatchAnswer::Err(e) => panic!("match_filter returned Err({})", e),
         }
+    }
+
+    // --- YAML parsing (pins what configuration files of earlier versions parse to) ---
+
+    const YAML_BASE: &str = "name: s\nhostname: h\nport: 6379\npassword: x\nchannel: c\nchildren: 1\nmode: replicant\nclients:\n  - name: t\n    hostname: h\n    port: 6379\n    password: x\n    channel: d\n";
+
+    fn yaml(extra_root: &str) -> Result<Config, String> {
+        parse_yaml(&format!("{}{}", extra_root, YAML_BASE))
+    }
+
+    fn yaml_replace(from: &str, to: &str) -> Result<Config, String> {
+        assert!(YAML_BASE.contains(from), "{} not in the base", from);
+        parse_yaml(&YAML_BASE.replacen(from, to, 1))
+    }
+
+    #[test]
+    fn yaml_minimal_config() {
+        let c = yaml("").unwrap();
+        assert_eq!(
+            (c.name.as_str(), c.port, c.password.as_str()),
+            ("s", 6379, "x")
+        );
+        assert_eq!(
+            (c.ssl, c.filter.clone(), c.ordering_limit),
+            (None, None, None)
+        );
+        assert_eq!(c.clients.len(), 1);
+        assert_eq!(c.clients[0].channel, "d");
+    }
+
+    #[test]
+    fn yaml_scalars_as_earlier_versions_read_them() {
+        assert_eq!(yaml("ssl: true\n").unwrap().ssl, Some(true));
+        assert_eq!(yaml("ssl: false\n").unwrap().ssl, Some(false));
+        // serde_yaml 0.8 rejected the YAML 1.1 spelling "True"; it is accepted now
+        assert_eq!(yaml("ssl: True\n").unwrap().ssl, Some(true));
+        assert_eq!(
+            yaml_replace("password: x\nchannel: c", "password: 1234\nchannel: c")
+                .unwrap()
+                .password,
+            "1234"
+        );
+        assert_eq!(yaml_replace("name: s\n", "name: 1\n").unwrap().name, "1");
+        assert_eq!(
+            yaml_replace(
+                "port: 6379\npassword: x\nchannel: c",
+                "port: 0x18EB\npassword: x\nchannel: c"
+            )
+            .unwrap()
+            .port,
+            6379
+        );
+        assert_eq!(
+            yaml("filter: 'a'\nfilter_limit: 11\n")
+                .unwrap()
+                .filter_limit,
+            Some(11)
+        );
+        assert_eq!(
+            yaml("ordering: '.*\"ts\": *(?P<ts>\\d+),.*#'\n")
+                .unwrap()
+                .ordering
+                .unwrap(),
+            ".*\"ts\": *(?P<ts>\\d+),.*#"
+        );
+        assert_eq!(yaml("unknown_key: 1\n").unwrap().name, "s");
+    }
+
+    #[test]
+    fn yaml_empty_password() {
+        let empty = yaml_replace("password: x\nchannel: c", "password:\nchannel: c").unwrap();
+        let tilde = yaml_replace("password: x\nchannel: c", "password: ~\nchannel: c").unwrap();
+        // serde_yaml 0.8 read an empty value as the literal "~" and sent AUTH ~ with it
+        assert_eq!(
+            (empty.password.as_str(), tilde.password.as_str()),
+            ("", "~")
+        );
+        let quoted = yaml_replace("password: x\nchannel: c", "password: ''\nchannel: c").unwrap();
+        assert_eq!(quoted.password, "");
+    }
+
+    #[test]
+    fn yaml_rejections() {
+        assert!(yaml("ssl: yes\n").is_err());
+        assert!(yaml_replace(
+            "port: 6379\npassword: x\nchannel: c",
+            "port: '6379'\npassword: x\nchannel: c"
+        )
+        .is_err());
+        assert!(yaml("filter: 'a'\nfilter_limit: 1.0\n").is_err());
+        assert!(yaml("name: twice\n").is_err());
+        assert!(yaml_replace("children: 1", "children: 70000").is_err());
+        assert!(yaml_replace("channel: c\n", "").is_err());
+    }
+
+    #[test]
+    fn yaml_readme_example() {
+        let readme = include_str!("../README.md");
+        let start = readme.find("## Full example configuration").unwrap();
+        let body = &readme[start..];
+        let begin = body.find("```yaml\n").unwrap() + "```yaml\n".len();
+        let end = begin + body[begin..].find("```").unwrap();
+        let c = parse_yaml(&body[begin..end]).unwrap();
+        assert_eq!(
+            (c.name.as_str(), c.children, c.mode.as_str()),
+            ("Source", 2, "replicant")
+        );
+        assert_eq!(c.ordering_buffer_time, Some(30));
+        assert_eq!(c.clients.len(), 2);
+        assert_eq!(c.clients[0].filter.as_deref(), Some("^(1|3|5|7|9)#"));
+        assert_eq!(c.clients[0].filter_replace.as_deref(), Some(""));
+        assert_eq!(c.clients[1].deleteblock, None);
+        assert!(verify_config(c).is_ok());
     }
 
     // --- redis commands ---

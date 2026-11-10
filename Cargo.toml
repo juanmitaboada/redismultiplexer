@@ -41,7 +41,7 @@ debug = []
 redis = { version = "0.32.7", default-features = false, features = ["tls-native-tls"] }
 chrono = "0.4.19"
 serde = { version = "1.0", features = ["derive"] }
-serde_yaml = "0.8"
+serde_norway = "0.9"
 thread_tryjoin = "0.3.0"
 ctrlc = "3.2.2"
 dict = "0.1.5"
