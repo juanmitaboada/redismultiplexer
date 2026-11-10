@@ -6,6 +6,11 @@ on:
   pull_request:
     branches: [ "main" ]
 
+# Least privilege: no job writes to the repository; SonarQube Cloud decorates pull
+# requests through its own GitHub App, not through this token.
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   RM_TEST_REDIS_URL: redis://127.0.0.1:6379
@@ -18,8 +23,8 @@ jobs:
 
     services:
       redis:
-        # Minimum Redis version supported by 2.0.
-        image: redis:6.2
+        # Minimum Redis version supported by 2.0, pinned by digest like the actions.
+        image: redis:6.2@sha256:a08354a6199cf1008897c893e1a679e6cf7ee803ee9f34a50b991b8200a0e8dc # 6.2
         options: >-
           --health-cmd "redis-cli ping"
           --health-interval 10s
@@ -29,7 +34,7 @@ jobs:
           - 6379:6379
 
     steps:
-    - uses: actions/checkout@v7
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
     - name: Toolchain
       run: |
         rustup toolchain install stable --profile minimal --component rustfmt,clippy
@@ -57,7 +62,7 @@ jobs:
 
     services:
       redis:
-        image: redis:6.2
+        image: redis:6.2@sha256:a08354a6199cf1008897c893e1a679e6cf7ee803ee9f34a50b991b8200a0e8dc # 6.2
         options: >-
           --health-cmd "redis-cli ping"
           --health-interval 10s
@@ -67,7 +72,7 @@ jobs:
           - 6379:6379
 
     steps:
-    - uses: actions/checkout@v7
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
     - name: Toolchain
       run: |
         msrv=$(sed -n 's/^rust-version = "\(.*\)"$/\1/p' Cargo.toml)
