@@ -118,3 +118,127 @@ Every run ended `ok` with 0 missing packages.
 - The harness used about 1.2 % of one CPU while the runs were draining.
 - A first quick pass overlapped other work on the laptop and was discarded;
   the table above is the repeated pass (within 1-2 % of the first).
+
+# 1.0.8
+
+Release 1.0.8: the queuer waits on its channel instead of polling every
+millisecond, and each worker reads its own queuer replies. 1.0.7 and 1.0.8
+were measured on the same day, on the same machine, with the same harness
+(the one that adds the time-boxed `fast` tier), so the tables below compare
+like with like. The 1.0.7 tables above were taken with the earlier harness and
+counts and stay as they were.
+
+## Environment
+
+As for 1.0.7 above (same laptop, OS, kernel, Redis 8.0.5 on 127.0.0.1:6390,
+rustc 1.99.1, Python 3.14.4). Binaries: 1.0.7 from commit 76deefc and 1.0.8
+from the `release: 1.0.8` commit, both `cargo build --locked --release`.
+Date: 2026-11-10.
+
+## How it was measured
+
+```sh
+# fast: time-boxed, 5 s per run, about 2 min per build for 3 repetitions
+python3 bench/rmbench.py run --tag fast --repeat 3 --label rust-1.0.8 \
+    --cmd 'target/release/redismultiplexer {config}' \
+    --redis redis://127.0.0.1:6390 --results ~/rmbench/fast/1.0.8
+# deep: quick matrix with 30 times the counts (150000 packages per source),
+# about 60 min for 1.0.7 and 5 min for 1.0.8
+python3 bench/rmbench.py run --tag quick --repeat 3 --scale 30 \
+    --max-bytes 2147483648 --timeout 600 --label rust-1.0.8 \
+    --cmd 'target/release/redismultiplexer {config}' \
+    --redis redis://127.0.0.1:6390 --results ~/rmbench/deep/1.0.8
+# q_base.c8 again at --scale 60: at scale 30 1.0.8 drains it in 1.6 s
+python3 bench/rmbench.py run --scenario q_base.c8 --repeat 3 --scale 60 \
+    --max-bytes 2147483648 --timeout 600 --label rust-1.0.8 \
+    --cmd 'target/release/redismultiplexer {config}' \
+    --redis redis://127.0.0.1:6390 --results ~/rmbench/deep-c8/1.0.8
+```
+
+The same commands with `--label rust-1.0.7` and the 1.0.7 binary give the
+1.0.7 columns. Every run of both builds ended `ok` with 0 missing packages.
+
+## fast (median of 3, msg/s)
+
+| scenario | rust-1.0.7 msg/s | rust-1.0.8 msg/s | ratio rust-1.0.8/rust-1.0.7 | rust-1.0.7 missing | rust-1.0.8 missing |
+|---|---|---|---|---|---|
+| fast.c1 | 918 | 29557 | 32.20 | 0 | 0 |
+| fast.c2 | 1836 | 38264 | 20.84 | 0 | 0 |
+| fast.c8 | 7333 | 86405 | 11.78 | 0 | 0 |
+| fast_fanout | 1844 | 38292 | 20.76 | 0 | 0 |
+| fast_ordering | 1776 | 39722 | 22.36 | 0 | 0 |
+
+1.0.8 detail:
+
+| scenario | status | msg/s | MiB/s | drain s | stop s | missing | cpu user s | cpu sys s | max RSS MiB |
+|---|---|---|---|---|---|---|---|---|---|
+| fast.c1 | ok | 29557 | 5.64 | 5.01 | 3.02 | 0 | 1.04 | 2.37 | 7.0 |
+| fast.c2 | ok | 38264 | 7.30 | 5.01 | 3.01 | 0 | 2.06 | 4.31 | 7.2 |
+| fast.c8 | ok | 86405 | 16.48 | 5.01 | 2.02 | 0 | 4.65 | 9.45 | 9.2 |
+| fast_fanout | ok | 38292 | 7.30 | 5.00 | 2.03 | 0 | 1.78 | 3.64 | 7.4 |
+| fast_ordering | ok | 39722 | 5.60 | 5.00 | 3.02 | 0 | 2.13 | 3.75 | 40.1 |
+
+## deep: quick at scale 30 (median of 3, msg/s)
+
+| scenario | rust-1.0.7 msg/s | rust-1.0.8 msg/s | ratio rust-1.0.8/rust-1.0.7 | rust-1.0.7 missing | rust-1.0.8 missing |
+|---|---|---|---|---|---|
+| q_base.c1 | 922 | 30295 | 32.86 | 0 | 0 |
+| q_base.c2 | 1838 | 38316 | 20.84 | 0 | 0 |
+| q_base.c8 (scale 60) | 7150 | 91165 | 12.75 | 0 | 0 |
+| q_fanout | 1831 | 38642 | 21.10 | 0 | 0 |
+| q_limits | 1833 | 38887 | 21.21 | 0 | 0 |
+| q_payload4k | 1836 | 32604 | 17.76 | 0 | 0 |
+| q_ordering | 1727 | 29590 | 17.13 | 0 | 0 |
+| q_filter.froot | 1834 | 40920 | 22.31 | 0 | 0 |
+| q_filter.fclient | 1832 | 38926 | 21.24 | 0 | 0 |
+| q_mixed_plain.i0 | 1854 | 28994 | 15.63 | 0 | 0 |
+| q_mixed_plain.i1 | 1856 | 28658 | 15.44 | 0 | 0 |
+| q_mixed_plain.i2 | 1855 | 28440 | 15.33 | 0 | 0 |
+| q_mixed_plain | 5562 | 85306 | 15.34 | 0 | 0 |
+| q_mixed.i0 | 1859 | 23906 | 12.86 | 0 | 0 |
+| q_mixed.i1 | 1860 | 23909 | 12.86 | 0 | 0 |
+| q_mixed.i2 | 1752 | 17972 | 10.26 | 0 | 0 |
+| q_mixed.i3 | 1860 | 26349 | 14.17 | 0 | 0 |
+| q_mixed | 7009 | 71882 | 10.26 | 0 | 0 |
+
+1.0.8 detail:
+
+| scenario | status | msg/s | MiB/s | drain s | stop s | missing | cpu user s | cpu sys s | max RSS MiB |
+|---|---|---|---|---|---|---|---|---|---|
+| q_base.c1 | ok | 30295 | 5.78 | 4.95 | 3.06 | 0 | 0.88 | 1.94 | 6.8 |
+| q_base.c2 | ok | 38316 | 7.31 | 3.92 | 3.11 | 0 | 1.36 | 2.84 | 7.2 |
+| q_base.c8 (scale 60) | ok | 91165 | 17.39 | 3.29 | 2.74 | 0 | 3.13 | 6.33 | 9.5 |
+| q_fanout | ok | 38642 | 7.37 | 3.88 | 3.14 | 0 | 1.38 | 2.82 | 7.3 |
+| q_limits | ok | 38887 | 7.42 | 3.86 | 3.16 | 0 | 1.38 | 2.81 | 7.3 |
+| q_payload4k | ok | 32604 | 127.36 | 4.60 | 3.42 | 0 | 1.79 | 3.12 | 7.2 |
+| q_ordering | ok | 29590 | 5.64 | 5.07 | 3.88 | 0 | 1.59 | 2.85 | 40.1 |
+| q_filter.froot | ok | 40920 | 3.90 | 3.67 | 3.37 | 0 | 2.16 | 2.30 | 7.9 |
+| q_filter.fclient | ok | 38926 | 3.71 | 3.85 | 3.16 | 0 | 2.53 | 2.34 | 8.0 |
+| q_mixed_plain.i0 | ok | 28994 | 5.53 | 5.17 | 2.87 | 0 | 1.57 | 3.25 | 7.1 |
+| q_mixed_plain.i1 | ok | 28658 | 5.47 | 5.23 | 3.01 | 0 | 1.54 | 3.25 | 7.0 |
+| q_mixed_plain.i2 | ok | 28440 | 5.42 | 5.27 | 3.02 | 0 | 1.64 | 3.38 | 6.8 |
+| q_mixed_plain | ok | 85306 | 16.27 | 5.28 | 3.02 | 0 | 4.75 | 9.93 | 7.1 |
+| q_mixed.i0 | ok | 23906 | 4.56 | 6.28 | 2.67 | 0 | 1.73 | 3.49 | 6.8 |
+| q_mixed.i1 | ok | 23909 | 4.56 | 6.27 | 3.01 | 0 | 1.83 | 3.50 | 6.9 |
+| q_mixed.i2 | ok | 17972 | 3.43 | 8.35 | 3.00 | 0 | 2.00 | 3.54 | 31.3 |
+| q_mixed.i3 | ok | 26349 | 2.51 | 5.69 | 4.01 | 0 | 2.80 | 3.02 | 7.6 |
+| q_mixed | ok | 71882 | 12.00 | 8.35 | 4.01 | 0 | 8.36 | 13.62 | 31.3 |
+
+## Notes on 1.0.8
+
+- The per-worker cap of 1.0.7 (about 915 msg/s) is gone: one worker now
+  moves about 30000 msg/s, two about 38000, eight about 91000 on this
+  laptop. Without ordering each package still makes two channel hops through
+  the single queuer thread and one round trip per BLPOP and per RPUSH, which
+  is what limits it now.
+- The fast tier and the deep run agree within about 5 % except for ordering
+  (39722 against 29590): a drain run ends only after the 1 s ordering buffer
+  has released its last packages, while the time box counts what was taken
+  from the source. The fast tier is enough to tell whether a change helps;
+  the deep run is the reference.
+- A second fast pass, started by mistake 20 minutes after the first, gave the
+  same 1.0.7 numbers (within 1 %) and 1.0.8 numbers 5-12 % lower; the first
+  pass, run on an idle laptop, is the one in the table.
+- 1.0.8 uses about 40 MiB peak RSS with ordering at this rate (the 1 s
+  ordering buffer holds about 40000 packages); 7-9 MiB otherwise.
+- Stop time after SIGINT is still 2-4 s (fixed sleeps in the shutdown path).
