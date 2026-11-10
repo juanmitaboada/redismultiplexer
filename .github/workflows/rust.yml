@@ -106,3 +106,62 @@ jobs:
       run: cargo clippy --locked --all-targets -- -D warnings
     - name: Test
       run: cargo test --locked --release
+
+  sonar:
+    name: SonarQube Cloud
+    runs-on: ubuntu-latest
+    # The Free plan analyses only main and pull requests to main, so m* pushes skip this
+    # job. Pull requests from forks get no secrets and are skipped too.
+    if: >-
+      (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+      (github.event_name == 'pull_request' &&
+       github.event.pull_request.head.repo.full_name == github.repository)
+
+    services:
+      redis:
+        image: redis:6.2@sha256:a08354a6199cf1008897c893e1a679e6cf7ee803ee9f34a50b991b8200a0e8dc # 6.2
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 6379:6379
+
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        # Full history: SCM blame and new code detection need it.
+        fetch-depth: 0
+    - name: Toolchain
+      run: |
+        rustup toolchain install stable --profile minimal --component clippy,llvm-tools-preview
+        rustup default stable
+        rustc --version
+    - name: Install cargo-llvm-cov
+      run: cargo install --locked cargo-llvm-cov --version 0.9.1
+    - name: Clippy report
+      # No -D warnings: the report must be written even when lints fire.
+      run: |
+        mkdir -p target
+        cargo clippy --locked --all-targets --message-format=json > target/clippy-report.json
+    - name: Coverage
+      # Release build (A-C4). The integration tests spawn the binary, which inherits
+      # LLVM_PROFILE_FILE from cargo-llvm-cov and is counted too.
+      run: cargo llvm-cov --locked --release --lcov --output-path target/lcov.info
+    - name: Project version
+      id: version
+      run: |
+        cargo metadata --no-deps --format-version 1 --locked > target/metadata.json
+        version=$(python3 -c 'import json; print(json.load(open("target/metadata.json"))["packages"][0]["version"])')
+        test -n "$version"
+        echo "version=$version" >> "$GITHUB_OUTPUT"
+    - name: SonarQube Cloud scan
+      uses: SonarSource/sonarqube-scan-action@e805d875275f728fac1885b413934be6d7c63f65 # v8.4.1
+      env:
+        SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+      with:
+        # The quality gate fails the job on pull requests only; main reports without failing.
+        args: >-
+          -Dsonar.projectVersion=${{ steps.version.outputs.version }}
+          -Dsonar.qualitygate.wait=${{ github.event_name == 'pull_request' }}
