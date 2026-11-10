@@ -1152,7 +1152,26 @@ fn queuer(
     // Prepare the retention data
     while keepworking {
         // Check if some worker requested data
-        match children_rx.recv_timeout(Duration::from_millis(1)) {
+        let request = children_rx.recv_timeout(Duration::from_millis(1));
+
+        // Read main's order before answering: main sends it before telling the children to
+        // stop, so a request sent after a child's stop order is always answered with dumpall
+        match keepworking_rx.try_recv() {
+            Ok(true) => {
+                print_debug!(
+                    PROGRAM_NAME,
+                    stdout(),
+                    COLOR_BLUE,
+                    0,
+                    "Queue: Prepared to die"
+                );
+                dumpall = true;
+            }
+            Ok(false) => keepworking = false,
+            Err(_) => (),
+        }
+
+        match request {
             Ok((id, ts, package)) => {
                 #[cfg(feature = "debug")]
                 print_debug!(
@@ -1205,22 +1224,6 @@ fn queuer(
                 // Unreachable while main holds queue_tx; pause so it cannot spin
                 thread::sleep(Duration::from_millis(1));
             }
-        }
-
-        // Check if our father wants us to finish
-        match keepworking_rx.try_recv() {
-            Ok(true) => {
-                print_debug!(
-                    PROGRAM_NAME,
-                    stdout(),
-                    COLOR_BLUE,
-                    0,
-                    "Queue: Prepared to die"
-                );
-                dumpall = true;
-            }
-            Ok(false) => keepworking = false,
-            Err(_) => (),
         }
     }
 
