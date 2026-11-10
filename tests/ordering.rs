@@ -68,3 +68,48 @@ fn ordering_buffer_flushed_on_sigint() {
     let want: Vec<String> = (0..10).map(pkg).collect();
     assert_eq!(ctx.list(&t0), want);
 }
+
+#[test]
+fn ordering_stop_under_load_loses_nothing() {
+    // M2R-1: one child, a busy source and a full 1 s buffer when SIGINT arrives. Every
+    // package must end up either delivered or still in the source, exactly once. A queuer
+    // that answers the child's last request without flushing loses the buffer; that race
+    // is not hit on every stop, so the deterministic check is the queuer unit test.
+    let mut ctx = Ctx::new("ordering_stop_load");
+    let src = ctx.key("src");
+    let t0 = ctx.key("t0");
+    let all: Vec<String> = (0..300_000).map(pkg).collect();
+    ctx.push(&src, &all);
+    let extra = ORDERING.replace("{T}", "1");
+    let cfg = ctx.config(
+        &src,
+        1,
+        "replicant",
+        &extra,
+        &[ctx.client_yaml("t0", &t0, "")],
+    );
+    let mut p = ctx.spawn(&cfg);
+    // Past one buffer time, so packages are both delivered and held when the stop comes
+    ctx.wait_for("first package released", |c| c.llen(&t0) > 0);
+    thread::sleep(Duration::from_millis(300));
+    assert!(
+        ctx.llen(&src) > 0,
+        "source drained before SIGINT; raise the package count"
+    );
+    p.stop(&ctx.pid_file());
+    let delivered = ctx.list(&t0);
+    let left = ctx.list(&src);
+    assert_eq!(
+        delivered.len() + left.len(),
+        all.len(),
+        "delivered {} + left {} != loaded {}",
+        delivered.len(),
+        left.len(),
+        all.len()
+    );
+    // The source keeps its order; the targets hold the rest, each package once
+    assert_eq!(left[..], all[all.len() - left.len()..]);
+    let mut got = delivered;
+    got.sort_by_key(|s| s[7..s.find(',').unwrap()].parse::<u64>().unwrap());
+    assert_eq!(got[..], all[..all.len() - left.len()]);
+}

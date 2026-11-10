@@ -2766,6 +2766,44 @@ mod tests {
     }
 
     #[test]
+    fn queuer_flushes_the_ordering_buffer_for_a_request_after_the_stop_order() {
+        // M2R-1: main sends `true` to the queuer before telling the children to stop, so a
+        // child's first request after its stop order must get the whole ordering buffer.
+        // The buggy queuer answers it from match_ordering when parked in its wait, so a few
+        // rounds make the failure certain; on fixed code every round is deterministic.
+        for round in 0..50 {
+            let mut c = config();
+            c.ordering_buffer_time = Some(30);
+            let (keep_tx, keep_rx) = mpsc::channel();
+            let (req_tx, req_rx) = mpsc::channel();
+            let (ans_tx, ans_rx) = mpsc::channel();
+            let (stat_tx, stat_rx) = mpsc::channel();
+            let handle =
+                thread::spawn(move || queuer(true, c, keep_rx, req_rx, vec![ans_tx], stat_tx));
+
+            req_tx.send((0, Some(1), Some("p1".to_string()))).unwrap();
+            assert!(
+                ans_rx.recv().unwrap().is_empty(),
+                "round {round}: held for 30 s"
+            );
+            // Let the queuer park in its wait, where M2R-1 happens
+            thread::sleep(Duration::from_millis(5));
+            keep_tx.send(true).unwrap();
+            req_tx.send((0, None, None)).unwrap();
+            assert_eq!(
+                ans_rx.recv().unwrap(),
+                vec!["p1".to_string()],
+                "round {round}"
+            );
+
+            keep_tx.send(false).unwrap();
+            handle.join().unwrap();
+            let sizes: Vec<Option<usize>> = stat_rx.try_iter().collect();
+            assert_eq!(sizes, vec![Some(1), Some(0), None], "round {round}");
+        }
+    }
+
+    #[test]
     fn verify_accepts_empty_client_name_current_behaviour() {
         // M1F-6: the client hostname is checked twice and the name never.
         let mut c = config();
