@@ -133,6 +133,9 @@ counts and stay as they were.
 As for 1.0.7 above (same laptop, OS, kernel, Redis 8.0.5 on 127.0.0.1:6390,
 rustc 1.99.1, Python 3.14.4). Binaries: 1.0.7 from commit 76deefc and 1.0.8
 from the `release: 1.0.8` commit, both `cargo build --locked --release`.
+The later commit `fix: read the stop order before answering a queuer request`
+only moves the queuer's read of its stop order ahead of each answer, with the
+same work per request, so it does not change the path measured here.
 Date: 2026-11-10.
 
 ## How it was measured
@@ -143,7 +146,7 @@ python3 bench/rmbench.py run --tag fast --repeat 3 --label rust-1.0.8 \
     --cmd 'target/release/redismultiplexer {config}' \
     --redis redis://127.0.0.1:6390 --results ~/rmbench/fast/1.0.8
 # deep: quick matrix with 30 times the counts (150000 packages per source),
-# about 60 min for 1.0.7 and 5 min for 1.0.8
+# 49 min for 1.0.7 and 5 min for 1.0.8
 python3 bench/rmbench.py run --tag quick --repeat 3 --scale 30 \
     --max-bytes 2147483648 --timeout 600 --label rust-1.0.8 \
     --cmd 'target/release/redismultiplexer {config}' \
@@ -156,7 +159,9 @@ python3 bench/rmbench.py run --scenario q_base.c8 --repeat 3 --scale 60 \
 ```
 
 The same commands with `--label rust-1.0.7` and the 1.0.7 binary give the
-1.0.7 columns. Every run of both builds ended `ok` with 0 missing packages.
+1.0.7 columns. Every run of both builds ended `ok` with 0 missing packages
+(none of these runs stops a busy source with ordering and one child, the case
+that fix is about).
 
 ## fast (median of 3, msg/s)
 
