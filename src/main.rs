@@ -199,10 +199,9 @@ fn main() {
                 stdout(),
                 COLOR_CYAN,
                 COLOR_NOHEAD,
-                "{} v{} ({})",
+                "{} v{}",
                 PROGRAM_NAME,
-                VERSION,
-                BUILD_DATE
+                VERSION
             );
 
             // Missing argument, show some help
@@ -233,10 +232,9 @@ fn main() {
                 stdout(),
                 COLOR_CYAN,
                 0,
-                "{} v{} ({})",
+                "{} v{}",
                 PROGRAM_NAME,
-                VERSION,
-                BUILD_DATE
+                VERSION
             );
 
             #[cfg(feature = "debug")]
@@ -816,10 +814,9 @@ fn main() {
             stdout(),
             COLOR_CYAN,
             COLOR_NOHEAD,
-            "{} v{} ({})",
+            "{} v{}",
             PROGRAM_NAME,
-            VERSION,
-            BUILD_DATE
+            VERSION
         );
 
         // Missing argument, show some help

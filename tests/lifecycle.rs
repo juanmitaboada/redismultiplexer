@@ -18,6 +18,16 @@ fn version_flag() {
 }
 
 #[test]
+fn help_banner_shows_the_version_only() {
+    // The build date was dropped with the build-time crate (reproducible builds).
+    let out = Command::new(bin()).arg("--help").output().unwrap();
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let banner = format!("RedisMultiplexer v{}\n", env!("CARGO_PKG_VERSION"));
+    assert!(stdout.contains(&banner), "{:?}", stdout);
+}
+
+#[test]
 fn invalid_config_exits_zero_current_behaviour() {
     // M1F-3: a configuration error is printed but the exit status is 0.
     let mut ctx = Ctx::new("invalid_config");

@@ -42,19 +42,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "build-time"
-version = "0.1.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f1219c19fc29b7bfd74b7968b420aff5bc951cf517800176e795d6b2300dd382"
-dependencies = [
- "chrono",
- "once_cell",
- "proc-macro2",
- "quote",
- "syn 2.0.119",
-]
-
-[[package]]
 name = "bumpalo"
 version = "3.20.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -635,7 +622,6 @@ dependencies = [
 name = "redismultiplexer"
 version = "1.0.8"
 dependencies = [
- "build-time",
  "chrono",
  "ctrlc",
  "dict",
