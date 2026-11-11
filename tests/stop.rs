@@ -75,6 +75,24 @@ fn stop_under_load_sighup_two_children_with_ordering() {
 }
 
 #[test]
+fn sighup_is_ignored_when_started_under_nohup() {
+    // M3F-14 = 14b: SIGHUP stops the program (M3-l), except when it started with SIGHUP
+    // ignored (nohup), which keeps it running as before; SIGINT still stops it.
+    let mut ctx = Ctx::new("stop_nohup");
+    let src = ctx.key("src");
+    let t0 = ctx.key("t0");
+    let cfg = ctx.config(&src, 2, "replicant", "", &[ctx.client_yaml("t0", &t0, "")]);
+    let mut p = ctx.spawn_hup_ignored(&cfg);
+    ctx.push(&src, &[seq_pkg(1)]);
+    ctx.wait_drained(&src, &[(&t0, 1)]);
+    p.signal("HUP");
+    thread::sleep(Duration::from_millis(1500));
+    ctx.push(&src, &[seq_pkg(2)]);
+    ctx.wait_drained(&src, &[(&t0, 2)]);
+    p.stop(&ctx.pid_file());
+}
+
+#[test]
 fn stop_is_prompt() {
     // No fixed sleeps on the way out: an idle program (each child in a BLPOP of at most
     // 1 s) stops within 2 s of the signal. 1.0.8 slept 2 s in main and 1.5 s per child.

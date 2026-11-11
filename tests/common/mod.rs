@@ -242,10 +242,20 @@ impl Ctx {
     }
 
     pub fn spawn(&self, config: &Path) -> Proc {
+        self.spawn_cmd(Command::new(bin()).arg(config))
+    }
+
+    /// As spawn, but with SIGHUP ignored when the program starts, as nohup leaves it.
+    pub fn spawn_hup_ignored(&self, config: &Path) -> Proc {
+        // `trap '' HUP` sets the ignore disposition, which exec keeps
+        let script = "trap '' HUP; exec \"$0\" \"$1\"";
+        self.spawn_cmd(Command::new("sh").args(["-c", script, bin()]).arg(config))
+    }
+
+    fn spawn_cmd(&self, cmd: &mut Command) -> Proc {
         let out = self.dir.join("stdout.log");
         let err = self.dir.join("stderr.log");
-        let child = Command::new(bin())
-            .arg(config)
+        let child = cmd
             .stdin(Stdio::null())
             .stdout(fs::File::create(&out).unwrap())
             .stderr(fs::File::create(&err).unwrap())

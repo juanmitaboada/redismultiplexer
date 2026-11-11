@@ -529,6 +529,9 @@ fn main() {
                         let (keepworking_tx, keepworking_rx): (Sender<bool>, Receiver<bool>) =
                             mpsc::channel();
                         let handler_stop = stop.clone();
+                        // Started under nohup (SIGHUP ignored): keep ignoring it, as before
+                        // ctrlc took SIGHUP too (M3F-14)
+                        let hup_ignored = sighup_ignored();
                         ctrlc::set_handler(move || {
                             print_debug!(
                                 PROGRAM_NAME,
@@ -542,6 +545,9 @@ fn main() {
                             let _ = keepworking_tx.send(false);
                         })
                         .expect("Error setting Ctrl-C handler");
+                        if hup_ignored {
+                            ignore_sighup();
+                        }
 
                         // Ordering: children put timestamped packages in one buffer and one
                         // sender delivers them from it, so the target order is strict (M3-k)
@@ -1709,6 +1715,24 @@ fn child(
 
     #[cfg(feature = "debug")]
     print_debug!(PROGRAM_NAME, stdout(), COLOR_BLUE, 0, "Child {}: Ends", id);
+}
+
+/// Whether SIGHUP is ignored now (inherited from the parent, as under nohup)
+fn sighup_ignored() -> bool {
+    // SAFETY: with a null new action, sigaction only reads the current disposition
+    unsafe {
+        let mut current: libc::sigaction = std::mem::zeroed();
+        libc::sigaction(libc::SIGHUP, std::ptr::null(), &mut current) == 0
+            && current.sa_sigaction == libc::SIG_IGN
+    }
+}
+
+/// Ignore SIGHUP again after ctrlc installed its handler for it
+fn ignore_sighup() {
+    // SAFETY: SIG_IGN installs no handler code
+    unsafe {
+        libc::signal(libc::SIGHUP, libc::SIG_IGN);
+    }
 }
 
 /// Wait `time`, or less once `stopping` says the program is stopping
