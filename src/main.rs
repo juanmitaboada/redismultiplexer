@@ -1518,6 +1518,7 @@ fn child(
                     let mut outgoing: u64 = 0;
                     let mut dropped: u64 = 0;
                     let mut deleted: u64 = 0;
+                    let mut cursor: usize = 0; // spreader: next target to try
                     let mut lasttime = get_current_time();
                     while keepworking {
                         // Check if we should save statistics
@@ -1546,22 +1547,29 @@ fn child(
                                 blpop_cmd(&config.channel).query(&mut source);
                             match item {
                                 Ok(redis::Value::Nil) => {
-                                    // {println!("Nil")},
-                                    // Process no data
-                                    match process_package(
-                                        id,
-                                        &ordering_regex,
-                                        ordering_limit,
-                                        &qtx,
-                                        &qrx,
-                                        &filters.root,
-                                        &config,
-                                        &mut clients,
-                                        None,
-                                        &mut outgoing,
-                                        &mut dropped,
-                                        &mut deleted,
-                                    ) {
+                                    // Nothing came: refresh the targets' limits state, and with
+                                    // ordering ask the queuer for released packages
+                                    let idle = if ordering_regex.is_none() {
+                                        refresh(id, &mut clients, &mut deleted)
+                                    } else {
+                                        process_package(
+                                            id,
+                                            &ordering_regex,
+                                            ordering_limit,
+                                            &qtx,
+                                            &qrx,
+                                            &filters.root,
+                                            &config,
+                                            &mut clients,
+                                            &mut cursor,
+                                            None,
+                                            &mut outgoing,
+                                            &mut dropped,
+                                            &mut deleted,
+                                        )
+                                        .map(|_| ())
+                                    };
+                                    match idle {
                                         Ok(_) => (),
                                         Err(e) => {
                                             error = true;
@@ -1589,31 +1597,47 @@ fn child(
                                     if let Some(redis::Value::BulkString(raw_bdata)) =
                                         data.into_iter().nth(1)
                                     {
-                                        match process_package(
-                                            id,
-                                            &ordering_regex,
-                                            ordering_limit,
-                                            &qtx,
-                                            &qrx,
-                                            &filters.root,
-                                            &config,
-                                            &mut clients,
-                                            Some(raw_bdata),
-                                            &mut outgoing,
-                                            &mut dropped,
-                                            &mut deleted,
-                                        ) {
-                                            Ok(_) => (),
-                                            Err(e) => {
-                                                print_debug!(
-                                                    PROGRAM_NAME,
-                                                    stderr(),
-                                                    COLOR_RED,
-                                                    0,
-                                                    "{}: Couldn't process package: {}",
-                                                    id,
-                                                    e
-                                                );
+                                        if ordering_regex.is_none() {
+                                            // Without ordering the worker delivers it itself
+                                            deliver(
+                                                id,
+                                                &filters.root,
+                                                &config,
+                                                &mut clients,
+                                                &mut cursor,
+                                                &raw_bdata,
+                                                &mut outgoing,
+                                                &mut dropped,
+                                                &mut deleted,
+                                            );
+                                        } else {
+                                            match process_package(
+                                                id,
+                                                &ordering_regex,
+                                                ordering_limit,
+                                                &qtx,
+                                                &qrx,
+                                                &filters.root,
+                                                &config,
+                                                &mut clients,
+                                                &mut cursor,
+                                                Some(raw_bdata),
+                                                &mut outgoing,
+                                                &mut dropped,
+                                                &mut deleted,
+                                            ) {
+                                                Ok(_) => (),
+                                                Err(e) => {
+                                                    print_debug!(
+                                                        PROGRAM_NAME,
+                                                        stderr(),
+                                                        COLOR_RED,
+                                                        0,
+                                                        "{}: Couldn't process package: {}",
+                                                        id,
+                                                        e
+                                                    );
+                                                }
                                             }
                                         }
                                     }
@@ -1653,6 +1677,9 @@ fn child(
                                 },
                                 Err(_) => (),
                             }
+                        } else if ordering_regex.is_none() {
+                            // Nothing is held anywhere without ordering: done
+                            keepworking = false;
                         } else {
                             // Get data left in the queue
                             let jobdone;
@@ -1665,6 +1692,7 @@ fn child(
                                 &filters.root,
                                 &config,
                                 &mut clients,
+                                &mut cursor,
                                 None,
                                 &mut outgoing,
                                 &mut dropped,
@@ -2202,6 +2230,7 @@ fn process_package(
     root_filter: &Option<Filter>,
     config: &Config,
     clients: &mut Vec<RedisLink>,
+    cursor: &mut usize,
     package: Option<Vec<u8>>,
     outgoing: &mut u64,
     dropped: &mut u64,
@@ -2272,136 +2301,21 @@ fn process_package(
     let jobdone: bool;
     if list.len() > 0 {
         for package in list {
-            // Ready to send data
-            let total_clients = clients.len();
-            let mut errors = 0;
-
-            let filtered = match root_filter {
-                Some(f) => f.apply(&package),
-                None => Some(Cow::Borrowed(&package[..])),
-            };
-            match filtered {
-                None => errors = total_clients,
-                Some(bdata) => {
-                    if config.mode == "replicant" {
-                        // Send data to all clients
-                        for client in clients.iter_mut() {
-                            // If we can send to this queu
-                            match send(id, client, &bdata, deleted) {
-                                // Data sent
-                                Ok(true) => (),
-
-                                // Not sent
-                                Ok(false) => {
-                                    errors += 1;
-                                }
-
-                                // There was an error
-                                Err(e) => {
-                                    // There was an error
-                                    print_debug!(
-                                        PROGRAM_NAME,
-                                        stderr(),
-                                        COLOR_RED,
-                                        0,
-                                        "Error while sending to '{}:{}@{}': {}",
-                                        config.hostname,
-                                        config.port,
-                                        config.channel,
-                                        e
-                                    );
-                                    errors += 1;
-                                }
-                            }
-                        }
-                    } else {
-                        // Send data to next client
-                        let mut done = false;
-
-                        // We will go throught all clients until data is
-                        // sent or all clients have failed
-                        while (!done) && (errors < total_clients) {
-                            // Try to send to this client
-                            let client = &mut clients[0];
-
-                            // If we can send to this queu
-                            match send(id, client, &bdata, deleted) {
-                                // Data sent
-                                Ok(true) => done = true,
-
-                                // Not sent
-                                Ok(false) => {
-                                    errors += 1;
-                                }
-
-                                // There was an error
-                                Err(e) => {
-                                    // There was an error
-                                    print_debug!(
-                                        PROGRAM_NAME,
-                                        stderr(),
-                                        COLOR_RED,
-                                        0,
-                                        "Error while sending to '{}:{}@{}': {}",
-                                        config.hostname,
-                                        config.port,
-                                        config.channel,
-                                        e
-                                    );
-                                    errors += 1;
-                                }
-                            }
-
-                            // Rotate
-                            if total_clients > 1 {
-                                for i in 0..(total_clients - 1) {
-                                    clients.swap(i, i + 1);
-                                }
-                            }
-
-                            // Leave if we are done
-                            if done {
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-
-            // If all clients have failed, drop the package and set error
-            if errors == total_clients {
-                // No sent at all
-                *dropped += 1;
-            } else {
-                // The package was sent at least to 1 node
-                *outgoing += 1;
-            }
+            deliver(
+                id,
+                root_filter,
+                config,
+                clients,
+                cursor,
+                &package,
+                outgoing,
+                dropped,
+                deleted,
+            );
         }
-
         jobdone = true;
     } else {
-        // Refresh clients status
-        for client in clients.iter_mut() {
-            match can_send(id, client, deleted) {
-                Ok(_) => (), // We do not care if it can send or not (just wanted to refresh client information)
-                Err(e) => {
-                    #[cfg(feature = "debug")]
-                    print_debug!(
-                        PROGRAM_NAME,
-                        stdout(),
-                        COLOR_CYAN,
-                        0,
-                        "{}: End unexpected process_package()",
-                        id
-                    );
-
-                    return Err(format!(
-                        "couldn't check queue for {}: {}",
-                        client.config.channel, e
-                    ));
-                }
-            }
-        }
+        refresh(id, clients, deleted)?;
         jobdone = false;
     }
 
@@ -2418,6 +2332,87 @@ fn process_package(
 
     // Send if we did or didn't do the job
     return Ok(jobdone);
+}
+
+/// Deliver one package to the targets the mode selects, through the root and client filters
+/// and the limits; counted as outgoing when at least one target took it, else as dropped
+fn deliver(
+    id: u16,
+    root_filter: &Option<Filter>,
+    config: &Config,
+    clients: &mut [RedisLink],
+    cursor: &mut usize,
+    package: &[u8],
+    outgoing: &mut u64,
+    dropped: &mut u64,
+    deleted: &mut u64,
+) {
+    let bdata = match root_filter {
+        Some(f) => f.apply(package),
+        None => Some(Cow::Borrowed(package)),
+    };
+    let mut attempt = |client: &mut RedisLink, bdata: &[u8]| match send(id, client, bdata, deleted)
+    {
+        Ok(sent) => sent,
+        Err(e) => {
+            print_debug!(
+                PROGRAM_NAME,
+                stderr(),
+                COLOR_RED,
+                0,
+                "Error while sending to '{}:{}@{}': {}",
+                config.hostname,
+                config.port,
+                config.channel,
+                e
+            );
+            false
+        }
+    };
+    let delivered = match bdata {
+        None => false,
+        Some(bdata) => {
+            if config.mode == "replicant" {
+                // Every target, in configuration order
+                let mut sent = false;
+                for client in clients.iter_mut() {
+                    sent |= attempt(client, &bdata);
+                }
+                sent
+            } else {
+                spread(cursor, clients.len(), |i| attempt(&mut clients[i], &bdata)).is_some()
+            }
+        }
+    };
+    if delivered {
+        *outgoing += 1;
+    } else {
+        *dropped += 1;
+    }
+}
+
+/// Spreader target selection: try the targets in turn from `cursor`, at most one full turn;
+/// the first that takes the package wins and the next package starts after it. When none
+/// takes it the cursor stays. Same turn as 1.0.8, which rotated the list by one per attempt.
+fn spread(cursor: &mut usize, n: usize, mut attempt: impl FnMut(usize) -> bool) -> Option<usize> {
+    for k in 0..n {
+        let i = (*cursor + k) % n;
+        if attempt(i) {
+            *cursor = (i + 1) % n;
+            return Some(i);
+        }
+    }
+    None
+}
+
+/// The idle path: refresh the limits state of every target (1.0.8 behaviour, M3F-7 is stage 4)
+fn refresh(id: u16, clients: &mut [RedisLink], deleted: &mut u64) -> Result<(), String> {
+    for client in clients.iter_mut() {
+        // Only the refresh matters, not whether it could send
+        can_send(id, client, deleted)
+            .map_err(|e| format!("couldn't check queue for {}: {}", client.config.channel, e))?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]

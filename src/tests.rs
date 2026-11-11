@@ -1028,3 +1028,80 @@ fn stats_slots_do_not_share_a_cache_line() {
     assert_eq!(std::mem::align_of::<WorkerStats>(), 64);
     assert!(b - a >= 64);
 }
+
+// --- spreader ---
+
+/// The 1.0.8 spreader: try clients[0], rotate the list by one after every attempt, stop at
+/// the first success or after one full turn. Returns the original index that took it.
+fn old_spread(order: &mut Vec<usize>, mut attempt: impl FnMut(usize) -> bool) -> Option<usize> {
+    let n = order.len();
+    for _ in 0..n {
+        let i = order[0];
+        let ok = attempt(i);
+        for k in 0..n - 1 {
+            order.swap(k, k + 1);
+        }
+        if ok {
+            return Some(i);
+        }
+    }
+    None
+}
+
+#[test]
+fn spreader_takes_turns_and_skips_refusing_targets() {
+    let mut cursor = 0;
+    let all = |_: usize| true;
+    let got: Vec<Option<usize>> = (0..4).map(|_| spread(&mut cursor, 3, all)).collect();
+    assert_eq!(got, vec![Some(0), Some(1), Some(2), Some(0)]);
+    let mut cursor = 0;
+    let not_1 = |i: usize| i != 1;
+    let got: Vec<Option<usize>> = (0..4).map(|_| spread(&mut cursor, 3, not_1)).collect();
+    assert_eq!(got, vec![Some(0), Some(2), Some(0), Some(2)]);
+    // Nobody takes it: one full turn, cursor unchanged
+    let mut cursor = 2;
+    let mut tried = Vec::new();
+    assert_eq!(
+        spread(&mut cursor, 3, |i| {
+            tried.push(i);
+            false
+        }),
+        None
+    );
+    assert_eq!((tried, cursor), (vec![2, 0, 1], 2));
+}
+
+#[test]
+fn spreader_by_index_matches_the_old_rotation() {
+    // Differential against the 1.0.8 rotation over generated accept patterns: same target
+    // for every package, same attempts in the same order.
+    let mut seed: u64 = 0x2545F4914F6CDD1D;
+    let mut next = || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed
+    };
+    let mut cases = 0;
+    for n in 1..=6usize {
+        for _ in 0..500 {
+            let mut order: Vec<usize> = (0..n).collect();
+            let mut cursor = 0;
+            for _ in 0..20 {
+                let accept: Vec<bool> = (0..n).map(|_| next() % 3 != 0).collect();
+                let (mut a, mut b) = (Vec::new(), Vec::new());
+                let old = old_spread(&mut order, |i| {
+                    a.push(i);
+                    accept[i]
+                });
+                let new = spread(&mut cursor, n, |i| {
+                    b.push(i);
+                    accept[i]
+                });
+                assert_eq!((old, &a), (new, &b), "n={} accept={:?}", n, accept);
+                cases += 1;
+            }
+        }
+    }
+    assert_eq!(cases, 60000);
+}
