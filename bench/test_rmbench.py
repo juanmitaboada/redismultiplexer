@@ -6,6 +6,8 @@ Run: python3 -m unittest discover -s bench -p 'test_*.py'
 from __future__ import annotations
 
 import argparse
+import contextlib
+import io
 import json
 import re
 import socket
@@ -15,6 +17,7 @@ import threading
 import tomllib
 import unittest
 from pathlib import Path
+from unittest import mock
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
@@ -315,15 +318,25 @@ class ReportTests(unittest.TestCase):
                 rmbench.append_csv(p, [dict.fromkeys(rmbench.CSV_FIELDS, "")])
 
 
-
 class FakeRedis:
     """Stand-in for resp.Redis in run_once: the source loses `step` packages per LLEN round
     and they appear in the first target, so every package is accounted for."""
 
-    def __init__(self, step: int) -> None:
+    def __init__(self, step: int, lose: bool = False) -> None:
         self.step = step
+        self.lose = lose  # packages leave the source but never reach a target
         self.lists: dict[str, int] = {}
         self.src = ""
+
+    def __enter__(self) -> "FakeRedis":
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        pass
+
+    def execute(self, *cmd: object) -> bytes:
+        assert cmd == ("INFO", "server"), cmd
+        return b"redis_version:7.0.0\r\n"
 
     def pipeline(self, cmds: list[list[object]]) -> list[object]:
         out: list[object] = []
@@ -331,7 +344,8 @@ class FakeRedis:
             src, tgt = str(cmds[0][1]), str(cmds[1][1])
             moved = min(self.step, self.lists.get(src, 0))
             self.lists[src] = self.lists.get(src, 0) - moved
-            self.lists[tgt] = self.lists.get(tgt, 0) + moved
+            if not self.lose:
+                self.lists[tgt] = self.lists.get(tgt, 0) + moved
         for cmd in cmds:
             name, key = cmd[0], str(cmd[1])
             if name == "RPUSH":
@@ -379,6 +393,64 @@ class RunOnceTests(unittest.TestCase):
         self.assertEqual(r["reason"], "source drained before the time box")
         self.assertEqual((r["expected_total"], r["delivered_total"]), (500, 500))
         self.assertLess(float(r["drain_s"]), 1.0)
+
+
+
+class CommandTests(unittest.TestCase):
+    """`run` and `compare` end to end, with the fake Redis of RunOnceTests (M3R-5)."""
+
+    def run_cmd(self, fake: FakeRedis, d: str) -> tuple[int, str]:
+        scen = Path(d) / "s.toml"
+        scen.write_text(BASE + '[[scenario]]\nname = "t"\nduration = 0.3\ncount = 900000\n')
+        args = rmbench.parser().parse_args(
+            ["run", "--scenarios", str(scen), "--cmd", RunOnceTests.PROGRAM, "--label", "x",
+             "--results", str(Path(d) / "res"), "--redis", "redis://127.0.0.1:6379"])
+        err, out = io.StringIO(), io.StringIO()
+        with mock.patch.object(rmbench, "Redis", lambda url: fake), \
+                contextlib.redirect_stderr(err), contextlib.redirect_stdout(out):
+            code = rmbench.cmd_run(args)
+        return code, err.getvalue()
+
+    def test_run_exits_0_without_losses(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            code, err = self.run_cmd(FakeRedis(step=100), d)
+        self.assertEqual(code, 0)
+        self.assertNotIn("MISSING:", err)
+
+    def test_run_reports_and_exits_3_on_losses(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            code, err = self.run_cmd(FakeRedis(step=100, lose=True), d)
+        self.assertEqual(code, rmbench.EXIT_MISSING)
+        self.assertRegex(err, r"MISSING: t r0 missing=\d+")
+
+    def compare(self, rows_a: list[dict], rows_b: list[dict]) -> tuple[str, str]:
+        with tempfile.TemporaryDirectory() as d:
+            a, b = Path(d) / "a.csv", Path(d) / "b.csv"
+            rmbench.append_csv(a, rows_a)
+            rmbench.append_csv(b, rows_b)
+            args = rmbench.parser().parse_args(["compare", str(a), str(b)])
+            err, out = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stderr(err), contextlib.redirect_stdout(out):
+                self.assertEqual(rmbench.cmd_compare(args), 0)
+        return out.getvalue(), err.getvalue()
+
+    def row(self, **kw: object) -> dict:
+        return dict.fromkeys(rmbench.CSV_FIELDS, "") | {
+            "label": "x", "scenario": "s", "status": "ok", "msg_s": "100", "missing": "0",
+            "count": "900", "duration_s": "5"} | kw
+
+    def test_compare_warns_on_different_counts(self) -> None:
+        out, err = self.compare([self.row()], [self.row(label="y", count="27000")])
+        self.assertIn("warning: not comparable, s: count 900 vs 27000", err)
+        self.assertIn("| s |", out)
+        _, err = self.compare([self.row()], [self.row(label="y")])
+        self.assertEqual(err, "")
+
+    def test_compare_worst_missing_includes_failed_runs(self) -> None:
+        # A lossy repetition that also failed must still show in the missing column
+        out, _ = self.compare([self.row(), self.row(status="error", missing="5", repeat_idx=1)],
+                              [self.row(label="y")])
+        self.assertIn("| 5 | 0 |", out)
 
 
 if __name__ == "__main__":
