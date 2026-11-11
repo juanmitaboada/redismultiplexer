@@ -250,3 +250,58 @@ fn dropped_at_the_stop_spreader_one() {
 fn dropped_at_the_stop_spreader_several() {
     dropped_at_the_stop("drop_stop_spr_2", true, 2);
 }
+
+/// An `ordering_buffer_time` past the clock's range (valid for 1.0.8) holds every package
+/// until the stop, which flushes them in order; before, the sender panicked (M3R-13).
+fn buffer_time_beyond_the_clock(test: &str, spreader: bool, children: u16) {
+    let mut ctx = Ctx::new(test);
+    let src = ctx.key("src");
+    let t0 = ctx.key("t0");
+    let t1 = ctx.key("t1");
+    let mut clients = vec![ctx.client_yaml("t0", &t0, "")];
+    if spreader {
+        clients.push(ctx.client_yaml("t1", &t1, ""));
+    }
+    let extra = "ordering: '\"ts\": *(?P<ts>\\d+),'\nordering_buffer_time: 18446744073709551615\n";
+    let mode = if spreader { "spreader" } else { "replicant" };
+    let cfg = ctx.config(&src, children, mode, extra, &clients);
+    let mut p = ctx.spawn(&cfg);
+    let n = 6;
+    let input: Vec<String> = (0..n).rev().map(seq_pkg).collect();
+    ctx.push(&src, &input);
+    ctx.wait_for("every package in the buffer", |c| c.llen(&src) == 0);
+    thread::sleep(Duration::from_millis(300));
+    assert_eq!(ctx.llen(&t0) + ctx.llen(&t1), 0, "released before the stop");
+    p.stop(&ctx.pid_file());
+    let cell = Cell {
+        ordering: true,
+        spreader,
+        children,
+    };
+    let lists = if spreader {
+        vec![ctx.list(&t0), ctx.list(&t1)]
+    } else {
+        vec![ctx.list(&t0)]
+    };
+    assert_all(cell, &lists, n);
+}
+
+#[test]
+fn buffer_time_beyond_the_clock_replicant_one() {
+    buffer_time_beyond_the_clock("hold_max_rep_1", false, 1);
+}
+
+#[test]
+fn buffer_time_beyond_the_clock_replicant_several() {
+    buffer_time_beyond_the_clock("hold_max_rep_2", false, 2);
+}
+
+#[test]
+fn buffer_time_beyond_the_clock_spreader_one() {
+    buffer_time_beyond_the_clock("hold_max_spr_1", true, 1);
+}
+
+#[test]
+fn buffer_time_beyond_the_clock_spreader_several() {
+    buffer_time_beyond_the_clock("hold_max_spr_2", true, 2);
+}

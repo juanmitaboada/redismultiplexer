@@ -1208,7 +1208,9 @@ impl OrderBuffer {
 fn release(st: &mut OrderState, now: Instant, hold: Duration) -> Vec<Vec<u8>> {
     let mut out = Vec::new();
     while let Some(Reverse(head)) = st.heap.peek() {
-        if st.finish || head.arrival + hold <= now {
+        // checked_add: a buffer time past the clock's range never becomes due (M3R-13); the
+        // package then waits for finish()
+        if st.finish || head.arrival.checked_add(hold).is_some_and(|due| due <= now) {
             out.push(st.heap.pop().unwrap().0.data);
         } else {
             break;
@@ -1217,9 +1219,11 @@ fn release(st: &mut OrderState, now: Instant, hold: Duration) -> Vec<Vec<u8>> {
     out
 }
 
-/// When the head will be due, if anything is held
+/// When the head will be due; None when nothing is held or the head is never due
 fn next_release(st: &OrderState, hold: Duration) -> Option<Instant> {
-    st.heap.peek().map(|Reverse(head)| head.arrival + hold)
+    st.heap
+        .peek()
+        .and_then(|Reverse(head)| head.arrival.checked_add(hold))
 }
 
 /// The sender's loop: wait for due packages and hand each batch to `deliver` in order;

@@ -705,6 +705,24 @@ fn ordering_release_boundary_is_in_milliseconds() {
 }
 
 #[test]
+fn ordering_buffer_time_beyond_the_clock_waits_for_finish() {
+    // M3R-13: `arrival + hold` overflowed for a buffer time past the clock's range and
+    // panicked the sender with the buffer lock held. With checked_add such a package is
+    // never due: nothing is released and no wake-up is scheduled until finish(), which
+    // releases everything in ts order.
+    let t0 = Instant::now();
+    let hold = Duration::from_secs(u64::MAX);
+    let mut st = held(&[(5, "five", t0), (3, "three", t0)]);
+    assert!(release(&mut st, t0 + Duration::from_secs(3600), hold).is_empty());
+    assert_eq!(next_release(&st, hold), None);
+    st.finish = true;
+    assert_eq!(
+        strs(release(&mut st, t0 + Duration::from_secs(3600), hold)),
+        vec!["three", "five"]
+    );
+}
+
+#[test]
 fn ordering_releases_old_entries_in_ts_order() {
     let t0 = Instant::now();
     let mut st = held(&[(5, "five", t0), (3, "three", t0), (9, "nine", t0)]);
