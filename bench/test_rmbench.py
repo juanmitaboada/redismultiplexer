@@ -9,7 +9,9 @@ import argparse
 import contextlib
 import io
 import json
+import os
 import re
+import signal
 import socket
 import sys
 import tempfile
@@ -401,6 +403,50 @@ class RunOnceTests(unittest.TestCase):
         self.assertEqual((r["expected_total"], r["delivered_total"]), (500, 500))
         self.assertLess(float(r["drain_s"]), 1.0)
 
+    def test_interrupted_run_stops_its_programs(self) -> None:
+        # M3F-12: Ctrl-C (or SIGTERM, SIGHUP) in the middle of a run raises
+        # KeyboardInterrupt; the programs started so far must not outlive the run.
+        program = (f"{sys.executable} -c 'import os, signal, sys, time; "
+                   f"open(sys.argv[1] + \".pid\", \"w\").write(str(os.getpid())); "
+                   f"signal.signal(signal.SIGINT, lambda *a: sys.exit(0)); time.sleep(60)' {{config}}")
+
+        class Interrupting(FakeRedis):
+            polls = 0
+
+            def pipeline(self, cmds: list[list[object]]) -> list[object]:
+                if cmds and cmds[0][0] == "LLEN":
+                    self.polls += 1
+                    if self.polls == 20:
+                        raise KeyboardInterrupt
+                return super().pipeline(cmds)
+
+        run = rmbench.expand(doc(BASE + '[[scenario]]\nname = "t"\nduration = 5\ncount = 900000\n'))[0]
+        with tempfile.TemporaryDirectory() as d:
+            args = argparse.Namespace(
+                label="x", results=d, renderer=rmbench.DEFAULT_RENDERER, config_ext=".yaml",
+                redis="redis://127.0.0.1:6379", cmd=program, settle=2.0, timeout=10.0,
+                keep_keys=False, duration=None)
+            with self.assertRaises(KeyboardInterrupt):
+                rmbench.run_once(run, 0, args, Interrupting(step=100), {"redis_version": "7", "host_cpus": 2})
+            pid_files = list(Path(d).glob("logs/*/i0.config.yaml.pid"))
+            self.assertEqual(len(pid_files), 1)
+            pid = int(pid_files[0].read_text())
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return
+        os.kill(pid, signal.SIGKILL)  # do not leak it when the test fails
+        self.fail(f"program {pid} still running after the interrupted run")
+
+    def test_sigterm_and_sighup_interrupt_like_ctrl_c(self) -> None:
+        saved = {s: signal.getsignal(s) for s in (signal.SIGTERM, signal.SIGHUP)}
+        try:
+            rmbench.interrupt_on_termination()
+            for sig in saved:
+                self.assertIs(signal.getsignal(sig), signal.default_int_handler)
+        finally:
+            for sig, handler in saved.items():
+                signal.signal(sig, handler)
 
 
 class CommandTests(unittest.TestCase):

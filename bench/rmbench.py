@@ -355,11 +355,24 @@ def stop(p: Proc) -> None:
 
 
 def run_once(run: Run, rep: int, args: argparse.Namespace, r: Redis, env: dict[str, Any]) -> list[dict[str, Any]]:
+    procs: list[Proc] = []
+    try:
+        return _run_once(run, rep, args, r, env, procs)
+    except BaseException:
+        # An interrupted run must not leave its programs running: each one runs in its own
+        # session, so nothing else stops it, and it keeps consuming the scenario's keys in
+        # later runs on the same Redis (M3F-12).
+        for p in procs:
+            stop(p)
+        raise
+
+
+def _run_once(run: Run, rep: int, args: argparse.Namespace, r: Redis, env: dict[str, Any],
+              procs: list[Proc]) -> list[dict[str, Any]]:
     stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     run_id = f"{args.label}-{stamp}-{run.name}-r{rep}"
     run_dir = Path(args.results) / "logs" / run_id
     run_dir.mkdir(parents=True, exist_ok=True)
-    procs: list[Proc] = []
     for idx, inst in enumerate(run.instances):
         src, targets = keys_for(run, idx, inst)
         procs.append(Proc(idx, inst, src, targets))
@@ -809,8 +822,16 @@ def parser() -> argparse.ArgumentParser:
     return ap
 
 
+def interrupt_on_termination() -> None:
+    """SIGTERM and SIGHUP (a closed terminal) interrupt like Ctrl-C, so the run stops the
+    programs it started on the way out (M3F-12); their default action skips that."""
+    for sig in (signal.SIGTERM, signal.SIGHUP):
+        signal.signal(sig, signal.default_int_handler)
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
+    interrupt_on_termination()
     try:
         return args.func(args)
     except (BenchError, RedisError, OSError) as e:
