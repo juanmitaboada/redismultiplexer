@@ -624,7 +624,6 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_norway",
- "thread_tryjoin",
 ]
 
 [[package]]
@@ -847,15 +846,6 @@ dependencies = [
  "once_cell",
  "rustix",
  "windows-sys",
-]
-
-[[package]]
-name = "thread_tryjoin"
-version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3cfed735bcd14901f6c47b5cece00fad6d11fd6317a3d4d6fe0b10e5a341d29c"
-dependencies = [
- "libc",
 ]
 
 [[package]]

@@ -302,12 +302,17 @@ impl Proc {
     }
 
     pub fn sigint(&self) {
+        self.signal("INT");
+    }
+
+    /// Sends a signal by name (INT, TERM, HUP).
+    pub fn signal(&self, sig: &str) {
         // Shell builtin kill: no extra crate and no dependency on procps.
         let st = Command::new("sh")
-            .args(["-c", "kill -INT \"$0\"", &self.pid().to_string()])
+            .args(["-c", "kill -$0 \"$1\"", sig, &self.pid().to_string()])
             .status()
             .unwrap();
-        assert!(st.success(), "kill -INT {} failed", self.pid());
+        assert!(st.success(), "kill -{} {} failed", sig, self.pid());
     }
 
     pub fn wait_exit(&mut self) -> ExitStatus {
@@ -330,9 +335,14 @@ impl Proc {
 
     /// SIGINT, then asserts exit status 0 and pid file removal.
     pub fn stop(&mut self, pid_file: &Path) {
-        self.sigint();
+        self.stop_with(pid_file, "INT");
+    }
+
+    /// The signal `sig`, then asserts exit status 0 and pid file removal.
+    pub fn stop_with(&mut self, pid_file: &Path, sig: &str) {
+        self.signal(sig);
         let st = self.wait_exit();
-        assert!(st.success(), "exit status after SIGINT: {:?}", st);
+        assert!(st.success(), "exit status after SIG{}: {:?}", sig, st);
         assert!(!pid_file.exists(), "pid file {:?} left behind", pid_file);
     }
 
@@ -396,6 +406,17 @@ pub struct StopRun {
 /// source busy at SIGINT however fast the build is, so the test does not depend on a
 /// package count.
 pub fn stop_under_load(test: &str, children: u16, ordering: bool, run_for: Duration) -> StopRun {
+    stop_under_load_with(test, children, ordering, run_for, "INT")
+}
+
+/// `stop_under_load` with the stop signal `sig` (INT, TERM, HUP).
+pub fn stop_under_load_with(
+    test: &str,
+    children: u16,
+    ordering: bool,
+    run_for: Duration,
+    sig: &str,
+) -> StopRun {
     let mut ctx = Ctx::new(test);
     let src = ctx.key("src");
     let t0 = ctx.key("t0");
@@ -434,7 +455,7 @@ pub fn stop_under_load(test: &str, children: u16, ordering: bool, run_for: Durat
     // With ordering the first release comes after one buffer time (whole seconds)
     ctx.wait_for("first package delivered", |c| c.llen(&t0) > 0);
     thread::sleep(run_for);
-    p.stop(&ctx.pid_file());
+    p.stop_with(&ctx.pid_file(), sig);
     done.store(true, Ordering::SeqCst);
     let pushed = producer.join().unwrap();
     let delivered: Vec<u64> = ctx.list(&t0).iter().map(|s| seq_of(s)).collect();

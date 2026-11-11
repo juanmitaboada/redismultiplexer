@@ -49,7 +49,6 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 use std::{cmp::Reverse, collections::BinaryHeap};
-use thread_tryjoin::TryJoinHandle;
 
 // use std::env;
 use redis::Commands;
@@ -523,9 +522,12 @@ fn main() {
                     }
 
                     if !error {
-                        // Set handler
+                        // Stop order, read by every child after each package. SIGINT, SIGTERM
+                        // and SIGHUP set it (ctrlc `termination`, M3-l = la) and wake this loop.
+                        let stop = Arc::new(AtomicBool::new(false));
                         let (keepworking_tx, keepworking_rx): (Sender<bool>, Receiver<bool>) =
                             mpsc::channel();
+                        let handler_stop = stop.clone();
                         ctrlc::set_handler(move || {
                             print_debug!(
                                 PROGRAM_NAME,
@@ -534,12 +536,11 @@ fn main() {
                                 0,
                                 "User requested to exit!"
                             );
-                            keepworking_tx.send(false).unwrap();
+                            handler_stop.store(true, Ordering::Relaxed);
+                            // Main may be past its loop already (a second signal)
+                            let _ = keepworking_tx.send(false);
                         })
                         .expect("Error setting Ctrl-C handler");
-
-                        // Stop order: set by this loop, read by every child after each package
-                        let stop = Arc::new(AtomicBool::new(false));
 
                         // Ordering: children put timestamped packages in one buffer and one
                         // sender delivers them from it, so the target order is strict (M3-k)
@@ -592,9 +593,6 @@ fn main() {
                                 );
                             });
                             handles.push(handle);
-
-                            // Do not rush
-                            thread::sleep(Duration::from_millis(1));
                         }
 
                         // Show configuration
@@ -618,11 +616,10 @@ fn main() {
                         let mut lasttime = get_current_time_with_ms();
                         let mut keepworking = true;
                         while keepworking {
-                            // Check if there is some message for us (from CTRL+C)
-                            match keepworking_rx.try_recv() {
-                                Ok(true) => print_debug!(PROGRAM_NAME, stderr(), COLOR_RED, 0, "Error while reading message from CTRL+C, got an unexpected message!"),
-                                Ok(false) => keepworking = false,
-                                Err(_) => (),
+                            // Wait up to a second for a signal (instead of sleeping, so a
+                            // stop is seen at once)
+                            if keepworking_rx.recv_timeout(Duration::from_secs(1)).is_ok() {
+                                keepworking = false;
                             }
 
                             // If nothind changed with children
@@ -798,9 +795,6 @@ fn main() {
                                         );
                                         lasttime = get_current_time_with_ms();
                                     }
-
-                                    // Sleep a sec
-                                    thread::sleep(Duration::from_millis(1000));
                                 } else {
                                     print_debug!(
                                         PROGRAM_NAME,
@@ -816,46 +810,27 @@ fn main() {
                         // Tell all children to finish their job
                         stop.store(true, Ordering::Relaxed);
 
-                        // Wait for children to close
+                        // Wait for the children: each leaves after its current package (a
+                        // BLPOP waits at most 1 s); say how many are left every second
                         print_debug!(PROGRAM_NAME, stdout(), COLOR_CYAN, 0, "Closing...");
-                        thread::sleep(Duration::from_millis(2000));
-
-                        // Wait for all children to close
-                        let mut working = 1;
-                        let mut joined: Vec<u16> = Vec::new();
-                        while working > 0 {
-                            // Not working at this moment
-                            working = 0;
-
-                            let mut counter: u16 = 0;
-                            for h in &handles {
-                                // Check if this handle was already joined
-                                if !joined.contains(&counter) {
-                                    // Try to join it
-                                    match h.try_timed_join(Duration::from_millis(1)) {
-                                        // It joined, it is dead!
-                                        Ok(_) => {
-                                            joined.push(counter);
-                                        }
-                                        // Didn't join, it is alive
-                                        Err(_) => working += 1,
-                                    }
-                                }
-                                counter += 1;
-                            }
-
-                            // If somebody working, show up
-                            if working > 0 {
+                        let mut said = Instant::now();
+                        while !handles.iter().all(|h| h.is_finished()) {
+                            if said.elapsed() >= Duration::from_secs(1) {
                                 print_debug!(
                                     PROGRAM_NAME,
                                     stdout(),
                                     COLOR_YELLOW,
                                     0,
                                     "There are {} threads left!",
-                                    working
+                                    handles.iter().filter(|h| !h.is_finished()).count()
                                 );
-                                thread::sleep(Duration::from_millis(1000));
+                                said = Instant::now();
                             }
+                            thread::sleep(Duration::from_millis(100));
+                        }
+                        for handle in handles {
+                            // A child that panicked was reported by the loop above
+                            let _ = handle.join();
                         }
 
                         // Every child has left, so nothing more enters the ordering buffer:
@@ -1422,7 +1397,11 @@ fn sender(
                         worker_slot(&stats, id).add(0, 0, batch.len() as u64, 0);
                         return;
                     }
-                    thread::sleep(Duration::from_millis(1000));
+                    // Retry in a second, or stop retrying once the program stops
+                    pause(
+                        || buffer.state.lock().unwrap().finish,
+                        Duration::from_secs(1),
+                    );
                 }
             }
         }
@@ -1508,9 +1487,9 @@ fn child(
 
     // Prepare the retention data
     while keepworking {
-        // Check if our father wants us to finish
+        // Stopped while (re)connecting: a worker holds nothing between packages
         if stop.load(Ordering::Relaxed) {
-            request_finish = true;
+            break;
         }
 
         // Connect to source
@@ -1683,7 +1662,7 @@ fn child(
 
                         // Error found while processing
                         if error {
-                            thread::sleep(Duration::from_millis(1000));
+                            pause(|| stop.load(Ordering::Relaxed), Duration::from_secs(1));
                             break;
                         }
                     }
@@ -1698,7 +1677,7 @@ fn child(
                         deleted,
                     );
                 } else {
-                    thread::sleep(Duration::from_millis(1000));
+                    pause(|| stop.load(Ordering::Relaxed), Duration::from_secs(1));
                 }
             }
             Err(e) => {
@@ -1713,7 +1692,7 @@ fn child(
                     config.port,
                     e
                 );
-                thread::sleep(Duration::from_millis(1000));
+                pause(|| stop.load(Ordering::Relaxed), Duration::from_secs(1));
             }
         }
 
@@ -1723,11 +1702,20 @@ fn child(
         }
     }
 
-    // Sleep a sec
-    thread::sleep(Duration::from_millis(1500));
-
     #[cfg(feature = "debug")]
     print_debug!(PROGRAM_NAME, stdout(), COLOR_BLUE, 0, "Child {}: Ends", id);
+}
+
+/// Wait `time`, or less once `stopping` says the program is stopping
+fn pause(stopping: impl Fn() -> bool, time: Duration) {
+    let until = Instant::now() + time;
+    while !stopping() {
+        let left = until.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            break;
+        }
+        thread::sleep(left.min(Duration::from_millis(100)));
+    }
 }
 
 /// A worker's counts since its last report and the stuck state of its targets

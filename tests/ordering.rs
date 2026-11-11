@@ -45,9 +45,10 @@ fn ordering_sorts_within_buffer() {
     assert!(p.stderr().contains("without ordering information"));
 }
 
-#[test]
-fn ordering_buffer_flushed_on_sigint() {
-    let mut ctx = Ctx::new("ordering_flush");
+/// A full 30 s buffer is delivered in ts order when the program is stopped, by any of the
+/// stop signals (M3-l = la: before, SIGTERM and SIGHUP killed it and lost the buffer).
+fn buffer_flushed(test: &str, sig: &str) {
+    let mut ctx = Ctx::new(test);
     let src = ctx.key("src");
     let t0 = ctx.key("t0");
     let input: Vec<String> = shuffled(10).into_iter().map(pkg).collect();
@@ -64,9 +65,24 @@ fn ordering_buffer_flushed_on_sigint() {
     ctx.wait_drained(&src, &[(&t0, 0)]);
     thread::sleep(Duration::from_millis(500));
     assert_eq!(ctx.llen(&t0), 0, "packages left the 30 s buffer early");
-    p.stop(&ctx.pid_file());
+    p.stop_with(&ctx.pid_file(), sig);
     let want: Vec<String> = (0..10).map(pkg).collect();
     assert_eq!(ctx.list(&t0), want);
+}
+
+#[test]
+fn ordering_buffer_flushed_on_sigint() {
+    buffer_flushed("ordering_flush", "INT");
+}
+
+#[test]
+fn ordering_buffer_flushed_on_sigterm() {
+    buffer_flushed("ordering_flush_term", "TERM");
+}
+
+#[test]
+fn ordering_buffer_flushed_on_sighup() {
+    buffer_flushed("ordering_flush_hup", "HUP");
 }
 
 #[test]
