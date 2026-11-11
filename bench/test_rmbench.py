@@ -266,6 +266,20 @@ class WindowTests(unittest.TestCase):
         r = self.row(run, p, duration=0.0)
         self.assertEqual((r["msg_s"], r["duration_s"]), ("300.0", ""))
 
+    def test_mixed_aggregate_is_boxed_only_when_every_instance_is(self) -> None:
+        # M3R-11: one instance boxed, the other drained first: the instance rows say so and
+        # the aggregate is not a time-boxed row.
+        a = self.proc(t0=10.0, t_change=14.9, t_end=15.0, win=(400, 480), src_left=390, counts=[510], boxed=True)
+        b = self.proc(idx=1, t0=10.0, t_change=12.0, t_end=12.0, win=(0, 900), src_left=0, counts=[900])
+        run = rmbench.Run("m", ["fast"], [a.inst, b.inst], mixed=True, duration=5.0)
+        rows = rmbench.build_rows(run, 0, "id", [a, b], argparse.Namespace(label="x", duration=None), self.ENV, 0.0)
+        self.assertEqual([r["scenario"] for r in rows], ["m.i0", "m.i1", "m"])
+        self.assertEqual([r["duration_s"] for r in rows], ["5", "", ""])
+        a.boxed = b.boxed = True
+        b.win = (100, 800)
+        rows = rmbench.build_rows(run, 0, "id", [a, b], argparse.Namespace(label="x", duration=None), self.ENV, 0.0)
+        self.assertEqual(rows[-1]["duration_s"], "5")
+
 
 class ReportTests(unittest.TestCase):
     def rows(self, label: str, msg: list[str]) -> list[dict]:
@@ -297,6 +311,9 @@ class ReportTests(unittest.TestCase):
         # One lossy repetition out of three must not disappear behind the median (M2R-4).
         rows = [self.full_row(m, i) for i, m in enumerate(["0", "26955", "0"])]
         self.assertIn("| 26955 |", rmbench.markdown_report(rows, "a"))
+        # M3R-11: a repetition that failed still counts for the worst `missing`.
+        failed = [self.full_row("0"), self.full_row("7", 1) | {"status": "error"}]
+        self.assertIn("| 7 |", rmbench.markdown_report(failed, "a"))
         table = rmbench.compare_table("a", {"s": rows}, "b", {"s": [self.full_row("0")]})
         self.assertIn("| s | 100 | 100 | 1.00 | 26955 | 0 |", table)
         # Duplicates (negative missing) are reported as well.
