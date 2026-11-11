@@ -55,6 +55,9 @@ Every configuration will have
 - `filter_until_included`: `true` makes the `filter_until` substring part of the header, so the Regular Expression can match it and `filter_replace` replaces it too (useful to strip a routing prefix such as `1#`); `false` (default) leaves it out of the header
 - `filter_limit`: the header of the package will be as long until these total bytes is reached (the minimum between filter\_until and filter\_limit will be used)
 - `filter_replace`: if this filter option is defined the Regular Expression will be replaced with this string (which may contain $X groups from Regex)
+- `filter_replace_header`: if this filter option is defined the whole header (not only the part the Regular Expression matched) is replaced with this literal string, without $X groups; an empty string removes the header. Use either `filter_replace` or `filter_replace_header`, not both
+
+Filters work on bytes: packages do not need to be valid UTF-8, and `filter_limit` counts bytes.
 
 As an example:
 - For the incoming string "Hello world"

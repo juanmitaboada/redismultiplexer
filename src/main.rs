@@ -82,6 +82,7 @@ struct ClientConfig {
     filter_until_included: Option<bool>,
     filter_limit: Option<usize>,
     filter_replace: Option<String>,
+    filter_replace_header: Option<String>,
 }
 
 impl Clone for ClientConfig {
@@ -103,6 +104,7 @@ impl Clone for ClientConfig {
             filter_until_included: self.filter_until_included,
             filter_limit: self.filter_limit,
             filter_replace: self.filter_replace.clone(),
+            filter_replace_header: self.filter_replace_header.clone(),
         }
     }
 }
@@ -124,6 +126,7 @@ struct Config {
     filter_until_included: Option<bool>,
     filter_limit: Option<usize>,
     filter_replace: Option<String>,
+    filter_replace_header: Option<String>,
     ordering: Option<String>,
     ordering_buffer_time: Option<u64>,
     ordering_limit: Option<usize>,
@@ -148,6 +151,7 @@ impl Clone for Config {
             filter_until_included: self.filter_until_included,
             filter_limit: self.filter_limit,
             filter_replace: self.filter_replace.clone(),
+            filter_replace_header: self.filter_replace_header.clone(),
             ordering: self.ordering.clone(),
             ordering_buffer_time: self.ordering_buffer_time,
             ordering_limit: self.ordering_limit,
@@ -175,7 +179,14 @@ struct Filter {
     until: Option<memchr::memmem::Finder<'static>>,
     until_included: bool, // the delimiter belongs to the header (and to what is replaced)
     limit: usize,         // 0: no limit
-    replace: Option<Vec<u8>>,
+    replace: Option<Replace>,
+}
+
+/// What a filter does to the header of a matching package
+#[derive(Clone)]
+enum Replace {
+    Regex(Vec<u8>),  // filter_replace: first regex match replaced, $ groups expanded
+    Header(Vec<u8>), // filter_replace_header: the whole header replaced by a literal
 }
 
 impl Filter {
@@ -184,7 +195,7 @@ impl Filter {
         until: Option<&str>,
         until_included: bool,
         limit: Option<usize>,
-        replace: Option<&str>,
+        replace: Option<Replace>,
     ) -> Result<Filter, String> {
         let regex = Regex::new(pattern).map_err(|e| e.to_string())?;
         Ok(Filter {
@@ -194,7 +205,7 @@ impl Filter {
                 .map(|u| memchr::memmem::Finder::new(u.as_bytes()).into_owned()),
             until_included,
             limit: limit.unwrap_or(0),
-            replace: replace.map(|r| r.as_bytes().to_vec()),
+            replace,
         })
     }
 
@@ -218,14 +229,14 @@ impl Filter {
         if !self.regex.is_match(haystack) {
             return None;
         }
+        let tail = &data[haystack.len()..];
         match &self.replace {
             None => Some(Cow::Borrowed(data)),
-            Some(r) => {
+            Some(Replace::Regex(r)) => {
                 let replaced = self.regex.replace(haystack, r.as_slice());
-                Some(Cow::Owned(
-                    [&replaced[..], &data[haystack.len()..]].concat(),
-                ))
+                Some(Cow::Owned([&replaced[..], tail].concat()))
             }
+            Some(Replace::Header(h)) => Some(Cow::Owned([h.as_slice(), tail].concat())),
         }
     }
 }
@@ -237,6 +248,15 @@ struct Filters {
     clients: Vec<Option<Filter>>,
 }
 
+/// The replacement a filter applies, from its two optional keys (verify_config rejects both)
+fn replacement(replace: &Option<String>, replace_header: &Option<String>) -> Option<Replace> {
+    match (replace, replace_header) {
+        (Some(r), _) => Some(Replace::Regex(r.as_bytes().to_vec())),
+        (None, Some(h)) => Some(Replace::Header(h.as_bytes().to_vec())),
+        (None, None) => None,
+    }
+}
+
 /// Compile every filter of a configuration
 fn build_filters(config: &Config) -> Result<Filters, String> {
     let root = match &config.filter {
@@ -246,7 +266,7 @@ fn build_filters(config: &Config) -> Result<Filters, String> {
                 config.filter_until.as_deref(),
                 config.filter_until_included.unwrap_or(false),
                 config.filter_limit,
-                config.filter_replace.as_deref(),
+                replacement(&config.filter_replace, &config.filter_replace_header),
             )
             .map_err(|e| format!("Filter Regex '{}' doesn't compile: {}", f, e))?,
         ),
@@ -261,7 +281,7 @@ fn build_filters(config: &Config) -> Result<Filters, String> {
                     client.filter_until.as_deref(),
                     client.filter_until_included.unwrap_or(false),
                     client.filter_limit,
-                    client.filter_replace.as_deref(),
+                    replacement(&client.filter_replace, &client.filter_replace_header),
                 )
                 .map_err(|e| {
                     format!(
@@ -995,6 +1015,7 @@ fn verify_config(config: Config) -> Result<Config, String> {
                 || (source.filter_until_included != None)
                 || (source.filter_limit != None)
                 || (source.filter_replace != None)
+                || (source.filter_replace_header != None)
             {
                 return Err(format!(
                     "Source '{}' is using some filtering option but filter is not defined",
@@ -1006,6 +1027,12 @@ fn verify_config(config: Config) -> Result<Config, String> {
             if v.len() == 0 {
                 return Err(format!(
                     "Source '{}' is using filters, but filter can not empty",
+                    source.name
+                ));
+            }
+            if source.filter_replace.is_some() && source.filter_replace_header.is_some() {
+                return Err(format!(
+                    "Source '{}' sets both filter_replace and filter_replace_header, use only one",
                     source.name
                 ));
             }
@@ -1123,6 +1150,7 @@ fn verify_config(config: Config) -> Result<Config, String> {
                         || (client.filter_until_included != None)
                         || (client.filter_limit != None)
                         || (client.filter_replace != None)
+                        || (client.filter_replace_header != None)
                     {
                         return Err(format!(
                             "Client '{}' is using some filtering option but filter is not defined",
@@ -1134,6 +1162,12 @@ fn verify_config(config: Config) -> Result<Config, String> {
                     if v.len() == 0 {
                         return Err(format!(
                             "Client '{}' is using filters, but filter can not empty",
+                            client.name
+                        ));
+                    }
+                    if client.filter_replace.is_some() && client.filter_replace_header.is_some() {
+                        return Err(format!(
+                            "Client '{}' sets both filter_replace and filter_replace_header, use only one",
                             client.name
                         ));
                     }

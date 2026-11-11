@@ -20,6 +20,7 @@ fn client(name: &str, channel: &str) -> ClientConfig {
         filter_until_included: None,
         filter_limit: None,
         filter_replace: None,
+        filter_replace_header: None,
     }
 }
 
@@ -40,11 +41,38 @@ fn config() -> Config {
         filter_until_included: None,
         filter_limit: None,
         filter_replace: None,
+        filter_replace_header: None,
         ordering: None,
         ordering_buffer_time: None,
         ordering_limit: None,
         clients: vec![client("t1", "dst")],
     }
+}
+
+/// A filter_replace replacement, as the configuration key gives it
+fn rx(replace: Option<&str>) -> Option<Replace> {
+    replace.map(|r| Replace::Regex(r.as_bytes().to_vec()))
+}
+
+/// A filter_replace_header filter
+fn header(
+    re: &str,
+    until: Option<&str>,
+    included: bool,
+    limit: Option<usize>,
+    literal: &str,
+    data: &[u8],
+) -> Option<Vec<u8>> {
+    Filter::new(
+        re,
+        until,
+        included,
+        limit,
+        Some(Replace::Header(literal.as_bytes().to_vec())),
+    )
+    .unwrap()
+    .apply(data)
+    .map(|c| c.into_owned())
 }
 
 fn filter_bytes(
@@ -56,7 +84,7 @@ fn filter_bytes(
 ) -> Option<Vec<u8>> {
     match re {
         None => Some(data.to_vec()),
-        Some(r) => Filter::new(r, until, false, limit, replace)
+        Some(r) => Filter::new(r, until, false, limit, rx(replace))
             .unwrap()
             .apply(data)
             .map(|c| c.into_owned()),
@@ -150,6 +178,12 @@ fn yaml_scalars_as_earlier_versions_read_them() {
         Some(true)
     );
     assert_eq!(yaml("").unwrap().filter_until_included, None);
+    assert_eq!(
+        yaml("filter: 'a'\nfilter_replace_header: ''\n")
+            .unwrap()
+            .filter_replace_header,
+        Some(String::new())
+    );
 }
 
 #[test]
@@ -382,7 +416,7 @@ fn included(
     replace: Option<&str>,
     data: &str,
 ) -> Option<String> {
-    Filter::new(re, Some(until), true, limit, replace)
+    Filter::new(re, Some(until), true, limit, rx(replace))
         .unwrap()
         .apply(data.as_bytes())
         .map(|c| String::from_utf8(c.into_owned()).unwrap())
@@ -432,6 +466,64 @@ fn verify_rejects_until_included_without_filter() {
     assert!(err(c).contains("filtering option but filter is not defined"));
     let mut c = config();
     c.filter_until_included = Some(false);
+    assert!(err(c).contains("filtering option but filter is not defined"));
+}
+
+#[test]
+fn filter_replace_header_replaces_the_whole_header() {
+    // M3-a: the literal replaces everything before the cut, not only the regex match
+    assert_eq!(
+        header("^route\\d+$", Some(":"), false, None, "X", b"route12:abc").unwrap(),
+        b"X:abc".to_vec()
+    );
+    assert_eq!(
+        header("^route\\d+:$", Some(":"), true, None, "", b"route12:abc").unwrap(),
+        b"abc".to_vec()
+    );
+    // No regex groups: "$1" is literal
+    assert_eq!(
+        header("^(r)", Some(":"), true, None, "$1-", b"r:abc").unwrap(),
+        b"$1-abc".to_vec()
+    );
+    // Header cut by the limit only; the rest of the package, bytes included, is kept
+    assert_eq!(
+        header("^ab", None, false, Some(2), "Z", b"abc\xff").unwrap(),
+        b"Zc\xff".to_vec()
+    );
+    assert_eq!(
+        header("^zz", Some(":"), true, None, "X", b"route12:abc"),
+        None
+    );
+}
+
+#[test]
+fn replacement_from_the_configuration_keys() {
+    assert!(replacement(&None, &None).is_none());
+    assert!(matches!(replacement(&Some("a".into()), &None), Some(Replace::Regex(r)) if r == b"a"));
+    assert!(matches!(replacement(&None, &Some("h".into())), Some(Replace::Header(h)) if h == b"h"));
+}
+
+#[test]
+fn verify_rejects_both_replacements() {
+    let mut c = config();
+    c.clients[0].filter = Some("a".into());
+    c.clients[0].filter_replace = Some("b".into());
+    c.clients[0].filter_replace_header = Some("c".into());
+    assert!(err(c).contains("Client 't1' sets both filter_replace and filter_replace_header"));
+    let mut c = config();
+    c.filter = Some("a".into());
+    c.filter_replace = Some("b".into());
+    c.filter_replace_header = Some(String::new());
+    assert!(err(c).contains("Source 'source' sets both filter_replace and filter_replace_header"));
+}
+
+#[test]
+fn verify_rejects_replace_header_without_filter() {
+    let mut c = config();
+    c.clients[0].filter_replace_header = Some("x".into());
+    assert!(err(c).contains("filtering option but filter is not defined"));
+    let mut c = config();
+    c.filter_replace_header = Some("x".into());
     assert!(err(c).contains("filtering option but filter is not defined"));
 }
 
@@ -517,14 +609,14 @@ fn filter_borrows_the_package_unless_it_replaces() {
     let data = b"Hello world";
     let f = Filter::new("ell", Some("r"), false, Some(11), None).unwrap();
     assert!(matches!(f.apply(data), Some(Cow::Borrowed(_))));
-    let f = Filter::new("ell", Some("r"), false, Some(11), Some("ELL")).unwrap();
+    let f = Filter::new("ell", Some("r"), false, Some(11), rx(Some("ELL"))).unwrap();
     assert!(matches!(f.apply(data), Some(Cow::Owned(_))));
 }
 
 #[test]
 fn filter_clone_matches_like_the_original() {
     // Each worker gets a clone (its own regex cache); it must behave the same
-    let f = Filter::new(r"^(\d)-(\d)", Some(" "), false, Some(10), Some("$2-$1")).unwrap();
+    let f = Filter::new(r"^(\d)-(\d)", Some(" "), false, Some(10), rx(Some("$2-$1"))).unwrap();
     let g = f.clone();
     assert_eq!(f.apply(b"1-2 rest"), g.apply(b"1-2 rest"));
     assert_eq!(g.apply(b"1-2 rest").unwrap().as_ref(), b"2-1 rest");

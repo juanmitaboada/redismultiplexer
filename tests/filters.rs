@@ -119,3 +119,32 @@ fn readme_client_filter_example_with_until_included() {
     assert_eq!(ctx.list(&odd), vec!["a", "c"]);
     assert_eq!(ctx.list(&even), vec!["b", "d"]);
 }
+
+#[test]
+fn replace_header_on_root_and_client() {
+    // M3-a: the root strips the routing prefix, a client replaces its own header
+    let mut ctx = Ctx::new("replace_header");
+    let src = ctx.key("src");
+    let plain = ctx.key("plain");
+    let tagged = ctx.key("tagged");
+    let input: Vec<String> = ["r1:a=1", "r2:b=2", "x:c=3"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    ctx.push(&src, &input);
+    let extra = "filter: '^r[0-9]+:$'\nfilter_until: ':'\nfilter_until_included: true\nfilter_replace_header: ''\n";
+    let clients = [
+        ctx.client_yaml("plain", &plain, ""),
+        ctx.client_yaml(
+            "tagged",
+            &tagged,
+            "    filter: '^b'\n    filter_until: '='\n    filter_replace_header: 'B'\n",
+        ),
+    ];
+    let cfg = ctx.config(&src, 1, "replicant", extra, &clients);
+    let mut p = ctx.spawn(&cfg);
+    ctx.wait_drained(&src, &[(&plain, 2), (&tagged, 1)]);
+    p.stop(&ctx.pid_file());
+    assert_eq!(ctx.list(&plain), vec!["a=1", "b=2"]);
+    assert_eq!(ctx.list(&tagged), vec!["B=2"]);
+}
