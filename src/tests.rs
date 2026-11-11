@@ -213,11 +213,15 @@ fn yaml_declared_differences_with_earlier_versions() {
     assert!(yaml_replace("name: s\n", "name: s # it\u{92}s\n").is_err());
     // d: a value on the line after its key at column 0: 0.8 read it, now an error
     assert!(yaml_replace("channel: c\n", "channel:\nc\n").is_err());
-    // e: `Null` on an optional text key: 0.8 read the text "Null", now absent
+    // e: `Null` or `NULL` on an optional text key: 0.8 read the text, now absent
     assert_eq!(yaml("filter: Null\n").unwrap().filter, None);
-    // f: an empty `hostname:` read "~" in 0.8 (never connected); now "" and rejected
+    assert_eq!(yaml("filter: NULL\n").unwrap().filter, None);
+    // f: an empty `hostname:` or `mode:` read "~" in 0.8 (never worked); now "" and rejected
     let c = yaml_replace("hostname: h\n", "hostname:\n").unwrap();
     assert_eq!(c.hostname, "");
+    assert!(verify_config(c).is_err());
+    let c = yaml_replace("mode: replicant\n", "mode:\n").unwrap();
+    assert_eq!(c.mode, "");
     assert!(verify_config(c).is_err());
 }
 
