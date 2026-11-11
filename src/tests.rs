@@ -906,14 +906,16 @@ fn queuer_flushes_the_ordering_buffer_for_a_request_after_the_stop_order() {
         let (keep_tx, keep_rx) = mpsc::channel();
         let (req_tx, req_rx) = mpsc::channel();
         let (ans_tx, ans_rx) = mpsc::channel();
-        let (stat_tx, stat_rx) = mpsc::channel();
-        let handle = thread::spawn(move || queuer(true, c, keep_rx, req_rx, vec![ans_tx], stat_tx));
+        let queue_len = Arc::new(AtomicUsize::new(0));
+        let len = queue_len.clone();
+        let handle = thread::spawn(move || queuer(true, c, keep_rx, req_rx, vec![ans_tx], len));
 
         req_tx.send((0, Some(1), Some(b"p1".to_vec()))).unwrap();
         assert!(
             ans_rx.recv().unwrap().is_empty(),
             "round {round}: held for 30 s"
         );
+        assert_eq!(queue_len.load(Ordering::Relaxed), 1, "round {round}");
         // Let the queuer park in its wait, where M2R-1 happens
         thread::sleep(Duration::from_millis(5));
         keep_tx.send(true).unwrap();
@@ -924,10 +926,10 @@ fn queuer_flushes_the_ordering_buffer_for_a_request_after_the_stop_order() {
             "round {round}"
         );
 
+        assert_eq!(queue_len.load(Ordering::Relaxed), 0, "round {round}");
+
         keep_tx.send(false).unwrap();
         handle.join().unwrap();
-        let sizes: Vec<Option<usize>> = stat_rx.try_iter().collect();
-        assert_eq!(sizes, vec![Some(1), Some(0), None], "round {round}");
     }
 }
 
@@ -975,4 +977,54 @@ fn each_child_reads_only_its_own_queuer_answers_and_stop_order() {
             );
         }
     }
+}
+
+// --- worker statistics ---
+
+#[test]
+fn each_worker_writes_only_its_own_stats_slot() {
+    // S3-1: the counter slot is the one per-worker index the delivery path keeps; a worker
+    // writing another worker's slot misreports counts and stuck targets. Deterministic.
+    for n in [1u16, 2, 3, 8] {
+        let stats = stats_slots(n, 2);
+        for id in 0..n {
+            let k = id as u64 + 1;
+            worker_slot(&stats, id).add(k, 10 * k, 100 * k, 1000 * k);
+            worker_slot(&stats, id).stuck[(id % 2) as usize].store(true, Ordering::Relaxed);
+        }
+        for (i, w) in stats.iter().enumerate() {
+            let k = i as u64 + 1;
+            let got = (
+                w.incoming.load(Ordering::Relaxed),
+                w.outgoing.load(Ordering::Relaxed),
+                w.dropped.load(Ordering::Relaxed),
+                w.deleted.load(Ordering::Relaxed),
+            );
+            assert_eq!(got, (k, 10 * k, 100 * k, 1000 * k), "slot {}", i);
+            assert!(w.stuck[i % 2].load(Ordering::Relaxed), "slot {}", i);
+            assert!(!w.stuck[1 - i % 2].load(Ordering::Relaxed), "slot {}", i);
+        }
+    }
+}
+
+#[test]
+fn stats_are_summed_and_reset_per_interval() {
+    let stats = stats_slots(3, 3);
+    stats[0].add(1, 2, 3, 4);
+    stats[2].add(10, 20, 30, 40);
+    stats[1].stuck[2].store(true, Ordering::Relaxed);
+    assert_eq!(take_counts(&stats), (11, 22, 33, 44));
+    assert_eq!(take_counts(&stats), (0, 0, 0, 0));
+    assert_eq!(stuck_clients(&stats, 3), vec![2]);
+    stats[1].stuck[2].store(false, Ordering::Relaxed);
+    assert!(stuck_clients(&stats, 3).is_empty());
+}
+
+#[test]
+fn stats_slots_do_not_share_a_cache_line() {
+    let stats = stats_slots(2, 1);
+    let a = &stats[0] as *const WorkerStats as usize;
+    let b = &stats[1] as *const WorkerStats as usize;
+    assert_eq!(std::mem::align_of::<WorkerStats>(), 64);
+    assert!(b - a >= 64);
 }

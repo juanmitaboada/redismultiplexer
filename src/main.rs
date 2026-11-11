@@ -42,15 +42,16 @@ use std::borrow::Cow;
 use std::cmp;
 use std::io::{stderr, stdout, Write};
 use std::process;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 use std::{cmp::Reverse, collections::BinaryHeap};
 use thread_tryjoin::TryJoinHandle;
 
 // use std::env;
-use dict::{Dict, DictIface};
 use redis::Commands;
 use std::fs;
 use std::path::Path;
@@ -296,16 +297,67 @@ fn build_filters(config: &Config) -> Result<Filters, String> {
     Ok(Filters { root, clients })
 }
 
-/// Keep track of statistics per child
-#[derive(Debug)]
-struct Statistics {
-    _id: u16,
-    incoming: u64,
-    outgoing: u64,
-    dropped: u64,
-    deleted: u64,
-    stuck: Vec<(String, bool)>,
-    finished: bool,
+/// Counters of one worker, written by that worker only and read by main. Relaxed atomics:
+/// every counter stands alone and main only needs a recent value. Aligned to a cache line,
+/// so two workers never write the same line.
+#[repr(align(64))]
+struct WorkerStats {
+    incoming: AtomicU64,
+    outgoing: AtomicU64,
+    dropped: AtomicU64,
+    deleted: AtomicU64,
+    stuck: Vec<AtomicBool>, // per client, in configuration order
+}
+
+impl WorkerStats {
+    fn new(clients: usize) -> WorkerStats {
+        WorkerStats {
+            incoming: AtomicU64::new(0),
+            outgoing: AtomicU64::new(0),
+            dropped: AtomicU64::new(0),
+            deleted: AtomicU64::new(0),
+            stuck: (0..clients).map(|_| AtomicBool::new(false)).collect(),
+        }
+    }
+
+    /// Add the counts a worker gathered since its last report
+    fn add(&self, incoming: u64, outgoing: u64, dropped: u64, deleted: u64) {
+        self.incoming.fetch_add(incoming, Ordering::Relaxed);
+        self.outgoing.fetch_add(outgoing, Ordering::Relaxed);
+        self.dropped.fetch_add(dropped, Ordering::Relaxed);
+        self.deleted.fetch_add(deleted, Ordering::Relaxed);
+    }
+}
+
+/// One counter slot per worker
+fn stats_slots(workers: u16, clients: usize) -> Arc<Vec<WorkerStats>> {
+    Arc::new((0..workers).map(|_| WorkerStats::new(clients)).collect())
+}
+
+/// The slot worker `id` writes: it must be its own, or main reports one worker's counts and
+/// stuck targets as another's
+fn worker_slot(stats: &[WorkerStats], id: u16) -> &WorkerStats {
+    &stats[id as usize]
+}
+
+/// Counts of every worker since the last call (each slot is reset): incoming, outgoing,
+/// dropped, deleted
+fn take_counts(stats: &[WorkerStats]) -> (u64, u64, u64, u64) {
+    stats.iter().fold((0, 0, 0, 0), |t, w| {
+        (
+            t.0 + w.incoming.swap(0, Ordering::Relaxed),
+            t.1 + w.outgoing.swap(0, Ordering::Relaxed),
+            t.2 + w.dropped.swap(0, Ordering::Relaxed),
+            t.3 + w.deleted.swap(0, Ordering::Relaxed),
+        )
+    })
+}
+
+/// Indexes of the clients that some worker found stuck at its last report
+fn stuck_clients(stats: &[WorkerStats], clients: usize) -> Vec<usize> {
+    (0..clients)
+        .filter(|&c| stats.iter().any(|w| w.stuck[c].load(Ordering::Relaxed)))
+        .collect()
 }
 
 /// Main module will manage the basics from this program
@@ -497,8 +549,8 @@ fn main() {
                         ) = mpsc::channel();
                         let (queue_working_tx, queue_working_rx): (Sender<bool>, Receiver<bool>) =
                             mpsc::channel();
-                        let (children_tx, children_rx): (Sender<Statistics>, Receiver<Statistics>) =
-                            mpsc::channel();
+                        // Counters of every child, read by this loop (no messages)
+                        let stats = stats_slots(inconfig.children, inconfig.clients.len());
                         let Links {
                             answers: queues_channels,
                             stops: keepworkings,
@@ -507,13 +559,11 @@ fn main() {
 
                         // Prepare list of handles
                         let mut handles: Vec<thread::JoinHandle<_>> = Vec::new();
-                        let (queuer_stat_tx, queuer_stat_rx): (
-                            Sender<Option<usize>>,
-                            Receiver<Option<usize>>,
-                        ) = mpsc::channel();
+                        let queue_len = Arc::new(AtomicUsize::new(0));
 
                         // Spawn a queue manage
                         let queue_config = inconfig.clone();
+                        let queue_len_w = queue_len.clone();
                         let queue_handler = thread::spawn(move || {
                             queuer(
                                 is_ordering_regex,
@@ -521,7 +571,7 @@ fn main() {
                                 queue_working_rx,
                                 queue_rx,
                                 queues_channels,
-                                queuer_stat_tx,
+                                queue_len_w,
                             )
                         });
 
@@ -529,7 +579,7 @@ fn main() {
                         // gets the ends paired with its id by links()
                         for (id, qrx, rx) in children_channels {
                             // Clone config and execute thread
-                            let tx = children_tx.clone();
+                            let child_stats = stats.clone();
                             let qtx = queue_tx.clone();
                             let child_config = inconfig.clone();
                             // Each child owns its compiled filters (one regex cache per thread)
@@ -540,7 +590,7 @@ fn main() {
                                     id,
                                     or,
                                     inconfig.ordering_limit,
-                                    tx,
+                                    child_stats,
                                     rx,
                                     qtx,
                                     &qrx,
@@ -571,21 +621,9 @@ fn main() {
                             print_debug!(PROGRAM_NAME, stdout(), COLOR_CYAN, 0, "  - {}:{} @ {}  [timelimit={}, checklimit={}, softlimit={}, hardlimit={}]", client.hostname, client.port, client.channel, option2string!(client.timelimit), option2string!(client.checklimit), option2string!(client.softlimit), option2string!(client.hardlimit));
                         }
 
-                        // Create dictionary of stuck clients
-                        let mut stucked = Dict::<(String, bool)>::new();
-                        for client in inconfig.clients {
-                            stucked.add(client.name, (client.channel, false));
-                        }
-
                         // Keep working while all children keep working
                         let mut lasttime = get_current_time_with_ms();
-                        let mut incoming: u64 = 0;
-                        let mut outgoing: u64 = 0;
-                        let mut dropped: u64 = 0;
-                        let mut deleted: u64 = 0;
                         let mut keepworking = true;
-                        let mut queuer_working: bool = true;
-                        let mut queuer_stat_size: usize = 0;
                         while keepworking {
                             // Check if there is some message for us (from CTRL+C)
                             match keepworking_rx.try_recv() {
@@ -596,53 +634,16 @@ fn main() {
 
                             // If nothind changed with children
                             if keepworking {
-                                // While we get messages, keep reading
-                                let mut got_message = true;
-                                while got_message {
-                                    got_message = false;
-                                    let result_message = children_rx.try_recv();
-                                    match result_message {
-                                        Ok(msg) => {
-                                            incoming += msg.incoming;
-                                            outgoing += msg.outgoing;
-                                            dropped += msg.dropped;
-                                            deleted += msg.deleted;
-                                            if msg.finished {
-                                                keepworking = false;
-                                            }
-                                            for (name, newstatus) in msg.stuck {
-                                                let (channel, _) = stucked.get(&name).unwrap();
-                                                let value = (channel.clone(), newstatus);
-                                                stucked.remove_key(&name).unwrap();
-                                                stucked.add(name, value);
-                                            }
-                                            got_message = true
-                                        }
-                                        Err(_) => (),
-                                    }
+                                // A child only ends when told to: one that ended on its own
+                                // (a panic) stops the program
+                                if handles.iter().any(|h| h.is_finished()) {
+                                    keepworking = false;
                                 }
 
                                 // Check if we can keep working
                                 if keepworking {
-                                    // Check if there is some message for us
-                                    got_message = true;
-                                    while got_message {
-                                        match queuer_stat_rx.try_recv() {
-                                            Ok(v) => {
-                                                got_message = true;
-                                                if let Some(size) = v {
-                                                    queuer_stat_size = size;
-                                                    queuer_working = true;
-                                                } else {
-                                                    queuer_working = false;
-                                                }
-                                            }
-                                            Err(_) => got_message = false,
-                                        }
-                                    }
-
                                     // Check if queuer has finished
-                                    if !queuer_working {
+                                    if queue_handler.is_finished() {
                                         // Some child already died, show message and leave
                                         print_debug!(
                                             PROGRAM_NAME,
@@ -658,6 +659,10 @@ fn main() {
                                     if (get_current_time_with_ms() - (STATISTICS_SECONDS * 1000))
                                         > lasttime
                                     {
+                                        // Counts of every child since the last report
+                                        let (incoming, outgoing, dropped, deleted) =
+                                            take_counts(&stats);
+
                                         // Show statistics
                                         let diff: f64 = ((get_current_time_with_ms() - lasttime)
                                             as f64)
@@ -692,7 +697,7 @@ fn main() {
                                                 COLOR_GREEN,
                                                 COLOR_NOHEAD_NOTAIL,
                                                 "Queue: {} regs",
-                                                queuer_stat_size
+                                                queue_len.load(Ordering::Relaxed)
                                             );
                                             print_debug!(
                                                 PROGRAM_NAME,
@@ -744,13 +749,14 @@ fn main() {
                                         }
 
                                         // Show stuck clients
-                                        let mut stucks = Vec::new();
-                                        for element in &stucked {
-                                            let (channel, is_stuck) = element.val.clone();
-                                            if is_stuck {
-                                                stucks.push(format!("{}:{}", element.key, channel));
-                                            }
-                                        }
+                                        let stucks: Vec<String> =
+                                            stuck_clients(&stats, inconfig.clients.len())
+                                                .into_iter()
+                                                .map(|c| {
+                                                    let client = &inconfig.clients[c];
+                                                    format!("{}:{}", client.name, client.channel)
+                                                })
+                                                .collect();
                                         if stucks.len() > 0 {
                                             print_debug!(
                                                 PROGRAM_NAME,
@@ -798,10 +804,6 @@ fn main() {
                                             ""
                                         );
                                         lasttime = get_current_time_with_ms();
-                                        incoming = 0;
-                                        outgoing = 0;
-                                        dropped = 0;
-                                        deleted = 0;
                                     }
 
                                     // Sleep a sec
@@ -1279,7 +1281,7 @@ fn queuer(
     keepworking_rx: Receiver<bool>,
     children_rx: Receiver<(u16, Option<u128>, Option<Vec<u8>>)>,
     children_tx: Vec<Sender<Vec<Vec<u8>>>>,
-    stat_tx: Sender<Option<usize>>,
+    queue_len: Arc<AtomicUsize>,
 ) {
     #[cfg(feature = "debug")]
     print_debug!(PROGRAM_NAME, stdout(), COLOR_BLUE, 0, "Queue: Starts");
@@ -1360,11 +1362,12 @@ fn queuer(
                     list.len()
                 );
 
+                // Publish the size of the queue for the statistics line (before the answer, so
+                // a child that got its answer sees the size that goes with it)
+                queue_len.store(ordered_packages.len(), Ordering::Relaxed);
+
                 // Answer to the child
                 answer_child(&children_tx, id, list);
-
-                // Send the size of the queue
-                stat_tx.send(Some(ordered_packages.len())).unwrap();
             }
             Err(RecvTimeoutError::Timeout) => (),
             Err(RecvTimeoutError::Disconnected) => {
@@ -1373,9 +1376,6 @@ fn queuer(
             }
         }
     }
-
-    // Say we are done
-    stat_tx.send(None).unwrap();
 
     #[cfg(feature = "debug")]
     print_debug!(PROGRAM_NAME, stdout(), COLOR_BLUE, 0, "Queue: Ends");
@@ -1416,7 +1416,7 @@ fn child(
     id: u16,
     ordering_regex: Option<Regex>,
     ordering_limit: Option<usize>,
-    tx: Sender<Statistics>,
+    stats: Arc<Vec<WorkerStats>>,
     rx: Receiver<bool>,
     qtx: Sender<(u16, Option<u128>, Option<Vec<u8>>)>,
     qrx: &Receiver<Vec<Vec<u8>>>,
@@ -1522,24 +1522,14 @@ fn child(
                     while keepworking {
                         // Check if we should save statistics
                         if (get_current_time() - 1) > lasttime {
-                            // Calculate stucked connections
-                            let mut stucked: Vec<(String, bool)> = Vec::new();
-                            for client in clients.iter_mut() {
-                                stucked
-                                    .push((client.config.name.clone(), client.sleeping_from > 0));
-                            }
-
-                            // If we should send statistics
-                            let msg = Statistics {
-                                _id: id,
-                                incoming: incoming,
-                                outgoing: outgoing,
-                                dropped: dropped,
-                                deleted: deleted,
-                                stuck: stucked,
-                                finished: false,
-                            };
-                            tx.send(msg).unwrap();
+                            report(
+                                worker_slot(&stats, id),
+                                &clients,
+                                incoming,
+                                outgoing,
+                                dropped,
+                                deleted,
+                            );
 
                             // Reset status
                             incoming = 0;
@@ -1707,26 +1697,15 @@ fn child(
                         }
                     }
 
-                    // If we won't keep working
-                    if !keepworking {
-                        // Calculate stucked connections
-                        let mut stucked: Vec<(String, bool)> = Vec::new();
-                        for client in clients.iter_mut() {
-                            stucked.push((client.config.name.clone(), client.sleeping_from > 0));
-                        }
-
-                        // Say we are done
-                        let msg = Statistics {
-                            _id: id,
-                            incoming: incoming,
-                            outgoing: outgoing,
-                            dropped: dropped,
-                            deleted: deleted,
-                            stuck: stucked,
-                            finished: true,
-                        };
-                        tx.send(msg).unwrap();
-                    }
+                    // Report what is left of this connection's counts
+                    report(
+                        worker_slot(&stats, id),
+                        &clients,
+                        incoming,
+                        outgoing,
+                        dropped,
+                        deleted,
+                    );
                 } else {
                     thread::sleep(Duration::from_millis(1000));
                 }
@@ -1778,6 +1757,21 @@ fn child(
 
     #[cfg(feature = "debug")]
     print_debug!(PROGRAM_NAME, stdout(), COLOR_BLUE, 0, "Child {}: Ends", id);
+}
+
+/// A worker's counts since its last report and the stuck state of its targets
+fn report(
+    slot: &WorkerStats,
+    clients: &[RedisLink],
+    incoming: u64,
+    outgoing: u64,
+    dropped: u64,
+    deleted: u64,
+) {
+    slot.add(incoming, outgoing, dropped, deleted);
+    for (flag, client) in slot.stuck.iter().zip(clients) {
+        flag.store(client.sleeping_from > 0, Ordering::Relaxed);
+    }
 }
 
 fn redis_connect(

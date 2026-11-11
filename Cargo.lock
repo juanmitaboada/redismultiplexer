@@ -126,12 +126,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "dict"
-version = "0.1.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "39fbb71fba1e2c935f51b056de0d812d9b625b8165b2d7f8848902080fbdffb4"
-
-[[package]]
 name = "dispatch2"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -624,7 +618,6 @@ version = "1.0.8"
 dependencies = [
  "chrono",
  "ctrlc",
- "dict",
  "memchr",
  "redis",
  "regex",
