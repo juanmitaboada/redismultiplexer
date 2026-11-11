@@ -187,6 +187,25 @@ fn yaml_empty_name_and_channel_read_as_in_earlier_versions() {
 }
 
 #[test]
+fn yaml_unknown_clients_key_inside_a_client_keeps_the_empty_name() {
+    // M3R-7: an unknown key `clients` inside a client is ignored by the typed read; it
+    // must not turn the "~" of an empty `name:` or `channel:` off for the whole file
+    for unknown in ["1", "x", "{a: 1}", "[1, 2]"] {
+        let text = YAML_BASE.replace("name: s\n", "name:\n").replace(
+            "    channel: d\n",
+            &format!("    channel:\n    clients: {}\n", unknown),
+        );
+        let c = parse_yaml(&text).unwrap();
+        assert_eq!(
+            (c.name.as_str(), c.clients[0].channel.as_str()),
+            ("~", "~"),
+            "{}",
+            unknown
+        );
+    }
+}
+
+#[test]
 fn yaml_declared_differences_with_earlier_versions() {
     // M3R-1 rows c to f: what serde_yaml 0.8 (1.0.8) read and serde_norway reads now.
     // c: a control character (form feed, or U+0092 in a comment): 0.8 kept it, now an error

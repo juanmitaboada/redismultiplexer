@@ -1147,7 +1147,15 @@ fn parse_yaml(data: &str) -> Result<Config, String> {
 struct RawNames {
     name: Option<String>,
     channel: Option<String>,
-    clients: Option<Vec<RawNames>>,
+    clients: Option<Vec<RawClientNames>>,
+}
+
+/// `name` and `channel` of a client. A struct of its own, without `clients`: an unknown
+/// `clients` key inside a client is then ignored here as by the typed read (M3R-7)
+#[derive(Deserialize)]
+struct RawClientNames {
+    name: Option<String>,
+    channel: Option<String>,
 }
 
 /// "~" where the YAML value was empty, as serde_yaml 0.8 read it
