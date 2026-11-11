@@ -42,12 +42,12 @@ use std::borrow::Cow;
 use std::cmp;
 use std::io::{stderr, stdout, Write};
 use std::process;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
-use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
-use std::sync::Arc;
+use std::sync::mpsc::{Receiver, Sender};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use std::{cmp::Reverse, collections::BinaryHeap};
 use thread_tryjoin::TryJoinHandle;
 
@@ -496,7 +496,6 @@ fn main() {
 
                     // Render main ordering regex
                     let ordering_regex: Option<Regex>;
-                    let is_ordering_regex: bool;
                     let regex_str: &str;
                     if let Some(r) = inconfig.ordering.clone() {
                         regex_str = &r;
@@ -504,7 +503,6 @@ fn main() {
                         match filter_temp {
                             Ok(f) => {
                                 ordering_regex = Some(f);
-                                is_ordering_regex = true;
                             }
                             Err(e) => {
                                 print_debug!(
@@ -517,13 +515,11 @@ fn main() {
                                     e
                                 );
                                 ordering_regex = None;
-                                is_ordering_regex = false;
                                 error = true;
                             }
                         }
                     } else {
                         ordering_regex = None;
-                        is_ordering_regex = false;
                     }
 
                     if !error {
@@ -542,45 +538,43 @@ fn main() {
                         })
                         .expect("Error setting Ctrl-C handler");
 
-                        // Let communicate with children to end
-                        let (queue_tx, queue_rx): (
-                            Sender<(u16, Option<u128>, Option<Vec<u8>>)>,
-                            Receiver<(u16, Option<u128>, Option<Vec<u8>>)>,
-                        ) = mpsc::channel();
-                        let (queue_working_tx, queue_working_rx): (Sender<bool>, Receiver<bool>) =
-                            mpsc::channel();
-                        // Counters of every child, read by this loop (no messages)
-                        let stats = stats_slots(inconfig.children, inconfig.clients.len());
-                        let Links {
-                            answers: queues_channels,
-                            stops: keepworkings,
-                            children: children_channels,
-                        } = links(inconfig.children);
+                        // Stop order: set by this loop, read by every child after each package
+                        let stop = Arc::new(AtomicBool::new(false));
+
+                        // Ordering: children put timestamped packages in one buffer and one
+                        // sender delivers them from it, so the target order is strict (M3-k)
+                        let ordered: Option<Arc<OrderBuffer>> = ordering_regex
+                            .as_ref()
+                            .map(|_| Arc::new(OrderBuffer::new()));
+                        let hold = Duration::from_secs(inconfig.ordering_buffer_time.unwrap_or(0));
+
+                        // Counters of every child, and of the sender after them (no messages)
+                        let stats = stats_slots(
+                            inconfig.children + ordered.is_some() as u16,
+                            inconfig.clients.len(),
+                        );
+
+                        // The sender: its own target connections and filters, its stats slot
+                        let sender_handle = ordered.as_ref().map(|buffer| {
+                            let buffer = buffer.clone();
+                            let sender_config = inconfig.clone();
+                            let fr = filters.clone();
+                            let sender_stats = stats.clone();
+                            let id = inconfig.children;
+                            thread::spawn(move || {
+                                sender(id, &buffer, hold, sender_config, fr, sender_stats)
+                            })
+                        });
 
                         // Prepare list of handles
                         let mut handles: Vec<thread::JoinHandle<_>> = Vec::new();
-                        let queue_len = Arc::new(AtomicUsize::new(0));
 
-                        // Spawn a queue manage
-                        let queue_config = inconfig.clone();
-                        let queue_len_w = queue_len.clone();
-                        let queue_handler = thread::spawn(move || {
-                            queuer(
-                                is_ordering_regex,
-                                queue_config.clone(),
-                                queue_working_rx,
-                                queue_rx,
-                                queues_channels,
-                                queue_len_w,
-                            )
-                        });
-
-                        // Spawn a number of threads and collect their join handles; each child
-                        // gets the ends paired with its id by links()
-                        for (id, qrx, rx) in children_channels {
+                        // Spawn a number of threads and collect their join handles
+                        for id in 0..inconfig.children {
                             // Clone config and execute thread
                             let child_stats = stats.clone();
-                            let qtx = queue_tx.clone();
+                            let child_stop = stop.clone();
+                            let child_ordered = ordered.clone();
                             let child_config = inconfig.clone();
                             // Each child owns its compiled filters (one regex cache per thread)
                             let fr = filters.clone();
@@ -591,9 +585,8 @@ fn main() {
                                     or,
                                     inconfig.ordering_limit,
                                     child_stats,
-                                    rx,
-                                    qtx,
-                                    &qrx,
+                                    child_stop,
+                                    child_ordered,
                                     child_config,
                                     fr,
                                 );
@@ -642,15 +635,15 @@ fn main() {
 
                                 // Check if we can keep working
                                 if keepworking {
-                                    // Check if queuer has finished
-                                    if queue_handler.is_finished() {
+                                    // Check if the sender has finished
+                                    if sender_handle.as_ref().is_some_and(|h| h.is_finished()) {
                                         // Some child already died, show message and leave
                                         print_debug!(
                                             PROGRAM_NAME,
                                             stdout(),
                                             COLOR_YELLOW,
                                             0,
-                                            "Queuer is closed abruptly, closing everything!"
+                                            "The ordered sender closed abruptly, closing everything!"
                                         );
                                         break;
                                     }
@@ -697,7 +690,7 @@ fn main() {
                                                 COLOR_GREEN,
                                                 COLOR_NOHEAD_NOTAIL,
                                                 "Queue: {} regs",
-                                                queue_len.load(Ordering::Relaxed)
+                                                ordered.as_ref().map_or(0, |b| b.len())
                                             );
                                             print_debug!(
                                                 PROGRAM_NAME,
@@ -820,16 +813,8 @@ fn main() {
                             }
                         }
 
-                        // Tell queuer to serve all data that is left
-                        queue_working_tx.send(true).unwrap();
-
-                        // Try to tell all children to finish their job
-                        for keep in keepworkings {
-                            match keep.send(false) {
-                                Ok(_) => (),
-                                Err(_) => (),
-                            }
-                        }
+                        // Tell all children to finish their job
+                        stop.store(true, Ordering::Relaxed);
 
                         // Wait for children to close
                         print_debug!(PROGRAM_NAME, stdout(), COLOR_CYAN, 0, "Closing...");
@@ -873,9 +858,12 @@ fn main() {
                             }
                         }
 
-                        // Tell the Queue to close
-                        queue_working_tx.send(false).unwrap();
-                        queue_handler.join().unwrap();
+                        // Every child has left, so nothing more enters the ordering buffer:
+                        // the sender flushes it in ts order and ends
+                        if let (Some(buffer), Some(handle)) = (&ordered, sender_handle) {
+                            buffer.finish();
+                            handle.join().unwrap();
+                        }
 
                         print_debug!(PROGRAM_NAME, stdout(), COLOR_GREEN, 0, "Program finished!");
                     }
@@ -1274,141 +1262,223 @@ fn empty_as_tilde(value: &mut String, raw: &Option<String>) {
     }
 }
 
-/// Manage ordered packages in a centralized way
-fn queuer(
-    is_ordering_regex: bool,
+/// A package held for ordering: released in `ts` order, equal `ts` in arrival order
+struct Held {
+    ts: u128,
+    seq: u64,         // arrival order
+    arrival: Instant, // released once it has waited the buffer time
+    data: Vec<u8>,
+}
+
+impl PartialEq for Held {
+    fn eq(&self, other: &Self) -> bool {
+        (self.ts, self.seq) == (other.ts, other.seq)
+    }
+}
+
+impl Eq for Held {}
+
+impl PartialOrd for Held {
+    fn partial_cmp(&self, other: &Self) -> Option<cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Held {
+    fn cmp(&self, other: &Self) -> cmp::Ordering {
+        (self.ts, self.seq).cmp(&(other.ts, other.seq))
+    }
+}
+
+/// What the ordering buffer holds, behind its lock
+#[derive(Default)]
+struct OrderState {
+    heap: BinaryHeap<Reverse<Held>>,
+    seq: u64,
+    finish: bool, // no more packages will come: release everything
+}
+
+/// The ordering buffer: every child puts timestamped packages in it, one sender takes them
+/// out in order. The lock is held only to push or pop, never across I/O.
+struct OrderBuffer {
+    state: Mutex<OrderState>,
+    wake: Condvar,
+}
+
+impl OrderBuffer {
+    fn new() -> OrderBuffer {
+        OrderBuffer {
+            state: Mutex::new(OrderState::default()),
+            wake: Condvar::new(),
+        }
+    }
+
+    /// Hold a package. The sender is woken only when the buffer was empty: otherwise it
+    /// already waits for a head that arrived earlier, so this package cannot be due sooner.
+    fn push(&self, ts: u128, data: Vec<u8>, arrival: Instant) {
+        let mut st = self.state.lock().unwrap();
+        let was_empty = st.heap.is_empty();
+        let seq = st.seq;
+        st.seq += 1;
+        st.heap.push(Reverse(Held {
+            ts,
+            seq,
+            arrival,
+            data,
+        }));
+        drop(st);
+        if was_empty {
+            self.wake.notify_one();
+        }
+    }
+
+    /// Packages held now (statistics line)
+    fn len(&self) -> usize {
+        self.state.lock().unwrap().heap.len()
+    }
+
+    /// No child will push again: the sender releases everything left, in order, and ends
+    fn finish(&self) {
+        self.state.lock().unwrap().finish = true;
+        self.wake.notify_all();
+    }
+}
+
+/// Packages due at `now`, in order: the head goes once it has waited `hold` since it
+/// arrived, then the next head is looked at (a recent package with a lower `ts` holds back
+/// the ones behind it, as in 1.0.8). After finish() everything goes.
+fn release(st: &mut OrderState, now: Instant, hold: Duration) -> Vec<Vec<u8>> {
+    let mut out = Vec::new();
+    while let Some(Reverse(head)) = st.heap.peek() {
+        if st.finish || head.arrival + hold <= now {
+            out.push(st.heap.pop().unwrap().0.data);
+        } else {
+            break;
+        }
+    }
+    out
+}
+
+/// When the head will be due, if anything is held
+fn next_release(st: &OrderState, hold: Duration) -> Option<Instant> {
+    st.heap.peek().map(|Reverse(head)| head.arrival + hold)
+}
+
+/// The sender's loop: wait for due packages and hand each batch to `deliver` in order;
+/// end once finish() was called and the buffer is empty. No periodic wake-up: it sleeps
+/// until the head is due or a push into an empty buffer wakes it.
+fn send_ordered(buffer: &OrderBuffer, hold: Duration, mut deliver: impl FnMut(Vec<Vec<u8>>)) {
+    let mut st = buffer.state.lock().unwrap();
+    loop {
+        let batch = release(&mut st, Instant::now(), hold);
+        if !batch.is_empty() {
+            // Deliver without the lock, so children keep pushing meanwhile
+            drop(st);
+            deliver(batch);
+            st = buffer.state.lock().unwrap();
+            continue;
+        }
+        if st.finish {
+            return;
+        }
+        st = match next_release(&st, hold) {
+            Some(due) => {
+                let wait = due.saturating_duration_since(Instant::now());
+                buffer.wake.wait_timeout(st, wait).unwrap().0
+            }
+            None => buffer.wake.wait(st).unwrap(),
+        };
+    }
+}
+
+/// The sender thread: delivers the ordering buffer through its own target connections
+fn sender(
+    id: u16,
+    buffer: &OrderBuffer,
+    hold: Duration,
     config: Config,
-    keepworking_rx: Receiver<bool>,
-    children_rx: Receiver<(u16, Option<u128>, Option<Vec<u8>>)>,
-    children_tx: Vec<Sender<Vec<Vec<u8>>>>,
-    queue_len: Arc<AtomicUsize>,
+    filters: Filters,
+    stats: Arc<Vec<WorkerStats>>,
 ) {
-    #[cfg(feature = "debug")]
-    print_debug!(PROGRAM_NAME, stdout(), COLOR_BLUE, 0, "Queue: Starts");
-
-    // Prepare main variable
-    let mut keepworking = true;
-    let mut dumpall: bool;
-    if is_ordering_regex {
-        dumpall = false;
-    } else {
-        dumpall = true;
-    }
-
-    // Prepare sorted list
-    let mut ordered_packages: BinaryHeap<Reverse<(u128, (u64, Vec<u8>))>> = BinaryHeap::new();
-
-    // Prepare the retention data
-    while keepworking {
-        // Check if some worker requested data
-        let request = children_rx.recv_timeout(Duration::from_millis(1));
-
-        // Read main's order before answering: main sends it before telling the children to
-        // stop, so a request sent after a child's stop order is always answered with dumpall
-        match keepworking_rx.try_recv() {
-            Ok(true) => {
-                print_debug!(
-                    PROGRAM_NAME,
-                    stdout(),
-                    COLOR_BLUE,
-                    0,
-                    "Queue: Prepared to die"
-                );
-                dumpall = true;
-            }
-            Ok(false) => keepworking = false,
-            Err(_) => (),
-        }
-
-        match request {
-            Ok((id, ts, package)) => {
-                #[cfg(feature = "debug")]
-                print_debug!(
-                    PROGRAM_NAME,
-                    stdout(),
-                    COLOR_BLUE,
-                    0,
-                    "Queue: Got request from {}: {:?}",
-                    id,
-                    package
-                );
-
-                let mut list: Vec<Vec<u8>>;
-                if dumpall {
-                    list = Vec::new();
-                    while let Some(Reverse(package)) = ordered_packages.pop() {
-                        list.push(package.1 .1);
-                    }
-                    if let Some(p) = package {
-                        list.push(p);
-                    }
-                } else {
-                    list = match_ordering(
-                        ts,
-                        config.ordering_buffer_time,
-                        package,
-                        &mut ordered_packages,
+    let mut clients: Option<Vec<RedisLink>> = None;
+    let mut cursor: usize = 0;
+    send_ordered(buffer, hold, |batch| {
+        let (mut outgoing, mut dropped, mut deleted) = (0, 0, 0);
+        // Connect on the first batch, and again after a failure; while the targets cannot
+        // be reached the batch waits, unless the program is stopping
+        while clients.is_none() {
+            match connect_targets(id, &config, &filters) {
+                Ok(c) => clients = Some(c),
+                Err(e) => {
+                    print_debug!(
+                        PROGRAM_NAME,
+                        stderr(),
+                        COLOR_RED,
+                        0,
+                        "Error while connecting to target Redis Server: {}",
+                        e
                     );
+                    if buffer.state.lock().unwrap().finish {
+                        worker_slot(&stats, id).add(0, 0, batch.len() as u64, 0);
+                        return;
+                    }
+                    thread::sleep(Duration::from_millis(1000));
                 }
-
-                #[cfg(feature = "debug")]
-                print_debug!(
-                    PROGRAM_NAME,
-                    stdout(),
-                    COLOR_BLUE,
-                    0,
-                    "Queue: Send answer to {}: {}",
-                    id,
-                    list.len()
-                );
-
-                // Publish the size of the queue for the statistics line (before the answer, so
-                // a child that got its answer sees the size that goes with it)
-                queue_len.store(ordered_packages.len(), Ordering::Relaxed);
-
-                // Answer to the child
-                answer_child(&children_tx, id, list);
-            }
-            Err(RecvTimeoutError::Timeout) => (),
-            Err(RecvTimeoutError::Disconnected) => {
-                // Unreachable while main holds queue_tx; pause so it cannot spin
-                thread::sleep(Duration::from_millis(1));
             }
         }
+        let targets = clients.as_mut().unwrap();
+        let mut failed = false;
+        for package in &batch {
+            failed |= deliver(
+                id,
+                &filters.root,
+                &config,
+                targets,
+                &mut cursor,
+                package,
+                &mut outgoing,
+                &mut dropped,
+                &mut deleted,
+            );
+        }
+        report(
+            worker_slot(&stats, id),
+            targets,
+            0,
+            outgoing,
+            dropped,
+            deleted,
+        );
+        // A target error may mean a broken connection: open new ones for the next batch
+        // (a worker does the same through its idle refresh)
+        if failed {
+            clients = None;
+        }
+    });
+}
+
+/// Open one connection per target, in configuration order, each with its compiled filter
+fn connect_targets(id: u16, config: &Config, filters: &Filters) -> Result<Vec<RedisLink>, String> {
+    let mut clients = Vec::new();
+    for (client, filter) in config.clients.iter().zip(&filters.clients) {
+        let link = redis_connect(
+            id,
+            client.ssl,
+            client.hostname.clone(),
+            client.port,
+            client.password.clone(),
+            true,
+        )?;
+        clients.push(RedisLink {
+            config: client.clone(),
+            link,
+            sleeping_from: 0,
+            packages: 0,
+            lastcheck: 0,
+            filter: filter.clone(),
+        });
     }
-
-    #[cfg(feature = "debug")]
-    print_debug!(PROGRAM_NAME, stdout(), COLOR_BLUE, 0, "Queue: Ends");
-}
-
-/// Channel ends between main, the queuer and the children. The queuer answers child `id` on
-/// `answers[id]` and main stops it on `stops[id]`; `children` yields each child id with the
-/// receiving ends of those same channels, so a child reads only its own answers (M2R-2)
-struct Links {
-    answers: Vec<Sender<Vec<Vec<u8>>>>,
-    stops: Vec<Sender<bool>>,
-    children: Vec<(u16, Receiver<Vec<Vec<u8>>>, Receiver<bool>)>,
-}
-
-fn links(children: u16) -> Links {
-    let mut links = Links {
-        answers: Vec::new(),
-        stops: Vec::new(),
-        children: Vec::new(),
-    };
-    for id in 0..children {
-        let (qtx, qrx) = mpsc::channel();
-        let (tx, rx) = mpsc::channel();
-        links.answers.push(qtx);
-        links.stops.push(tx);
-        links.children.push((id, qrx, rx));
-    }
-    links
-}
-
-/// The queuer's answer to the request of child `id`
-fn answer_child(answers: &[Sender<Vec<Vec<u8>>>], id: u16, list: Vec<Vec<u8>>) {
-    answers[id as usize].send(list).unwrap();
+    Ok(clients)
 }
 
 /// Manage the full process from a child
@@ -1417,9 +1487,8 @@ fn child(
     ordering_regex: Option<Regex>,
     ordering_limit: Option<usize>,
     stats: Arc<Vec<WorkerStats>>,
-    rx: Receiver<bool>,
-    qtx: Sender<(u16, Option<u128>, Option<Vec<u8>>)>,
-    qrx: &Receiver<Vec<Vec<u8>>>,
+    stop: Arc<AtomicBool>,
+    ordered: Option<Arc<OrderBuffer>>,
     config: Config,
     filters: Filters,
 ) {
@@ -1440,27 +1509,8 @@ fn child(
     // Prepare the retention data
     while keepworking {
         // Check if our father wants us to finish
-        match rx.try_recv() {
-            Ok(true) => print_debug!(
-                PROGRAM_NAME,
-                stderr(),
-                COLOR_RED,
-                0,
-                "Error while reading message from Parent, got an unexpected message!"
-            ),
-            Ok(false) => {
-                #[cfg(feature = "debug")]
-                print_debug!(
-                    PROGRAM_NAME,
-                    stdout(),
-                    COLOR_WHITE,
-                    0,
-                    "{}: I was told to close!",
-                    id
-                );
-                request_finish = true;
-            }
-            Err(_) => (),
+        if stop.load(Ordering::Relaxed) {
+            request_finish = true;
         }
 
         // Connect to source
@@ -1478,38 +1528,21 @@ fn child(
                 source = link;
 
                 // Connect to targets
-                let mut clients: Vec<RedisLink> = Vec::new();
-                for (client, filter) in config.clients.iter().zip(&filters.clients) {
-                    match redis_connect(
-                        id,
-                        client.ssl,
-                        client.hostname.clone(),
-                        client.port,
-                        client.password.clone(),
-                        true,
-                    ) {
-                        Ok(link) => clients.push(RedisLink {
-                            config: client.clone(),
-                            link: link,
-                            sleeping_from: 0,
-                            packages: 0,
-                            lastcheck: 0,
-                            filter: filter.clone(),
-                        }),
-                        Err(e) => {
-                            print_debug!(
-                                PROGRAM_NAME,
-                                stderr(),
-                                COLOR_RED,
-                                0,
-                                "Error while connecting to target Redis Server: {}",
-                                e
-                            );
-                            error = true;
-                            break;
-                        }
+                let mut clients = match connect_targets(id, &config, &filters) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        print_debug!(
+                            PROGRAM_NAME,
+                            stderr(),
+                            COLOR_RED,
+                            0,
+                            "Error while connecting to target Redis Server: {}",
+                            e
+                        );
+                        error = true;
+                        Vec::new()
                     }
-                }
+                };
 
                 // No error until here, keep going
                 if !error {
@@ -1547,29 +1580,8 @@ fn child(
                                 blpop_cmd(&config.channel).query(&mut source);
                             match item {
                                 Ok(redis::Value::Nil) => {
-                                    // Nothing came: refresh the targets' limits state, and with
-                                    // ordering ask the queuer for released packages
-                                    let idle = if ordering_regex.is_none() {
-                                        refresh(id, &mut clients, &mut deleted)
-                                    } else {
-                                        process_package(
-                                            id,
-                                            &ordering_regex,
-                                            ordering_limit,
-                                            &qtx,
-                                            &qrx,
-                                            &filters.root,
-                                            &config,
-                                            &mut clients,
-                                            &mut cursor,
-                                            None,
-                                            &mut outgoing,
-                                            &mut dropped,
-                                            &mut deleted,
-                                        )
-                                        .map(|_| ())
-                                    };
-                                    match idle {
+                                    // Nothing came: refresh the targets' limits state
+                                    match refresh(id, &mut clients, &mut deleted) {
                                         Ok(_) => (),
                                         Err(e) => {
                                             error = true;
@@ -1597,48 +1609,43 @@ fn child(
                                     if let Some(redis::Value::BulkString(raw_bdata)) =
                                         data.into_iter().nth(1)
                                     {
-                                        if ordering_regex.is_none() {
-                                            // Without ordering the worker delivers it itself
+                                        // With ordering a timestamped package goes to the
+                                        // buffer (moved, not copied) and the sender delivers it;
+                                        // any other package the worker delivers itself
+                                        let held = match (&ordered, &ordering_regex) {
+                                            (Some(buffer), Some(re)) => {
+                                                match ordering_ts(re, ordering_limit, &raw_bdata) {
+                                                    Ok(ts) => {
+                                                        buffer.push(ts, raw_bdata, Instant::now());
+                                                        None
+                                                    }
+                                                    Err(warning) => {
+                                                        print_debug!(
+                                                            PROGRAM_NAME,
+                                                            stderr(),
+                                                            COLOR_YELLOW,
+                                                            0,
+                                                            "{}",
+                                                            warning
+                                                        );
+                                                        Some(raw_bdata)
+                                                    }
+                                                }
+                                            }
+                                            _ => Some(raw_bdata),
+                                        };
+                                        if let Some(package) = held {
                                             deliver(
                                                 id,
                                                 &filters.root,
                                                 &config,
                                                 &mut clients,
                                                 &mut cursor,
-                                                &raw_bdata,
+                                                &package,
                                                 &mut outgoing,
                                                 &mut dropped,
                                                 &mut deleted,
                                             );
-                                        } else {
-                                            match process_package(
-                                                id,
-                                                &ordering_regex,
-                                                ordering_limit,
-                                                &qtx,
-                                                &qrx,
-                                                &filters.root,
-                                                &config,
-                                                &mut clients,
-                                                &mut cursor,
-                                                Some(raw_bdata),
-                                                &mut outgoing,
-                                                &mut dropped,
-                                                &mut deleted,
-                                            ) {
-                                                Ok(_) => (),
-                                                Err(e) => {
-                                                    print_debug!(
-                                                        PROGRAM_NAME,
-                                                        stderr(),
-                                                        COLOR_RED,
-                                                        0,
-                                                        "{}: Couldn't process package: {}",
-                                                        id,
-                                                        e
-                                                    );
-                                                }
-                                            }
                                         }
                                     }
                                 }
@@ -1665,57 +1672,13 @@ fn child(
                             }
 
                             // Check if our father wants us to finish
-                            match rx.try_recv() {
-                                Ok(true) => print_debug!(PROGRAM_NAME, stderr(), COLOR_RED, 0, "Error while reading message from Parent, got an unexpected message!"),
-                                Ok(false) => {
-
-                                    // We are requested to finish
-                                    #[cfg(feature="debug")]
-                                    print_debug!(PROGRAM_NAME, stdout(), COLOR_WHITE, 0, "{}: I was told to close!", id);
-                                    request_finish = true;
-
-                                },
-                                Err(_) => (),
+                            if stop.load(Ordering::Relaxed) {
+                                request_finish = true;
                             }
-                        } else if ordering_regex.is_none() {
-                            // Nothing is held anywhere without ordering: done
-                            keepworking = false;
                         } else {
-                            // Get data left in the queue
-                            let jobdone;
-                            match process_package(
-                                id,
-                                &ordering_regex,
-                                ordering_limit,
-                                &qtx,
-                                &qrx,
-                                &filters.root,
-                                &config,
-                                &mut clients,
-                                &mut cursor,
-                                None,
-                                &mut outgoing,
-                                &mut dropped,
-                                &mut deleted,
-                            ) {
-                                Ok(v) => jobdone = v,
-                                Err(e) => {
-                                    jobdone = false;
-                                    error = true;
-                                    print_debug!(
-                                        PROGRAM_NAME,
-                                        stderr(),
-                                        COLOR_RED,
-                                        0,
-                                        "{}: process_package() has failed: {}",
-                                        id,
-                                        e
-                                    );
-                                }
-                            }
-
-                            // Decide about keep working (if requested to finish and nothing to do)
-                            keepworking = jobdone && !error;
+                            // A worker holds nothing between packages (the ordering buffer is
+                            // the sender's): done
+                            keepworking = false;
                         }
 
                         // Error found while processing
@@ -1755,28 +1718,8 @@ fn child(
         }
 
         // Check if our father wants us to finish
-        match rx.try_recv() {
-            Ok(true) => print_debug!(
-                PROGRAM_NAME,
-                stderr(),
-                COLOR_RED,
-                0,
-                "Error while reading message from Parent, got an unexpected message!"
-            ),
-            Ok(false) => {
-                // We are requested to finish
-                #[cfg(feature = "debug")]
-                print_debug!(
-                    PROGRAM_NAME,
-                    stdout(),
-                    COLOR_WHITE,
-                    0,
-                    "{}: I was told to close!",
-                    id
-                );
-                keepworking = false;
-            }
-            Err(_) => (),
+        if stop.load(Ordering::Relaxed) {
+            keepworking = false;
         }
     }
 
@@ -2154,51 +2097,6 @@ fn send(
     }
 }
 
-fn match_ordering(
-    ts: Option<u128>,
-    time: Option<u64>,
-    bdata: Option<Vec<u8>>,
-    buffer: &mut BinaryHeap<Reverse<(u128, (u64, Vec<u8>))>>,
-) -> Vec<Vec<u8>> {
-    let mut list: Vec<Vec<u8>> = Vec::new();
-
-    // If we got a package
-    if let Some(data) = bdata {
-        if let Some(v) = ts {
-            buffer.push(Reverse((v, (get_current_time(), data))));
-        } else {
-            // No filter available, just send it
-            list.push(data);
-        }
-    }
-
-    // Attach all packages from the buffer that should be sent already
-    let control;
-    if let Some(timer) = time {
-        control = get_current_time() - timer;
-    } else {
-        // Make sure control is in the future (1s for security + 1s for strict < on comparison)
-        control = get_current_time() + 2;
-    }
-    while let Some(Reverse(package)) = buffer.peek() {
-        if package.1 .0 < control {
-            let Reverse(p) = buffer.pop().unwrap();
-            list.push(p.1 .1);
-        } else {
-            break;
-        }
-    }
-
-    // #[cfg(feature="debug")]
-    // {
-    //     println!("BUFFER: {:?}", buffer);
-    //     println!("LIST:   {:?}", list);
-    // }
-
-    // Return the list back
-    return list;
-}
-
 /// Timestamp of a package for ordering: the named group `ts` of the ordering regex, looked
 /// for in the first `limit` bytes (0 or none: the whole package) and parsed as an integer.
 /// The error is the warning to print; the package is then sent without ordering.
@@ -2221,121 +2119,9 @@ fn ordering_ts(re: &Regex, limit: Option<usize>, data: &[u8]) -> Result<u128, &'
     }
 }
 
-fn process_package(
-    id: u16,
-    ordering_regex: &Option<Regex>,
-    ordering_limit: Option<usize>,
-    qtx: &Sender<(u16, Option<u128>, Option<Vec<u8>>)>,
-    qrx: &Receiver<Vec<Vec<u8>>>,
-    root_filter: &Option<Filter>,
-    config: &Config,
-    clients: &mut Vec<RedisLink>,
-    cursor: &mut usize,
-    package: Option<Vec<u8>>,
-    outgoing: &mut u64,
-    dropped: &mut u64,
-    deleted: &mut u64,
-) -> Result<bool, String> {
-    #[cfg(feature = "debug")]
-    print_debug!(
-        PROGRAM_NAME,
-        stdout(),
-        COLOR_CYAN,
-        0,
-        "{}: Start process_package(): data={:?}",
-        id,
-        package
-    );
-
-    // Check if we got a package
-    if let Some(data) = package {
-        let ts: Option<u128>;
-
-        // Process regex
-        if let Some(re) = ordering_regex {
-            match ordering_ts(re, ordering_limit, &data) {
-                Ok(n) => ts = Some(n),
-                Err(warning) => {
-                    // No TS information, just send it
-                    print_debug!(PROGRAM_NAME, stderr(), COLOR_YELLOW, 0, "{}", warning);
-                    ts = None;
-                }
-            }
-        } else {
-            // No filter available, just send it
-            ts = None;
-        }
-
-        // Send it to queuer (moved, not copied)
-        qtx.send((id, ts, Some(data))).unwrap();
-    } else {
-        // Just say we didn't get anything
-        qtx.send((id, None, None)).unwrap();
-    }
-
-    #[cfg(feature = "debug")]
-    print_debug!(
-        PROGRAM_NAME,
-        stdout(),
-        COLOR_CYAN,
-        0,
-        "{}: Sent request to Queuer process_package()",
-        id
-    );
-
-    // Check if there is some work to be done
-    let list: Vec<Vec<u8>> = qrx.recv().unwrap();
-
-    #[cfg(feature = "debug")]
-    print_debug!(
-        PROGRAM_NAME,
-        stdout(),
-        COLOR_CYAN,
-        0,
-        "{}: Got answer from Queuer process_package(): {}",
-        id,
-        list.len()
-    );
-
-    // Check if we got packages to send
-    let jobdone: bool;
-    if list.len() > 0 {
-        for package in list {
-            deliver(
-                id,
-                root_filter,
-                config,
-                clients,
-                cursor,
-                &package,
-                outgoing,
-                dropped,
-                deleted,
-            );
-        }
-        jobdone = true;
-    } else {
-        refresh(id, clients, deleted)?;
-        jobdone = false;
-    }
-
-    #[cfg(feature = "debug")]
-    print_debug!(
-        PROGRAM_NAME,
-        stdout(),
-        COLOR_CYAN,
-        0,
-        "{}: End process_package() - JOBDONE: {:?}",
-        id,
-        jobdone
-    );
-
-    // Send if we did or didn't do the job
-    return Ok(jobdone);
-}
-
 /// Deliver one package to the targets the mode selects, through the root and client filters
-/// and the limits; counted as outgoing when at least one target took it, else as dropped
+/// and the limits; counted as outgoing when at least one target took it, else as dropped.
+/// True when a target answered with an error (its connection may be broken).
 fn deliver(
     id: u16,
     root_filter: &Option<Filter>,
@@ -2346,7 +2132,8 @@ fn deliver(
     outgoing: &mut u64,
     dropped: &mut u64,
     deleted: &mut u64,
-) {
+) -> bool {
+    let mut failed = false;
     let bdata = match root_filter {
         Some(f) => f.apply(package),
         None => Some(Cow::Borrowed(package)),
@@ -2366,6 +2153,7 @@ fn deliver(
                 config.channel,
                 e
             );
+            failed = true;
             false
         }
     };
@@ -2389,6 +2177,7 @@ fn deliver(
     } else {
         *dropped += 1;
     }
+    failed
 }
 
 /// Spreader target selection: try the targets in turn from `cursor`, at most one full turn;

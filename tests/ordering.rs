@@ -78,3 +78,74 @@ fn ordering_stop_under_load_loses_nothing() {
     // M2R-7: the source is fed while the program runs, so no build drains it first.
     stop_under_load("ordering_stop_load", 1, true, Duration::from_millis(300));
 }
+
+/// Packages with increasing ts, pushed in that order while the program runs, must reach
+/// both targets in exactly that order with any number of children (M3-k = ka, M3F-6).
+/// 1.0.8 released each second's packages to whichever child asked next and the children
+/// delivered those batches at the same time. The source is fed at 12000 packages per
+/// second for 3 s, so there are several batches, and three targets make each batch slower
+/// to deliver than to pop, so 1.0.8's deliveries overlap and the order breaks.
+fn strict_order(test: &str, children: u16) {
+    let mut ctx = Ctx::new(test);
+    let src = ctx.key("src");
+    let t0 = ctx.key("t0");
+    let t1 = ctx.key("t1");
+    let t2 = ctx.key("t2");
+    let n: u64 = 36000;
+    let cfg = ctx.config(
+        &src,
+        children,
+        "replicant",
+        ORDERING_1S,
+        &[
+            ctx.client_yaml("t0", &t0, ""),
+            ctx.client_yaml("t1", &t1, ""),
+            ctx.client_yaml("t2", &t2, ""),
+        ],
+    );
+    let mut p = ctx.spawn(&cfg);
+    let producer = {
+        let (url, src) = (ctx.ep.url.clone(), src.clone());
+        thread::spawn(move || {
+            let mut con = redis::Client::open(url.as_str())
+                .unwrap()
+                .get_connection()
+                .unwrap();
+            for start in (0..n).step_by(600) {
+                let batch: Vec<String> = (start..start + 600).map(seq_pkg).collect();
+                let _: usize = redis::Commands::rpush(&mut con, &src, batch).unwrap();
+                thread::sleep(Duration::from_millis(50));
+            }
+        })
+    };
+    producer.join().unwrap();
+    let all = n as usize;
+    ctx.wait_drained(&src, &[(&t0, all), (&t1, all), (&t2, all)]);
+    p.stop(&ctx.pid_file());
+    let want: Vec<String> = (0..n).map(seq_pkg).collect();
+    for t in [&t0, &t1, &t2] {
+        let got = ctx.list(t);
+        assert_eq!(got.len(), want.len());
+        let first = got.iter().zip(&want).position(|(a, b)| a != b);
+        let misplaced = got.iter().zip(&want).filter(|(a, b)| a != b).count();
+        assert!(
+            first.is_none(),
+            "{} children: {} out of order from position {:?}, {} of {} packages misplaced",
+            children,
+            t,
+            first,
+            misplaced,
+            n
+        );
+    }
+}
+
+#[test]
+fn ordering_strict_order_two_children() {
+    strict_order("ordering_strict_2", 2);
+}
+
+#[test]
+fn ordering_strict_order_eight_children() {
+    strict_order("ordering_strict_8", 8);
+}

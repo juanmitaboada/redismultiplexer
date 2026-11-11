@@ -655,53 +655,195 @@ fn build_filters_keeps_client_order() {
     assert!(f.clients[1].as_ref().unwrap().apply(b"b").is_some());
 }
 
-// --- match_ordering ---
+// --- ordering buffer ---
 
-#[test]
-fn ordering_package_without_ts_is_released_at_once() {
-    let mut heap = BinaryHeap::new();
-    let out = match_ordering(None, Some(30), Some("p".into()), &mut heap);
-    assert_eq!(strs(out), vec!["p".to_string()]);
-    assert!(heap.is_empty());
+fn held(entries: &[(u128, &str, Instant)]) -> OrderState {
+    let buffer = OrderBuffer::new();
+    for (ts, data, at) in entries {
+        buffer.push(*ts, data.as_bytes().to_vec(), *at);
+    }
+    buffer.state.into_inner().unwrap()
 }
 
 #[test]
 fn ordering_without_buffer_time_releases_at_once() {
-    let mut heap = BinaryHeap::new();
-    let out = match_ordering(Some(5), None, Some("p".into()), &mut heap);
-    assert_eq!(strs(out), vec!["p".to_string()]);
+    let t0 = Instant::now();
+    let mut st = held(&[(5, "p", t0)]);
+    assert_eq!(strs(release(&mut st, t0, Duration::ZERO)), vec!["p"]);
 }
 
 #[test]
 fn ordering_retains_within_buffer_time() {
-    let mut heap = BinaryHeap::new();
-    let out = match_ordering(Some(5), Some(30), Some("p".into()), &mut heap);
-    assert!(out.is_empty());
-    assert_eq!(heap.len(), 1);
-    let out = match_ordering(None, Some(30), None, &mut heap);
-    assert!(out.is_empty());
+    let t0 = Instant::now();
+    let mut st = held(&[(5, "p", t0)]);
+    assert!(release(
+        &mut st,
+        t0 + Duration::from_secs(29),
+        Duration::from_secs(30)
+    )
+    .is_empty());
+    assert_eq!(st.heap.len(), 1);
+    assert_eq!(
+        next_release(&st, Duration::from_secs(30)),
+        Some(t0 + Duration::from_secs(30))
+    );
+}
+
+#[test]
+fn ordering_release_boundary_is_in_milliseconds() {
+    // M3-c = ca: released when it has waited the buffer time on a monotonic clock in
+    // milliseconds. 1.0.8 compared wall-clock seconds, so a package waited between T and
+    // T + 1 s (declared difference).
+    let t0 = Instant::now();
+    let hold = Duration::from_secs(1);
+    let mut st = held(&[(5, "p", t0)]);
+    assert!(release(&mut st, t0 + Duration::from_millis(999), hold).is_empty());
+    assert_eq!(
+        strs(release(&mut st, t0 + Duration::from_millis(1000), hold)),
+        vec!["p"]
+    );
 }
 
 #[test]
 fn ordering_releases_old_entries_in_ts_order() {
-    let mut heap = BinaryHeap::new();
-    for (ts, data) in [(5u128, "five"), (3, "three"), (9, "nine")] {
-        heap.push(Reverse((ts, (0u64, data.as_bytes().to_vec()))));
-    }
-    let out = match_ordering(None, Some(30), None, &mut heap);
+    let t0 = Instant::now();
+    let mut st = held(&[(5, "five", t0), (3, "three", t0), (9, "nine", t0)]);
+    let out = release(
+        &mut st,
+        t0 + Duration::from_secs(30),
+        Duration::from_secs(30),
+    );
     assert_eq!(strs(out), vec!["three", "five", "nine"]);
-    assert!(heap.is_empty());
+    assert!(st.heap.is_empty());
 }
 
 #[test]
 fn ordering_recent_entry_with_lower_ts_blocks_the_rest() {
-    let mut heap = BinaryHeap::new();
-    for (ts, data) in [(5u128, "five"), (3, "three"), (9, "nine")] {
-        heap.push(Reverse((ts, (0u64, data.as_bytes().to_vec()))));
-    }
-    let out = match_ordering(Some(7), Some(30), Some("seven".into()), &mut heap);
+    let t0 = Instant::now();
+    let later = t0 + Duration::from_secs(20);
+    let mut st = held(&[
+        (5, "five", t0),
+        (3, "three", t0),
+        (9, "nine", t0),
+        (7, "seven", later),
+    ]);
+    let out = release(
+        &mut st,
+        t0 + Duration::from_secs(30),
+        Duration::from_secs(30),
+    );
     assert_eq!(strs(out), vec!["three", "five"]);
-    assert_eq!(heap.len(), 2);
+    assert_eq!(st.heap.len(), 2);
+}
+
+#[test]
+fn ordering_equal_ts_keeps_arrival_order() {
+    // M3-c = ca, M3F-9: equal `ts` leave in arrival order. 1.0.8 sorted them by arrival
+    // second and then by payload bytes, so "b" then "a" in the same second left as "a",
+    // "b" (declared difference).
+    let t0 = Instant::now();
+    let mut st = held(&[(5, "b", t0), (5, "a", t0), (5, "c", t0), (4, "z", t0)]);
+    let out = release(&mut st, t0, Duration::ZERO);
+    assert_eq!(strs(out), vec!["z", "b", "a", "c"]);
+}
+
+#[test]
+fn ordering_finish_releases_everything_in_ts_order() {
+    let t0 = Instant::now();
+    let mut st = held(&[(5, "five", t0), (3, "three", t0), (9, "nine", t0)]);
+    st.finish = true;
+    assert_eq!(
+        strs(release(&mut st, t0, Duration::from_secs(30))),
+        vec!["three", "five", "nine"]
+    );
+}
+
+#[test]
+fn ordered_sender_delivers_every_worker_package_once_in_ts_order() {
+    // S3-1 b: packages pushed by several workers at once all come out through the sender,
+    // each once; with a buffer longer than the run they come out in ts order on finish.
+    for (workers, hold) in [
+        (2u64, Duration::from_secs(60)),
+        (8, Duration::from_secs(60)),
+        (8, Duration::ZERO),
+    ] {
+        let buffer = Arc::new(OrderBuffer::new());
+        let per = 2000u64;
+        let out = Arc::new(Mutex::new(Vec::new()));
+        let sink = out.clone();
+        let b = buffer.clone();
+        let sender = thread::spawn(move || {
+            send_ordered(&b, hold, |batch| sink.lock().unwrap().extend(batch));
+        });
+        let pushers: Vec<_> = (0..workers)
+            .map(|w| {
+                let b = buffer.clone();
+                thread::spawn(move || {
+                    for k in 0..per {
+                        // Worker w holds ts w, w + workers, ...: every ts once overall
+                        let ts = k * workers + w;
+                        b.push(
+                            ts as u128,
+                            format!("{}:{}", w, ts).into_bytes(),
+                            Instant::now(),
+                        );
+                    }
+                })
+            })
+            .collect();
+        for p in pushers {
+            p.join().unwrap();
+        }
+        buffer.finish();
+        sender.join().unwrap();
+        let got = strs(Arc::try_unwrap(out).unwrap().into_inner().unwrap());
+        assert_eq!(
+            got.len() as u64,
+            workers * per,
+            "workers={} hold={:?}",
+            workers,
+            hold
+        );
+        let mut seen: Vec<u64> = got
+            .iter()
+            .map(|p| p.split(':').nth(1).unwrap().parse().unwrap())
+            .collect();
+        if hold > Duration::ZERO {
+            let want: Vec<u64> = (0..workers * per).collect();
+            assert_eq!(seen, want, "ts order");
+        }
+        seen.sort();
+        seen.dedup();
+        assert_eq!(seen.len() as u64, workers * per, "each package once");
+    }
+}
+
+#[test]
+fn ordered_sender_waits_without_spinning_and_wakes_on_push() {
+    // Nothing held: the sender waits on the condition variable (no periodic wake-up) and a
+    // push into the empty buffer wakes it.
+    let buffer = Arc::new(OrderBuffer::new());
+    let out = Arc::new(Mutex::new(Vec::new()));
+    let (b, sink) = (buffer.clone(), out.clone());
+    let sender = thread::spawn(move || {
+        send_ordered(&b, Duration::ZERO, |batch| {
+            sink.lock().unwrap().extend(batch)
+        })
+    });
+    thread::sleep(Duration::from_millis(50));
+    assert!(out.lock().unwrap().is_empty());
+    buffer.push(1, b"one".to_vec(), Instant::now());
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while out.lock().unwrap().is_empty() {
+        assert!(
+            Instant::now() < deadline,
+            "the push did not wake the sender"
+        );
+        thread::sleep(Duration::from_millis(1));
+    }
+    buffer.finish();
+    sender.join().unwrap();
+    assert_eq!(strs(out.lock().unwrap().clone()), vec!["one"]);
 }
 
 // --- ordering_ts ---
@@ -895,88 +1037,11 @@ fn verify_rejects_empty_client_channel() {
 }
 
 #[test]
-fn queuer_flushes_the_ordering_buffer_for_a_request_after_the_stop_order() {
-    // M2R-1: main sends `true` to the queuer before telling the children to stop, so a
-    // child's first request after its stop order must get the whole ordering buffer.
-    // The buggy queuer answers it from match_ordering when parked in its wait, so a few
-    // rounds make the failure certain; on fixed code every round is deterministic.
-    for round in 0..50 {
-        let mut c = config();
-        c.ordering_buffer_time = Some(30);
-        let (keep_tx, keep_rx) = mpsc::channel();
-        let (req_tx, req_rx) = mpsc::channel();
-        let (ans_tx, ans_rx) = mpsc::channel();
-        let queue_len = Arc::new(AtomicUsize::new(0));
-        let len = queue_len.clone();
-        let handle = thread::spawn(move || queuer(true, c, keep_rx, req_rx, vec![ans_tx], len));
-
-        req_tx.send((0, Some(1), Some(b"p1".to_vec()))).unwrap();
-        assert!(
-            ans_rx.recv().unwrap().is_empty(),
-            "round {round}: held for 30 s"
-        );
-        assert_eq!(queue_len.load(Ordering::Relaxed), 1, "round {round}");
-        // Let the queuer park in its wait, where M2R-1 happens
-        thread::sleep(Duration::from_millis(5));
-        keep_tx.send(true).unwrap();
-        req_tx.send((0, None, None)).unwrap();
-        assert_eq!(
-            ans_rx.recv().unwrap(),
-            vec![b"p1".to_vec()],
-            "round {round}"
-        );
-
-        assert_eq!(queue_len.load(Ordering::Relaxed), 0, "round {round}");
-
-        keep_tx.send(false).unwrap();
-        handle.join().unwrap();
-    }
-}
-
-#[test]
 fn verify_accepts_empty_client_name_current_behaviour() {
     // M1F-6: the client hostname is checked twice and the name never.
     let mut c = config();
     c.clients[0].name = String::new();
     assert!(verify_config(c).is_ok());
-}
-
-#[test]
-fn each_child_reads_only_its_own_queuer_answers_and_stop_order() {
-    // M2R-2, M3R-9: a child that reads another child's answers works until the stop, then
-    // hangs or loses its last packages. Deterministic: fails on every run if the pairing
-    // between links() and answer_child() is wrong.
-    for n in [1u16, 2, 3, 8] {
-        let l = links(n);
-        assert_eq!(
-            (l.answers.len(), l.stops.len(), l.children.len()),
-            (n as usize, n as usize, n as usize)
-        );
-        for id in 0..n {
-            answer_child(&l.answers, id, vec![id.to_be_bytes().to_vec()]);
-            l.stops[id as usize].send(id % 2 == 0).unwrap();
-        }
-        for (k, (id, answers, stop)) in l.children.iter().enumerate() {
-            assert_eq!(*id as usize, k, "children are listed in id order");
-            assert_eq!(
-                answers.try_recv().unwrap(),
-                vec![id.to_be_bytes().to_vec()],
-                "answers of child {}",
-                id
-            );
-            assert!(
-                answers.try_recv().is_err(),
-                "child {} got another child's answer",
-                id
-            );
-            assert_eq!(
-                stop.try_recv().unwrap(),
-                id % 2 == 0,
-                "stop order of child {}",
-                id
-            );
-        }
-    }
 }
 
 // --- worker statistics ---
