@@ -625,6 +625,7 @@ dependencies = [
  "chrono",
  "ctrlc",
  "dict",
+ "memchr",
  "redis",
  "regex",
  "serde",

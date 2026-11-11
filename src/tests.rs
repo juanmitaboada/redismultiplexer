@@ -45,6 +45,27 @@ fn config() -> Config {
     }
 }
 
+fn filter_bytes(
+    re: Option<&str>,
+    until: Option<&str>,
+    limit: Option<usize>,
+    replace: Option<&str>,
+    data: &[u8],
+) -> Option<Vec<u8>> {
+    match match_filter(
+        re.map(|r| Regex::new(r).unwrap()),
+        until.map(str::to_string),
+        limit,
+        replace.map(str::to_string),
+        data.to_vec(),
+    ) {
+        MatchAnswer::Box(s) => Some(s),
+        MatchAnswer::Ok(false) => None,
+        MatchAnswer::Ok(true) => panic!("match_filter returned Ok(true)"),
+        MatchAnswer::Err(e) => panic!("match_filter returned Err({})", e),
+    }
+}
+
 fn filter(
     re: Option<&str>,
     until: Option<&str>,
@@ -52,18 +73,13 @@ fn filter(
     replace: Option<&str>,
     data: &str,
 ) -> Option<String> {
-    match match_filter(
-        re.map(|r| Regex::new(r).unwrap()),
-        until.map(str::to_string),
-        limit,
-        replace.map(str::to_string),
-        data.to_string(),
-    ) {
-        MatchAnswer::Box(s) => Some(s),
-        MatchAnswer::Ok(false) => None,
-        MatchAnswer::Ok(true) => panic!("match_filter returned Ok(true)"),
-        MatchAnswer::Err(e) => panic!("match_filter returned Err({})", e),
-    }
+    filter_bytes(re, until, limit, replace, data.as_bytes()).map(|v| String::from_utf8(v).unwrap())
+}
+
+fn strs(list: Vec<Vec<u8>>) -> Vec<String> {
+    list.into_iter()
+        .map(|v| String::from_utf8(v).unwrap())
+        .collect()
 }
 
 // --- YAML parsing (pins what configuration files of earlier versions parse to) ---
@@ -386,10 +402,44 @@ fn filter_replace_with_groups() {
 }
 
 #[test]
-#[should_panic]
-fn filter_limit_inside_multibyte_char_panics_until_m3() {
-    // A-C2: slicing a &str inside a multibyte character panics. M3 moves to bytes.
-    filter(Some("x"), None, Some(1), None, "\u{e9}x");
+fn filter_limit_inside_multibyte_char_cuts_bytes() {
+    // A-C2 fixed: the limit counts bytes and may cut a multibyte character without panicking.
+    // "\u{e9}" is two bytes, so a limit of 1 leaves half of it and "x" out of the haystack.
+    assert_eq!(filter(Some("x"), None, Some(1), None, "\u{e9}x"), None);
+    assert_eq!(filter(Some("\u{e9}"), None, Some(1), None, "\u{e9}x"), None);
+    assert_eq!(
+        filter(Some("\u{e9}"), None, Some(2), None, "\u{e9}x"),
+        Some("\u{e9}x".into())
+    );
+}
+
+#[test]
+fn filter_passes_non_utf8_payloads() {
+    // A-C1 fixed: only the header has to match; the payload is carried as bytes.
+    let data = b"k#\xff\xfe\x00tail";
+    assert_eq!(
+        filter_bytes(Some("^k$"), Some("#"), None, None, data),
+        Some(data.to_vec())
+    );
+    assert_eq!(
+        filter_bytes(Some("^k"), None, None, Some("K"), data),
+        Some(b"K#\xff\xfe\x00tail".to_vec())
+    );
+    assert_eq!(filter_bytes(Some("^z"), None, None, None, data), None);
+}
+
+#[test]
+fn filter_unicode_classes_do_not_match_invalid_utf8() {
+    // regex::bytes in Unicode mode: `.` never matches an invalid byte; `(?-u)` opts out
+    assert_eq!(filter_bytes(Some("^.$"), None, None, None, b"\xff"), None);
+    assert_eq!(
+        filter_bytes(Some("(?-u)^\\xff"), None, None, None, b"\xff\x01"),
+        Some(b"\xff\x01".to_vec())
+    );
+    assert_eq!(
+        filter_bytes(Some("^.$"), None, None, None, "\u{e9}".as_bytes()),
+        Some("\u{e9}".as_bytes().to_vec())
+    );
 }
 
 // --- match_ordering ---
@@ -398,7 +448,7 @@ fn filter_limit_inside_multibyte_char_panics_until_m3() {
 fn ordering_package_without_ts_is_released_at_once() {
     let mut heap = BinaryHeap::new();
     let out = match_ordering(None, Some(30), Some("p".into()), &mut heap);
-    assert_eq!(out, vec!["p".to_string()]);
+    assert_eq!(strs(out), vec!["p".to_string()]);
     assert!(heap.is_empty());
 }
 
@@ -406,7 +456,7 @@ fn ordering_package_without_ts_is_released_at_once() {
 fn ordering_without_buffer_time_releases_at_once() {
     let mut heap = BinaryHeap::new();
     let out = match_ordering(Some(5), None, Some("p".into()), &mut heap);
-    assert_eq!(out, vec!["p".to_string()]);
+    assert_eq!(strs(out), vec!["p".to_string()]);
 }
 
 #[test]
@@ -423,10 +473,10 @@ fn ordering_retains_within_buffer_time() {
 fn ordering_releases_old_entries_in_ts_order() {
     let mut heap = BinaryHeap::new();
     for (ts, data) in [(5u128, "five"), (3, "three"), (9, "nine")] {
-        heap.push(Reverse((ts, (0u64, data.to_string()))));
+        heap.push(Reverse((ts, (0u64, data.as_bytes().to_vec()))));
     }
     let out = match_ordering(None, Some(30), None, &mut heap);
-    assert_eq!(out, vec!["three", "five", "nine"]);
+    assert_eq!(strs(out), vec!["three", "five", "nine"]);
     assert!(heap.is_empty());
 }
 
@@ -434,11 +484,57 @@ fn ordering_releases_old_entries_in_ts_order() {
 fn ordering_recent_entry_with_lower_ts_blocks_the_rest() {
     let mut heap = BinaryHeap::new();
     for (ts, data) in [(5u128, "five"), (3, "three"), (9, "nine")] {
-        heap.push(Reverse((ts, (0u64, data.to_string()))));
+        heap.push(Reverse((ts, (0u64, data.as_bytes().to_vec()))));
     }
     let out = match_ordering(Some(7), Some(30), Some("seven".into()), &mut heap);
-    assert_eq!(out, vec!["three", "five"]);
+    assert_eq!(strs(out), vec!["three", "five"]);
     assert_eq!(heap.len(), 2);
+}
+
+// --- ordering_ts ---
+
+fn ts_of(limit: Option<usize>, data: &[u8]) -> Result<u128, &'static str> {
+    ordering_ts(&Regex::new(r#""ts": *(?P<ts>\d+),"#).unwrap(), limit, data)
+}
+
+#[test]
+fn ordering_ts_found() {
+    assert_eq!(ts_of(None, br#"{"ts": 42, "x": 1}"#), Ok(42));
+    assert_eq!(ts_of(Some(0), br#"{"ts": 42, "x": 1}"#), Ok(42));
+}
+
+#[test]
+fn ordering_ts_in_a_non_utf8_package() {
+    assert_eq!(ts_of(Some(64), b"{\"ts\": 7,\xff\xfe}"), Ok(7));
+}
+
+#[test]
+fn ordering_ts_limit_inside_multibyte_char_does_not_panic() {
+    // A-C2 for ordering_limit: the cut falls inside "\u{e9}" (two bytes)
+    let data = "\u{e9}{\"ts\": 7,}".as_bytes();
+    assert_eq!(
+        ts_of(Some(1), data),
+        Err("Found a package without ordering information")
+    );
+    assert_eq!(ts_of(Some(64), data), Ok(7));
+}
+
+#[test]
+fn ordering_ts_missing_or_unparsable() {
+    assert_eq!(
+        ts_of(None, b"no timestamp here"),
+        Err("Found a package without ordering information")
+    );
+    // \d in Unicode mode matches other scripts' digits, which do not parse as u128
+    assert_eq!(
+        ts_of(None, "{\"ts\": \u{663},}".as_bytes()),
+        Err("Found a package with ordering information but 'ts' couldn't be parsed to u128")
+    );
+    // Past u128::MAX
+    assert_eq!(
+        ts_of(None, format!("{{\"ts\": {}0,}}", u128::MAX).as_bytes()),
+        Err("Found a package with ordering information but 'ts' couldn't be parsed to u128")
+    );
 }
 
 // --- can_check_queue ---
@@ -600,7 +696,7 @@ fn queuer_flushes_the_ordering_buffer_for_a_request_after_the_stop_order() {
         let (stat_tx, stat_rx) = mpsc::channel();
         let handle = thread::spawn(move || queuer(true, c, keep_rx, req_rx, vec![ans_tx], stat_tx));
 
-        req_tx.send((0, Some(1), Some("p1".to_string()))).unwrap();
+        req_tx.send((0, Some(1), Some(b"p1".to_vec()))).unwrap();
         assert!(
             ans_rx.recv().unwrap().is_empty(),
             "round {round}: held for 30 s"
@@ -611,7 +707,7 @@ fn queuer_flushes_the_ordering_buffer_for_a_request_after_the_stop_order() {
         req_tx.send((0, None, None)).unwrap();
         assert_eq!(
             ans_rx.recv().unwrap(),
-            vec!["p1".to_string()],
+            vec![b"p1".to_vec()],
             "round {round}"
         );
 

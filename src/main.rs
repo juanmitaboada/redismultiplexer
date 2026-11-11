@@ -35,13 +35,12 @@
 )]
 
 // use std::mem;
-use regex::Regex;
+use regex::bytes::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::cmp;
 use std::io::{stderr, stdout, Write};
 use std::process;
-use std::str::from_utf8;
 use std::sync::mpsc;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::thread;
@@ -165,7 +164,7 @@ struct RedisLink {
 #[allow(dead_code)]
 enum MatchAnswer {
     Ok(bool),
-    Box(String),
+    Box(Vec<u8>),
     Err(String),
 }
 
@@ -388,20 +387,20 @@ fn main() {
 
                         // Let communicate with children to end
                         let (queue_tx, queue_rx): (
-                            Sender<(u16, Option<u128>, Option<String>)>,
-                            Receiver<(u16, Option<u128>, Option<String>)>,
+                            Sender<(u16, Option<u128>, Option<Vec<u8>>)>,
+                            Receiver<(u16, Option<u128>, Option<Vec<u8>>)>,
                         ) = mpsc::channel();
                         let (queue_working_tx, queue_working_rx): (Sender<bool>, Receiver<bool>) =
                             mpsc::channel();
                         let (children_tx, children_rx): (Sender<Statistics>, Receiver<Statistics>) =
                             mpsc::channel();
                         let mut keepworkings: Vec<Sender<bool>> = Vec::new();
-                        let mut queues_channels: Vec<Sender<Vec<String>>> = Vec::new();
-                        let mut children_channels: Vec<(Receiver<Vec<String>>, Receiver<bool>)> =
+                        let mut queues_channels: Vec<Sender<Vec<Vec<u8>>>> = Vec::new();
+                        let mut children_channels: Vec<(Receiver<Vec<Vec<u8>>>, Receiver<bool>)> =
                             Vec::new();
                         for _ in 0..inconfig.children {
                             // Create queue channels for every child
-                            let (qtx, qrx): (Sender<Vec<String>>, Receiver<Vec<String>>) =
+                            let (qtx, qrx): (Sender<Vec<Vec<u8>>>, Receiver<Vec<Vec<u8>>>) =
                                 mpsc::channel();
 
                             // Create channels for every child
@@ -1170,8 +1169,8 @@ fn queuer(
     is_ordering_regex: bool,
     config: Config,
     keepworking_rx: Receiver<bool>,
-    children_rx: Receiver<(u16, Option<u128>, Option<String>)>,
-    children_tx: Vec<Sender<Vec<String>>>,
+    children_rx: Receiver<(u16, Option<u128>, Option<Vec<u8>>)>,
+    children_tx: Vec<Sender<Vec<Vec<u8>>>>,
     stat_tx: Sender<Option<usize>>,
 ) {
     #[cfg(feature = "debug")]
@@ -1187,7 +1186,7 @@ fn queuer(
     }
 
     // Prepare sorted list
-    let mut ordered_packages: BinaryHeap<Reverse<(u128, (u64, String))>> = BinaryHeap::new();
+    let mut ordered_packages: BinaryHeap<Reverse<(u128, (u64, Vec<u8>))>> = BinaryHeap::new();
 
     // Prepare the retention data
     while keepworking {
@@ -1224,7 +1223,7 @@ fn queuer(
                     package
                 );
 
-                let mut list: Vec<String>;
+                let mut list: Vec<Vec<u8>>;
                 if dumpall {
                     list = Vec::new();
                     while let Some(Reverse(package)) = ordered_packages.pop() {
@@ -1281,8 +1280,8 @@ fn child(
     ordering_limit: Option<usize>,
     tx: Sender<Statistics>,
     rx: Receiver<bool>,
-    qtx: Sender<(u16, Option<u128>, Option<String>)>,
-    qrx: &Receiver<Vec<String>>,
+    qtx: Sender<(u16, Option<u128>, Option<Vec<u8>>)>,
+    qrx: &Receiver<Vec<Vec<u8>>>,
     config: Config,
     filter_regex: Option<Regex>,
 ) {
@@ -1427,7 +1426,7 @@ fn child(
                             // Get a new package
                             let item: redis::RedisResult<redis::Value> =
                                 blpop_cmd(&config.channel).query(&mut source);
-                            match &item {
+                            match item {
                                 Ok(redis::Value::Nil) => {
                                     // {println!("Nil")},
                                     // Process no data
@@ -1467,49 +1466,36 @@ fn child(
                                     // Send to all clients
                                     incoming += 1;
 
-                                    // Decode package
-                                    if let redis::Value::BulkString(val) = &data[1] {
-                                        match from_utf8(val) {
-                                            Ok(raw_bdata) => {
-                                                // Got data
-                                                match process_package(
-                                                    id,
-                                                    &ordering_regex,
-                                                    ordering_limit,
-                                                    &qtx,
-                                                    &qrx,
-                                                    &filter_regex,
-                                                    &config,
-                                                    &mut clients,
-                                                    Some(raw_bdata),
-                                                    &mut outgoing,
-                                                    &mut dropped,
-                                                    &mut deleted,
-                                                ) {
-                                                    Ok(_) => (),
-                                                    Err(e) => {
-                                                        print_debug!(
-                                                            PROGRAM_NAME,
-                                                            stderr(),
-                                                            COLOR_RED,
-                                                            0,
-                                                            "{}: Couldn't process package: {}",
-                                                            id,
-                                                            e
-                                                        );
-                                                    }
-                                                }
-                                            }
+                                    // The package is the second element (key, value); taken by
+                                    // value, so the payload bytes are moved, not copied
+                                    if let Some(redis::Value::BulkString(raw_bdata)) =
+                                        data.into_iter().nth(1)
+                                    {
+                                        match process_package(
+                                            id,
+                                            &ordering_regex,
+                                            ordering_limit,
+                                            &qtx,
+                                            &qrx,
+                                            &filter_regex,
+                                            &config,
+                                            &mut clients,
+                                            Some(raw_bdata),
+                                            &mut outgoing,
+                                            &mut dropped,
+                                            &mut deleted,
+                                        ) {
+                                            Ok(_) => (),
                                             Err(e) => {
                                                 print_debug!(
                                                     PROGRAM_NAME,
                                                     stderr(),
                                                     COLOR_RED,
                                                     0,
-                                                    "Couldn't decode to UTF8: {}",
+                                                    "{}: Couldn't process package: {}",
+                                                    id,
                                                     e
                                                 );
-                                                error = true;
                                             }
                                         }
                                     }
@@ -1735,7 +1721,7 @@ fn blpop_cmd(channel: &str) -> redis::Cmd {
     cmd
 }
 
-fn send_to_client(client: &mut RedisLink, data: &str) -> Result<bool, String> {
+fn send_to_client(client: &mut RedisLink, data: &[u8]) -> Result<bool, String> {
     // Preparre channels
     let channel = client.config.channel.clone();
 
@@ -1991,7 +1977,7 @@ fn can_send(id: u16, client: &mut RedisLink, deleted: &mut u64) -> Result<bool, 
 fn send(
     id: u16,
     client: &mut RedisLink,
-    dirty_bdata: &str,
+    dirty_bdata: &[u8],
     deleted: &mut u64,
 ) -> Result<bool, String> {
     match match_filter(
@@ -1999,7 +1985,7 @@ fn send(
         client.config.filter_until.clone(),
         client.config.filter_limit,
         client.config.filter_replace.clone(),
-        dirty_bdata.to_string(),
+        dirty_bdata.to_vec(),
     ) {
         MatchAnswer::Ok(true) => {
             return Err(
@@ -2036,11 +2022,11 @@ fn match_filter(
     until: Option<String>,
     limit: Option<usize>,
     replace: Option<String>,
-    bdata: String,
+    bdata: Vec<u8>,
 ) -> MatchAnswer {
     if let Some(re) = regex {
-        // Find by limit
-        let slice: &str;
+        // Find by limit (a byte count: it may cut a multibyte character, which is harmless)
+        let slice: &[u8];
         if let Some(l) = limit {
             if l > 0 {
                 slice = &bdata[..cmp::min(l, bdata.len())];
@@ -2052,10 +2038,10 @@ fn match_filter(
         }
 
         // Find by until
-        let haystack: &str;
+        let haystack: &[u8];
         if let Some(u) = until {
             if u.len() > 0 {
-                if let Some(idx) = slice.find(&u) {
+                if let Some(idx) = memchr::memmem::find(slice, u.as_bytes()) {
                     haystack = &slice[..idx];
                 } else {
                     haystack = &slice;
@@ -2070,9 +2056,9 @@ fn match_filter(
         // Check if they match
         if re.is_match(haystack) {
             if let Some(r) = replace {
-                let replaced = re.replace(haystack, r);
-                let newbdata = format!("{}{}", replaced, &bdata[haystack.len()..]);
-                return MatchAnswer::Box(String::from(newbdata));
+                let replaced = re.replace(haystack, r.as_bytes());
+                let newbdata = [&replaced[..], &bdata[haystack.len()..]].concat();
+                return MatchAnswer::Box(newbdata);
             } else {
                 return MatchAnswer::Box(bdata);
             }
@@ -2089,18 +2075,18 @@ fn match_filter(
 fn match_ordering(
     ts: Option<u128>,
     time: Option<u64>,
-    bdata: Option<String>,
-    buffer: &mut BinaryHeap<Reverse<(u128, (u64, String))>>,
-) -> Vec<String> {
-    let mut list: Vec<String> = Vec::new();
+    bdata: Option<Vec<u8>>,
+    buffer: &mut BinaryHeap<Reverse<(u128, (u64, Vec<u8>))>>,
+) -> Vec<Vec<u8>> {
+    let mut list: Vec<Vec<u8>> = Vec::new();
 
     // If we got a package
     if let Some(data) = bdata {
         if let Some(v) = ts {
-            buffer.push(Reverse((v, (get_current_time(), data.to_string()))));
+            buffer.push(Reverse((v, (get_current_time(), data))));
         } else {
             // No filter available, just send it
-            list.push(data.to_string());
+            list.push(data);
         }
     }
 
@@ -2131,16 +2117,38 @@ fn match_ordering(
     return list;
 }
 
+/// Timestamp of a package for ordering: the named group `ts` of the ordering regex, looked
+/// for in the first `limit` bytes (0 or none: the whole package) and parsed as an integer.
+/// The error is the warning to print; the package is then sent without ordering.
+fn ordering_ts(re: &Regex, limit: Option<usize>, data: &[u8]) -> Result<u128, &'static str> {
+    let haystack = match limit {
+        Some(l) if l > 0 => &data[..cmp::min(l, data.len())],
+        _ => data,
+    };
+    match re.captures(haystack) {
+        Some(x) => {
+            let parsed_ts = x.name("ts").map_or(&b""[..], |m| m.as_bytes());
+            std::str::from_utf8(parsed_ts)
+                .ok()
+                .and_then(|s| s.parse::<u128>().ok())
+                .ok_or(
+                    "Found a package with ordering information but 'ts' couldn't be parsed to u128",
+                )
+        }
+        None => Err("Found a package without ordering information"),
+    }
+}
+
 fn process_package(
     id: u16,
     ordering_regex: &Option<Regex>,
     ordering_limit: Option<usize>,
-    qtx: &Sender<(u16, Option<u128>, Option<String>)>,
-    qrx: &Receiver<Vec<String>>,
+    qtx: &Sender<(u16, Option<u128>, Option<Vec<u8>>)>,
+    qrx: &Receiver<Vec<Vec<u8>>>,
     filter_regex: &Option<Regex>,
     config: &Config,
     clients: &mut Vec<RedisLink>,
-    package: Option<&str>,
+    package: Option<Vec<u8>>,
     outgoing: &mut u64,
     dropped: &mut u64,
     deleted: &mut u64,
@@ -2162,40 +2170,11 @@ fn process_package(
 
         // Process regex
         if let Some(re) = ordering_regex {
-            // Find by limit
-            let haystack: &str;
-            if let Some(l) = ordering_limit {
-                if l > 0 {
-                    haystack = &data[..cmp::min(l, data.len())];
-                } else {
-                    haystack = &data;
-                }
-            } else {
-                haystack = &data;
-            }
-
-            // Check if they match
-            match re.captures(haystack) {
-                Some(x) => {
-                    let parsed_ts = x.name("ts").map_or("", |m| m.as_str());
-                    match parsed_ts.parse::<u128>() {
-                        Ok(n) => ts = Some(n),
-                        Err(_) => {
-                            // No TS information, jut send it
-                            print_debug!(PROGRAM_NAME, stderr(), COLOR_YELLOW, 0, "Found a package with ordering information but 'ts' couldn't be parsed to u128");
-                            ts = None;
-                        }
-                    }
-                }
-                None => {
-                    // No TS information, jut send it
-                    print_debug!(
-                        PROGRAM_NAME,
-                        stderr(),
-                        COLOR_YELLOW,
-                        0,
-                        "Found a package without ordering information"
-                    );
+            match ordering_ts(re, ordering_limit, &data) {
+                Ok(n) => ts = Some(n),
+                Err(warning) => {
+                    // No TS information, just send it
+                    print_debug!(PROGRAM_NAME, stderr(), COLOR_YELLOW, 0, "{}", warning);
                     ts = None;
                 }
             }
@@ -2204,8 +2183,8 @@ fn process_package(
             ts = None;
         }
 
-        // Send it to queuer
-        qtx.send((id, ts, Some(data.to_string()))).unwrap();
+        // Send it to queuer (moved, not copied)
+        qtx.send((id, ts, Some(data))).unwrap();
     } else {
         // Just say we didn't get anything
         qtx.send((id, None, None)).unwrap();
@@ -2222,7 +2201,7 @@ fn process_package(
     );
 
     // Check if there is some work to be done
-    let list: Vec<String> = qrx.recv().unwrap();
+    let list: Vec<Vec<u8>> = qrx.recv().unwrap();
 
     #[cfg(feature = "debug")]
     print_debug!(
@@ -2248,7 +2227,7 @@ fn process_package(
                 config.filter_until.clone(),
                 config.filter_limit,
                 config.filter_replace.clone(),
-                package.to_string(),
+                package,
             ) {
                 MatchAnswer::Ok(true) => {
                     #[cfg(feature = "debug")]

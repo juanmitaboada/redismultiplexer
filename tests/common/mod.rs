@@ -184,6 +184,11 @@ impl Ctx {
             .unwrap_or_else(|e| panic!("{:?} failed: {}", args, e))
     }
 
+    #[allow(dead_code)]
+    pub fn list_bytes(&mut self, key: &str) -> Vec<Vec<u8>> {
+        self.con.lrange(key, 0, -1).unwrap()
+    }
+
     pub fn ltrim(&mut self, key: &str, start: isize, stop: isize) {
         let _: () = self.con.ltrim(key, start, stop).unwrap();
     }
