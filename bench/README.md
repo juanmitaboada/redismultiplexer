@@ -116,7 +116,7 @@ One row per run and repetition (plus an aggregate row for mixed runs).
 |---|---|
 | msg_s | source packages consumed / drain_s (time-boxed: consumed when the box closed) |
 | mib_s | payload bytes delivered / drain_s (time-boxed: delivered when the box closed) |
-| drain_s | from process start to the last change in any watched list (time-boxed: to the end of the box, or earlier if the source ran dry) |
+| drain_s | from process start to the last change in any watched list (time-boxed: to the end of the box) |
 | stop_s | from SIGINT to process exit |
 | wall_s | drain_s + stop_s |
 | expected_total, delivered_total, missing | expected packages in the targets, packages found there after exit, difference |
@@ -125,7 +125,7 @@ One row per run and repetition (plus an aggregate row for mixed runs).
 | cpu_user_s, cpu_sys_s | from `wait4` of the started process (includes children it waited for) |
 | max_rss_kib | peak VmHWM of the started process, sampled every 100 ms from /proc |
 | harness_cpu_s | CPU used by the harness itself while the program was draining |
-| duration_s | time box of the run; empty for drain runs |
+| duration_s | time box of the run; empty for drain runs, and for a time-boxed run whose source ran dry before the box closed: that run is measured as a drain run and its `reason` says `source drained before the time box` |
 
 A run ends when the targets hold the expected count and the source is empty,
 or when the source is empty and nothing has changed for `--settle` seconds

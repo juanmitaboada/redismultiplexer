@@ -269,6 +269,7 @@ class Proc:
     hwm_kib: int = 0
     t_end: float = 0.0  # end of the measured window: last change (drain) or the time box
     win: tuple[int, ...] = ()  # list lengths (source, targets...) at t_end
+    boxed: bool = False  # the time box closed the run (not a drain that came first)
 
 
 def load_source(r: Redis, key: str, count: int, size: int) -> None:
@@ -416,7 +417,7 @@ def run_once(run: Run, rep: int, args: argparse.Namespace, r: Redis, env: dict[s
                 p.last, p.t_change = vals, now
             src_left, delivered = vals[0], sum(vals[1:])
             if duration and now - p.t0 >= duration:
-                p.done, p.t_end, p.win = True, now, vals
+                p.done, p.t_end, p.win, p.boxed = True, now, vals, True
             elif src_left == 0 and delivered >= expected_total(p.inst):
                 p.done = True
             elif src_left == 0 and now - p.t_change >= settle:
@@ -490,10 +491,14 @@ def build_rows(run: Run, rep: int, run_id: str, procs: list[Proc], args: argpars
     out = []
     for p in procs:
         inst = p.inst
-        drain, consumed, delivered_w = _window(p, timed) if p.popen is not None else (0.0, 0, 0)
+        # A source that drained before the box closed is a drain run, not a time-boxed one (MQF-2)
+        boxed = timed and p.boxed
+        if timed and not boxed and p.status == "ok":
+            p.reason = "source drained before the time box"
+        drain, consumed, delivered_w = _window(p, boxed) if p.popen is not None else (0.0, 0, 0)
         delivered = sum(p.counts)
         # A time-boxed run leaves packages in the source: only those taken from it are expected.
-        if timed and p.popen is not None:
+        if boxed and p.popen is not None:
             exp = expected_total(inst, inst["count"] - p.src_left)
         else:
             exp = expected_total(inst)
@@ -520,13 +525,13 @@ def build_rows(run: Run, rep: int, run_id: str, procs: list[Proc], args: argpars
             "max_rss_kib": p.hwm_kib or "",
             "harness_cpu_s": f"{harness_cpu:.3f}" if p.popen is not None else "",
             "redis_version": env["redis_version"], "host_cpus": env["host_cpus"],
-            "duration_s": f"{duration:g}" if timed else "",
+            "duration_s": f"{duration:g}" if boxed else "",
         }
         out.append(row)
     if run.mixed and any(p.popen is not None for p in procs):
         started = [p for p in procs if p.popen is not None]
         span = max(p.t_end for p in started) - min(p.t0 for p in started)
-        windows = [_window(p, timed) for p in started]
+        windows = [_window(p, timed and p.boxed) for p in started]
         consumed = sum(w[1] for w in windows)
         delivered_bytes = sum(w[2] * p.inst["payload"] for w, p in zip(windows, started))
         status = "ok" if all(p.status == "ok" for p in procs) else next(p.status for p in procs if p.status != "ok")
@@ -543,6 +548,7 @@ def build_rows(run: Run, rep: int, run_id: str, procs: list[Proc], args: argpars
             "delivered_total": sum(int(o["delivered_total"] or 0) for o in out),
             "missing": sum(int(o["missing"] or 0) for o in out), "per_target": "",
             "status_file_drop": "",
+            "duration_s": f"{duration:g}" if timed and all(p.boxed for p in started) else "",
             "cpu_user_s": f"{sum(p.rusage.ru_utime for p in started if p.rusage):.3f}",
             "cpu_sys_s": f"{sum(p.rusage.ru_stime for p in started if p.rusage):.3f}",
             "max_rss_kib": max((p.hwm_kib for p in started if p.hwm_kib), default=""),

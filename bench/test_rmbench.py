@@ -236,7 +236,7 @@ class WindowTests(unittest.TestCase):
     def test_time_boxed_counts_the_window(self) -> None:
         run = rmbench.Run("t", ["fast"], [], duration=5.0)
         # At the box: 500 taken, 480 delivered; after the stop: 510 taken, all delivered.
-        p = self.proc(t0=10.0, t_change=14.9, t_end=15.0, win=(400, 480), src_left=390, counts=[510])
+        p = self.proc(t0=10.0, t_change=14.9, t_end=15.0, win=(400, 480), src_left=390, counts=[510], boxed=True)
         r = self.row(run, p)
         self.assertEqual((r["msg_s"], r["mib_s"], r["drain_s"]), ("100.0", "0.018", "5.000"))
         self.assertEqual((r["expected_total"], r["delivered_total"], r["missing"]), (510, 510, 0))
@@ -351,8 +351,8 @@ class RunOnceTests(unittest.TestCase):
     PROGRAM = (f"{sys.executable} -c 'import signal, sys, time; "
                f"signal.signal(signal.SIGINT, lambda *a: sys.exit(0)); time.sleep(60)' {{config}}")
 
-    def run_box(self, box: float) -> dict:
-        run = rmbench.expand(doc(BASE + f'[[scenario]]\nname = "t"\nduration = {box}\ncount = 900000\n'))[0]
+    def run_box(self, box: float, count: int = 900000) -> dict:
+        run = rmbench.expand(doc(BASE + f'[[scenario]]\nname = "t"\nduration = {box}\ncount = {count}\n'))[0]
         with tempfile.TemporaryDirectory() as d:
             args = argparse.Namespace(
                 label="x", results=d, renderer=rmbench.DEFAULT_RENDERER, config_ext=".yaml",
@@ -370,6 +370,15 @@ class RunOnceTests(unittest.TestCase):
         self.assertLess(float(r["drain_s"]), 0.9)
         self.assertGreater(int(r["delivered_total"]), 0)
         self.assertGreater(float(r["msg_s"]), 0.0)
+        self.assertEqual(r["reason"], "")
+
+    def test_source_drained_before_the_box_is_a_drain_run(self) -> None:
+        # MQF-2: 500 packages at 100 per poll drain in about 50 ms, long before the 3 s box.
+        r = self.run_box(3.0, count=500)
+        self.assertEqual((r["status"], r["duration_s"], r["missing"]), ("ok", "", 0))
+        self.assertEqual(r["reason"], "source drained before the time box")
+        self.assertEqual((r["expected_total"], r["delivered_total"]), (500, 500))
+        self.assertLess(float(r["drain_s"]), 1.0)
 
 
 if __name__ == "__main__":
