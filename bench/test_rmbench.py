@@ -74,6 +74,13 @@ instances = [{ mode = "spreader", clients = 3 }, { ordering = true }]
         runs = rmbench.expand(doc(BASE + '[[scenario]]\nname = "s"\n'), scale=0.5)
         self.assertEqual(runs[0].instances[0]["count"], 510)
 
+    def test_scale_one_keeps_the_count_as_written(self) -> None:
+        for scale in (1.0, 1.0 + 1e-12):
+            runs = rmbench.expand(doc(BASE + '[[scenario]]\nname = "s"\n'), scale=scale)
+            self.assertEqual(runs[0].instances[0]["count"], 1000, scale)
+        runs = rmbench.expand(doc(BASE + '[[scenario]]\nname = "s"\n'), scale=1.001)
+        self.assertEqual(runs[0].instances[0]["count"], 990)
+
     def test_duplicate_names_rejected(self) -> None:
         with self.assertRaises(rmbench.BenchError):
             rmbench.expand(doc(BASE + '[[scenario]]\nname = "s"\n[[scenario]]\nname = "s"\n'))

@@ -16,6 +16,7 @@ import datetime as dt
 import fnmatch
 import itertools
 import json
+import math
 import os
 import resource
 import shlex
@@ -122,7 +123,11 @@ def expand(doc: dict[str, Any], scale: float = 1.0) -> list[Run]:
 def _scaled(params: dict[str, Any], scale: float) -> dict[str, Any]:
     p = {k: params[k] for k in AXES if k in params}
     # Multiple of 30: exact 50% filter split (k = seq mod 10) and 3-way spreading.
-    p["count"] = max(30, int(round(int(p["count"]) * scale / 30.0)) * 30) if scale != 1.0 else int(p["count"])
+    # A scale of 1 (the default) keeps the scenario's count as written (MQF-10: no float equality).
+    if math.isclose(scale, 1.0):
+        p["count"] = int(p["count"])
+    else:
+        p["count"] = max(30, int(round(int(p["count"]) * scale / 30.0)) * 30)
     return p
 
 
