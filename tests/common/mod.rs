@@ -171,6 +171,17 @@ impl Ctx {
         self.con.lrange(key, 0, -1).unwrap()
     }
 
+    /// Any command on the test connection, e.g. `ctx.cmd(&["INFO", "stats"])`.
+    #[allow(dead_code)]
+    pub fn cmd<T: redis::FromRedisValue>(&mut self, args: &[&str]) -> T {
+        let mut c = redis::cmd(args[0]);
+        for a in &args[1..] {
+            c.arg(*a);
+        }
+        c.query(&mut self.con)
+            .unwrap_or_else(|e| panic!("{:?} failed: {}", args, e))
+    }
+
     pub fn ltrim(&mut self, key: &str, start: isize, stop: isize) {
         let _: () = self.con.ltrim(key, start, stop).unwrap();
     }

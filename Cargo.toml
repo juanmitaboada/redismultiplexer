@@ -38,7 +38,7 @@ debug = []
 #default = ["debug"]
 
 [dependencies]
-redis = { version = "0.32.7", default-features = false, features = ["tls-native-tls"] }
+redis = { version = "0.32.7", default-features = false, features = ["tls-native-tls", "disable-client-setinfo"] }
 chrono = "0.4.19"
 serde = { version = "1.0", features = ["derive"] }
 serde_norway = "0.9"
