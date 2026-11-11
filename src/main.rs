@@ -1452,18 +1452,6 @@ fn child(
                                         }
                                     }
                                 }
-                                Ok(redis::Value::Int(_)) => {
-                                    // Wrong value
-                                    // println!("Int(i64)");
-                                    print_debug!(PROGRAM_NAME, stderr(), COLOR_RED, 0, "Error while reading from Redis Server '{}:{}': not a queue!", config.hostname, config.port);
-                                    error = true;
-                                }
-                                Ok(redis::Value::BulkString(_)) => {
-                                    // Wrong value
-                                    // println!("Data(Vec<u8>)");
-                                    print_debug!(PROGRAM_NAME, stderr(), COLOR_RED, 0, "Error while reading from Redis Server '{}:{}': not a queue!", config.hostname, config.port);
-                                    error = true;
-                                }
                                 Ok(redis::Value::Array(data)) => {
                                     // This is the expected data
                                     // println!("Bulk(Vec<Value>)");
@@ -1518,20 +1506,9 @@ fn child(
                                         }
                                     }
                                 }
-                                Ok(redis::Value::SimpleString(_)) => {
-                                    // Wrong value
-                                    // println!("Status(String)");
-                                    print_debug!(PROGRAM_NAME, stderr(), COLOR_RED, 0, "Error while reading from Redis Server '{}:{}': not a queue!", config.hostname, config.port);
-                                    error = true;
-                                }
-                                Ok(redis::Value::Okay) => {
-                                    // Wrong value
-                                    // println!("Okay")
-                                    print_debug!(PROGRAM_NAME, stderr(), COLOR_RED, 0, "Error while reading from Redis Server '{}:{}': not a queue!", config.hostname, config.port);
-                                    error = true;
-                                }
                                 Ok(_) => {
-                                    // RESP3-only reply types, never sent to a RESP2 connection: handled as a wrong value
+                                    // Any other reply means the key is not a list (BLPOP answers
+                                    // nil or an array; other types only on a wrong server)
                                     print_debug!(PROGRAM_NAME, stderr(), COLOR_RED, 0, "Error while reading from Redis Server '{}:{}': not a queue!", config.hostname, config.port);
                                     error = true;
                                 }

@@ -26,6 +26,43 @@ fn help_banner_shows_the_version_only() {
     assert!(stdout.contains(&banner), "{:?}", stdout);
 }
 
+/// The line of `out` that holds the version banner; it must carry no build date.
+fn banner_line(out: &str) -> String {
+    let banner = format!("RedisMultiplexer v{}", env!("CARGO_PKG_VERSION"));
+    let line = out
+        .lines()
+        .find(|l| l.contains(&banner))
+        .unwrap_or_else(|| panic!("no banner in {:?}", out))
+        .to_string();
+    let rest = &line[line.find(&banner).unwrap() + banner.len()..];
+    assert!(!rest.contains('('), "build date in {:?}", line);
+    line
+}
+
+#[test]
+fn start_banner_shows_the_version_only() {
+    let mut ctx = Ctx::new("start_banner");
+    let src = ctx.key("src");
+    let t0 = ctx.key("t0");
+    ctx.push(&src, &packages("b", 1));
+    let cfg = ctx.config(&src, 1, "replicant", "", &[ctx.client_yaml("t0", &t0, "")]);
+    let mut p = ctx.spawn(&cfg);
+    ctx.wait_drained(&src, &[(&t0, 1)]);
+    p.stop(&ctx.pid_file());
+    banner_line(&p.stdout());
+}
+
+#[test]
+fn no_argument_banner_shows_the_version_only() {
+    let out = Command::new(bin()).output().unwrap();
+    banner_line(&String::from_utf8_lossy(&out.stdout));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("Usage"),
+        "{:?}",
+        out
+    );
+}
+
 #[test]
 fn invalid_config_exits_zero_current_behaviour() {
     // M1F-3: a configuration error is printed but the exit status is 0.
