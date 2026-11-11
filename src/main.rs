@@ -1124,7 +1124,37 @@ fn get_config(path_to_config: String) -> Result<Config, String> {
 
 /// Parse the YAML text of a configuration, without any check of its values
 fn parse_yaml(data: &str) -> Result<Config, String> {
-    serde_norway::from_str(data).map_err(|e| e.to_string())
+    let mut config: Config = serde_norway::from_str(data).map_err(|e| e.to_string())?;
+    // serde_yaml 0.8 (up to 1.0.8) read an empty `name:` or `channel:` as "~", so files
+    // with one ran; a second, untyped read tells an empty value (None) from '' (M3R-1)
+    if let Ok(raw) = serde_norway::from_str::<RawNames>(data) {
+        empty_as_tilde(&mut config.name, &raw.name);
+        empty_as_tilde(&mut config.channel, &raw.channel);
+        for (client, names) in config
+            .clients
+            .iter_mut()
+            .zip(raw.clients.unwrap_or_default())
+        {
+            empty_as_tilde(&mut client.name, &names.name);
+            empty_as_tilde(&mut client.channel, &names.channel);
+        }
+    }
+    Ok(config)
+}
+
+/// `name` and `channel` of a configuration as optional values: None for an empty value
+#[derive(Deserialize)]
+struct RawNames {
+    name: Option<String>,
+    channel: Option<String>,
+    clients: Option<Vec<RawNames>>,
+}
+
+/// "~" where the YAML value was empty, as serde_yaml 0.8 read it
+fn empty_as_tilde(value: &mut String, raw: &Option<String>) {
+    if value.is_empty() && raw.is_none() {
+        *value = "~".to_string();
+    }
 }
 
 /// Manage ordered packages in a centralized way
@@ -2541,6 +2571,63 @@ mod tests {
         );
         let quoted = yaml_replace("password: x\nchannel: c", "password: ''\nchannel: c").unwrap();
         assert_eq!(quoted.password, "");
+    }
+
+    #[test]
+    fn yaml_empty_name_and_channel_read_as_in_earlier_versions() {
+        // M3R-1 rows a and b: serde_yaml 0.8 read an empty `name:` or `channel:` (root or
+        // client, a trailing comment included) as "~"; files with one ran on 1.0.8
+        let c = yaml_replace("name: s\n", "name:\n").unwrap();
+        assert_eq!(c.name, "~");
+        assert!(verify_config(c).is_ok());
+        assert_eq!(
+            yaml_replace("name: s\n", "name: # label\n").unwrap().name,
+            "~"
+        );
+        let c = yaml_replace("channel: c\n", "channel:\n").unwrap();
+        assert_eq!(c.channel, "~");
+        assert!(verify_config(c).is_ok());
+        let c = yaml_replace("    channel: d\n", "    channel:\n").unwrap();
+        assert_eq!(c.clients[0].channel, "~");
+        assert_eq!(
+            yaml_replace("  - name: t\n", "  - name:\n")
+                .unwrap()
+                .clients[0]
+                .name,
+            "~"
+        );
+        // Quoted empty strings stay empty and are rejected, as in 1.0.8
+        let c = yaml_replace("name: s\n", "name: ''\n").unwrap();
+        assert_eq!(c.name, "");
+        assert!(verify_config(c).is_err());
+        assert_eq!(
+            yaml_replace("channel: c\n", "channel: \"\"\n")
+                .unwrap()
+                .channel,
+            ""
+        );
+        // `~` and `null` read as text, as in 1.0.8
+        assert_eq!(yaml_replace("name: s\n", "name: ~\n").unwrap().name, "~");
+        assert_eq!(
+            yaml_replace("name: s\n", "name: null\n").unwrap().name,
+            "null"
+        );
+    }
+
+    #[test]
+    fn yaml_declared_differences_with_earlier_versions() {
+        // M3R-1 rows c to f: what serde_yaml 0.8 (1.0.8) read and serde_norway reads now.
+        // c: a control character (form feed, or U+0092 in a comment): 0.8 kept it, now an error
+        assert!(yaml_replace("name: s\n", "name: s\u{c}\n").is_err());
+        assert!(yaml_replace("name: s\n", "name: s # it\u{92}s\n").is_err());
+        // d: a value on the line after its key at column 0: 0.8 read it, now an error
+        assert!(yaml_replace("channel: c\n", "channel:\nc\n").is_err());
+        // e: `Null` on an optional text key: 0.8 read the text "Null", now absent
+        assert_eq!(yaml("filter: Null\n").unwrap().filter, None);
+        // f: an empty `hostname:` read "~" in 0.8 (never connected); now "" and rejected
+        let c = yaml_replace("hostname: h\n", "hostname:\n").unwrap();
+        assert_eq!(c.hostname, "");
+        assert!(verify_config(c).is_err());
     }
 
     #[test]
