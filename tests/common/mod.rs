@@ -11,6 +11,8 @@ use redis::Commands;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -359,4 +361,97 @@ pub fn q(s: &str) -> String {
 /// `n` distinct packages: "<tag>-00000" ...
 pub fn packages(tag: &str, n: usize) -> Vec<String> {
     (0..n).map(|i| format!("{}-{:05}", tag, i)).collect()
+}
+
+/// Ordering with a 1 s buffer on the `ts` field of `seq_pkg` packages.
+pub const ORDERING_1S: &str =
+    "ordering: '\"ts\": *(?P<ts>\\d+),'\nordering_buffer_time: 1\nordering_limit: 200\n";
+
+/// Package number `seq` of a stop-under-load run; the number is also its timestamp.
+pub fn seq_pkg(seq: u64) -> String {
+    format!("{{\"ts\": {}, \"v\": \"x\"}}", seq)
+}
+
+fn seq_of(p: &str) -> u64 {
+    p[7..p.find(',').unwrap()].parse().unwrap()
+}
+
+/// Result of `stop_under_load`: sequence numbers delivered (in target order) and left in
+/// the source (in source order).
+pub struct StopRun {
+    pub delivered: Vec<u64>,
+    pub left: Vec<u64>,
+}
+
+/// Stop under load (M2R-1, M2R-7, M3R-3). A producer thread keeps pushing numbered
+/// packages into the source while the program runs, SIGINT comes `run_for` after the
+/// first delivery with the producer still pushing, and once the program has exited cleanly every package pushed
+/// must be either delivered or still in the source, exactly once: the source keeps the
+/// newest ones, in order, and the target holds all the older ones. The producer keeps the
+/// source busy at SIGINT however fast the build is, so the test does not depend on a
+/// package count.
+pub fn stop_under_load(test: &str, children: u16, ordering: bool, run_for: Duration) -> StopRun {
+    let mut ctx = Ctx::new(test);
+    let src = ctx.key("src");
+    let t0 = ctx.key("t0");
+    let extra = if ordering { ORDERING_1S } else { "" };
+    let cfg = ctx.config(
+        &src,
+        children,
+        "replicant",
+        extra,
+        &[ctx.client_yaml("t0", &t0, "")],
+    );
+    let done = Arc::new(AtomicBool::new(false));
+    let producer = {
+        let (url, src, done) = (ctx.ep.url.clone(), src.clone(), done.clone());
+        thread::spawn(move || {
+            let mut con = redis::Client::open(url.as_str())
+                .unwrap()
+                .get_connection()
+                .unwrap();
+            let mut seq = 0u64;
+            while !done.load(Ordering::SeqCst) {
+                let batch: Vec<String> = (seq..seq + 1000).map(seq_pkg).collect();
+                let _: usize = con.rpush(&src, batch).unwrap();
+                seq += 1000;
+                // A backlog, not a flood: pause while the source holds 200000 packages
+                while !done.load(Ordering::SeqCst) && con.llen::<_, usize>(&src).unwrap() > 200_000
+                {
+                    thread::sleep(Duration::from_millis(5));
+                }
+            }
+            seq
+        })
+    };
+    ctx.wait_for("source loaded", |c| c.llen(&src) >= 10_000);
+    let mut p = ctx.spawn(&cfg);
+    // With ordering the first release comes after one buffer time (whole seconds)
+    ctx.wait_for("first package delivered", |c| c.llen(&t0) > 0);
+    thread::sleep(run_for);
+    p.stop(&ctx.pid_file());
+    done.store(true, Ordering::SeqCst);
+    let pushed = producer.join().unwrap();
+    let delivered: Vec<u64> = ctx.list(&t0).iter().map(|s| seq_of(s)).collect();
+    let left: Vec<u64> = ctx.list(&src).iter().map(|s| seq_of(s)).collect();
+    assert_eq!(
+        delivered.len() + left.len(),
+        pushed as usize,
+        "delivered {} + left {} != pushed {}",
+        delivered.len(),
+        left.len(),
+        pushed
+    );
+    let taken = delivered.len() as u64;
+    assert!(
+        left.iter().copied().eq(taken..pushed),
+        "source does not hold the newest packages in order"
+    );
+    let mut sorted = delivered.clone();
+    sorted.sort_unstable();
+    assert!(
+        sorted.into_iter().eq(0..taken),
+        "target does not hold every older package once"
+    );
+    StopRun { delivered, left }
 }

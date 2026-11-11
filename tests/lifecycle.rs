@@ -4,7 +4,6 @@ mod common;
 
 use common::*;
 use std::process::Command;
-use std::thread;
 use std::time::Duration;
 
 #[test]
@@ -49,24 +48,12 @@ fn invalid_config_exits_zero_current_behaviour() {
 fn sigint_with_nonempty_source() {
     // Documents what a clean stop loses with packages still queued: nothing.
     // Without ordering every popped package is delivered before exit and the
-    // rest stays in the source, in order.
-    let mut ctx = Ctx::new("sigint_nonempty");
-    let src = ctx.key("src");
-    let t0 = ctx.key("t0");
-    let all = packages("p", 50000);
-    ctx.push(&src, &all);
-    let cfg = ctx.config(&src, 1, "replicant", "", &[ctx.client_yaml("t0", &t0, "")]);
-    let mut p = ctx.spawn(&cfg);
-    ctx.wait_for("first package delivered", |c| c.llen(&t0) > 0);
-    thread::sleep(Duration::from_millis(500));
-    assert!(
-        ctx.llen(&src) > 0,
-        "source drained before SIGINT; raise the package count"
-    );
-    p.stop(&ctx.pid_file());
-    let delivered = ctx.list(&t0);
-    let left = ctx.list(&src);
-    assert_eq!(delivered.len() + left.len(), all.len());
-    assert_eq!(delivered[..], all[..delivered.len()]);
-    assert_eq!(left[..], all[delivered.len()..]);
+    // rest stays in the source, in order; with one child also delivered in order.
+    let run = stop_under_load("sigint_nonempty", 1, false, Duration::from_millis(500));
+    assert!(run
+        .delivered
+        .iter()
+        .copied()
+        .eq(0..run.delivered.len() as u64));
+    assert!(!run.left.is_empty());
 }
