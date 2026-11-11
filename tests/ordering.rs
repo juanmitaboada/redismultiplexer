@@ -96,28 +96,24 @@ fn ordering_stop_under_load_loses_nothing() {
 }
 
 /// Packages with increasing ts, pushed in that order while the program runs, must reach
-/// both targets in exactly that order with any number of children (M3-k = ka, M3F-6).
-/// 1.0.8 released each second's packages to whichever child asked next and the children
-/// delivered those batches at the same time. The source is fed at 12000 packages per
-/// second for 3 s, so there are several batches, and three targets make each batch slower
-/// to deliver than to pop, so 1.0.8's deliveries overlap and the order breaks.
+/// the target in exactly that order with any number of children (M3-k = ka, M3F-6).
+/// 1.0.8 and main hand each second's packages to whichever child asks next, and the
+/// children deliver those batches at the same time. The target is a SlowTarget taking
+/// 2 ms per RPUSH and the source is fed at 1000 packages per second, so delivering one
+/// second's batch takes at least 2 s: the next batch always starts in another child while
+/// the previous one is still being delivered, on any machine, and their packages mix. One
+/// sender delivers batch after batch, so the order holds.
 fn strict_order(test: &str, children: u16) {
     let mut ctx = Ctx::new(test);
     let src = ctx.key("src");
-    let t0 = ctx.key("t0");
-    let t1 = ctx.key("t1");
-    let t2 = ctx.key("t2");
-    let n: u64 = 36000;
+    let target = SlowTarget::start(Duration::from_millis(2));
+    let n: u64 = 3000;
     let cfg = ctx.config(
         &src,
         children,
         "replicant",
         ORDERING_1S,
-        &[
-            ctx.client_yaml("t0", &t0, ""),
-            ctx.client_yaml("t1", &t1, ""),
-            ctx.client_yaml("t2", &t2, ""),
-        ],
+        &[ctx.client_yaml_at("t0", "rmtest:slow", target.port)],
     );
     let mut p = ctx.spawn(&cfg);
     let producer = {
@@ -127,8 +123,8 @@ fn strict_order(test: &str, children: u16) {
                 .unwrap()
                 .get_connection()
                 .unwrap();
-            for start in (0..n).step_by(600) {
-                let batch: Vec<String> = (start..start + 600).map(seq_pkg).collect();
+            for start in (0..n).step_by(50) {
+                let batch: Vec<String> = (start..start + 50).map(seq_pkg).collect();
                 let _: usize = redis::Commands::rpush(&mut con, &src, batch).unwrap();
                 thread::sleep(Duration::from_millis(50));
             }
@@ -136,24 +132,23 @@ fn strict_order(test: &str, children: u16) {
     };
     producer.join().unwrap();
     let all = n as usize;
-    ctx.wait_drained(&src, &[(&t0, all), (&t1, all), (&t2, all)]);
+    ctx.wait_for("every package at the slow target", |c| {
+        c.llen(&src) == 0 && target.count() == all
+    });
     p.stop(&ctx.pid_file());
     let want: Vec<String> = (0..n).map(seq_pkg).collect();
-    for t in [&t0, &t1, &t2] {
-        let got = ctx.list(t);
-        assert_eq!(got.len(), want.len());
-        let first = got.iter().zip(&want).position(|(a, b)| a != b);
-        let misplaced = got.iter().zip(&want).filter(|(a, b)| a != b).count();
-        assert!(
-            first.is_none(),
-            "{} children: {} out of order from position {:?}, {} of {} packages misplaced",
-            children,
-            t,
-            first,
-            misplaced,
-            n
-        );
-    }
+    let got = target.pushed();
+    assert_eq!(got.len(), want.len());
+    let first = got.iter().zip(&want).position(|(a, b)| a != b);
+    let misplaced = got.iter().zip(&want).filter(|(a, b)| a != b).count();
+    assert!(
+        first.is_none(),
+        "{} children: out of order from position {:?}, {} of {} packages misplaced",
+        children,
+        first,
+        misplaced,
+        n
+    );
 }
 
 #[test]

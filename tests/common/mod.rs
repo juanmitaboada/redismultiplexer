@@ -9,10 +9,12 @@
 
 use redis::Commands;
 use std::fs;
+use std::io::{BufRead, BufReader, Write};
+use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -205,6 +207,17 @@ impl Ctx {
             q(&self.ep.password),
             q(key),
             extra
+        )
+    }
+
+    /// YAML for a client (target) entry on 127.0.0.1:`port`, without password or TLS
+    /// (a SlowTarget).
+    pub fn client_yaml_at(&self, name: &str, key: &str, port: u16) -> String {
+        format!(
+            "  - name: {}\n    ssl: false\n    hostname: '127.0.0.1'\n    port: {}\n    password: ''\n    channel: {}\n",
+            q(name),
+            port,
+            q(key)
         )
     }
 
@@ -490,4 +503,88 @@ pub fn stop_under_load_with(
         "target does not hold every older package once"
     );
     StopRun { delivered, left }
+}
+
+/// A stand-in Redis target that is slow on purpose: each RPUSH waits `delay` before its
+/// reply, and every pushed value is recorded in arrival order across all connections. A
+/// test sets how long a batch takes to deliver, whatever the speed of the machine.
+/// LLEN answers 0 (never over a limit); any other command answers +OK.
+pub struct SlowTarget {
+    pub port: u16,
+    pushed: Arc<Mutex<Vec<String>>>,
+}
+
+impl SlowTarget {
+    pub fn start(delay: Duration) -> SlowTarget {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let pushed = Arc::new(Mutex::new(Vec::new()));
+        let rec = pushed.clone();
+        // The accept thread ends with the test process; each connection thread ends when
+        // the program closes its connection
+        thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let rec = rec.clone();
+                thread::spawn(move || slow_target_serve(stream, delay, rec));
+            }
+        });
+        SlowTarget { port, pushed }
+    }
+
+    /// Values pushed so far, in arrival order
+    pub fn pushed(&self) -> Vec<String> {
+        self.pushed.lock().unwrap().clone()
+    }
+
+    pub fn count(&self) -> usize {
+        self.pushed.lock().unwrap().len()
+    }
+}
+
+/// One RESP request (an array of bulk strings), or None at end of stream
+fn resp_request(r: &mut impl BufRead) -> Option<Vec<Vec<u8>>> {
+    let mut line = String::new();
+    if r.read_line(&mut line).ok()? == 0 {
+        return None;
+    }
+    let n: usize = line.trim_end().strip_prefix('*')?.parse().ok()?;
+    let mut args = Vec::with_capacity(n);
+    for _ in 0..n {
+        line.clear();
+        r.read_line(&mut line).ok()?;
+        let len: usize = line.trim_end().strip_prefix('$')?.parse().ok()?;
+        let mut buf = vec![0; len + 2];
+        r.read_exact(&mut buf).ok()?;
+        buf.truncate(len);
+        args.push(buf);
+    }
+    Some(args)
+}
+
+fn slow_target_serve(stream: TcpStream, delay: Duration, rec: Arc<Mutex<Vec<String>>>) {
+    let mut w = stream.try_clone().unwrap();
+    let mut r = BufReader::new(stream);
+    while let Some(args) = resp_request(&mut r) {
+        let cmd = args
+            .first()
+            .map(|c| String::from_utf8_lossy(c).to_ascii_uppercase())
+            .unwrap_or_default();
+        let reply = match cmd.as_str() {
+            "RPUSH" => {
+                thread::sleep(delay);
+                let mut v = rec.lock().unwrap();
+                v.extend(
+                    args[2..]
+                        .iter()
+                        .map(|a| String::from_utf8_lossy(a).into_owned()),
+                );
+                format!(":{}\r\n", v.len())
+            }
+            "LLEN" => ":0\r\n".to_string(),
+            _ => "+OK\r\n".to_string(),
+        };
+        if w.write_all(reply.as_bytes()).is_err() {
+            return;
+        }
+    }
 }
