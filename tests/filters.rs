@@ -69,10 +69,9 @@ fn client_filter_with_replace() {
 }
 
 #[test]
-fn readme_client_filter_example_never_matches_current_behaviour() {
-    // A-C3: filter_until removes the delimiter from the haystack, so the README
-    // client example `^(1|3|5|7|9)#` with until "#" never matches. M3 decides
-    // whether the behaviour or the README changes.
+fn readme_client_filter_example_without_until_included() {
+    // A-C3: without filter_until_included the delimiter is not part of the header, so
+    // `^(1|3|5|7|9)#` with until "#" never matches (1.0 behaviour, still the default).
     let mut ctx = Ctx::new("readme_filter");
     let src = ctx.key("src");
     let t0 = ctx.key("t0");
@@ -92,4 +91,31 @@ fn readme_client_filter_example_never_matches_current_behaviour() {
     ctx.wait_drained(&src, &[(&witness, 3)]);
     p.stop(&ctx.pid_file());
     assert_eq!(ctx.llen(&t0), 0);
+}
+
+#[test]
+fn readme_client_filter_example_with_until_included() {
+    // M3-b: with filter_until_included the README example routes odd prefixes and strips them
+    let mut ctx = Ctx::new("readme_filter_included");
+    let src = ctx.key("src");
+    let odd = ctx.key("odd");
+    let even = ctx.key("even");
+    let input: Vec<String> = ["1#a", "2#b", "3#c", "4#d"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    ctx.push(&src, &input);
+    let filter = |re: &str| {
+        format!("    filter: '{re}'\n    filter_until: '#'\n    filter_until_included: true\n    filter_limit: 100\n    filter_replace: ''\n")
+    };
+    let clients = [
+        ctx.client_yaml("odd", &odd, &filter("^(1|3|5|7|9)#")),
+        ctx.client_yaml("even", &even, &filter("^(0|2|4|6|8)#")),
+    ];
+    let cfg = ctx.config(&src, 1, "replicant", "", &clients);
+    let mut p = ctx.spawn(&cfg);
+    ctx.wait_drained(&src, &[(&odd, 2), (&even, 2)]);
+    p.stop(&ctx.pid_file());
+    assert_eq!(ctx.list(&odd), vec!["a", "c"]);
+    assert_eq!(ctx.list(&even), vec!["b", "d"]);
 }

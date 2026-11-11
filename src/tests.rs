@@ -17,6 +17,7 @@ fn client(name: &str, channel: &str) -> ClientConfig {
         deleteblock: None,
         filter: None,
         filter_until: None,
+        filter_until_included: None,
         filter_limit: None,
         filter_replace: None,
     }
@@ -36,6 +37,7 @@ fn config() -> Config {
         status: None,
         filter: None,
         filter_until: None,
+        filter_until_included: None,
         filter_limit: None,
         filter_replace: None,
         ordering: None,
@@ -54,7 +56,7 @@ fn filter_bytes(
 ) -> Option<Vec<u8>> {
     match re {
         None => Some(data.to_vec()),
-        Some(r) => Filter::new(r, until, limit, replace)
+        Some(r) => Filter::new(r, until, false, limit, replace)
             .unwrap()
             .apply(data)
             .map(|c| c.into_owned()),
@@ -141,6 +143,13 @@ fn yaml_scalars_as_earlier_versions_read_them() {
         ".*\"ts\": *(?P<ts>\\d+),.*#"
     );
     assert_eq!(yaml("unknown_key: 1\n").unwrap().name, "s");
+    assert_eq!(
+        yaml("filter: 'a'\nfilter_until_included: true\n")
+            .unwrap()
+            .filter_until_included,
+        Some(true)
+    );
+    assert_eq!(yaml("").unwrap().filter_until_included, None);
 }
 
 #[test]
@@ -266,6 +275,12 @@ fn yaml_readme_example() {
     assert_eq!(c.clients.len(), 2);
     assert_eq!(c.clients[0].filter.as_deref(), Some("^(1|3|5|7|9)#"));
     assert_eq!(c.clients[0].filter_replace.as_deref(), Some(""));
+    assert_eq!(c.clients[0].filter_until_included, Some(true));
+    // The example strips the routing prefix of the packages it routes
+    let filters = build_filters(&c).unwrap();
+    let odd = filters.clients[0].as_ref().unwrap();
+    assert_eq!(odd.apply(b"3#data").unwrap().as_ref(), b"data");
+    assert!(odd.apply(b"4#data").is_none());
     assert_eq!(c.clients[1].deleteblock, None);
     assert!(verify_config(c).is_ok());
 }
@@ -335,9 +350,9 @@ fn filter_limit_longer_than_input() {
 }
 
 #[test]
-fn filter_until_excludes_delimiter_current_behaviour() {
-    // A-C3: the delimiter is not part of the haystack, so a regex that includes it
-    // never matches (the README client example). M3 decides the fix.
+fn filter_until_excludes_delimiter_by_default() {
+    // A-C3: without filter_until_included the delimiter is not part of the header, so a
+    // regex that includes it never matches (1.0 behaviour, kept as the default).
     assert_eq!(
         filter(
             Some("^(1|3|5|7|9)#"),
@@ -358,6 +373,66 @@ fn filter_until_excludes_delimiter_current_behaviour() {
         ),
         Some("1#payload".into())
     );
+}
+
+fn included(
+    re: &str,
+    until: &str,
+    limit: Option<usize>,
+    replace: Option<&str>,
+    data: &str,
+) -> Option<String> {
+    Filter::new(re, Some(until), true, limit, replace)
+        .unwrap()
+        .apply(data.as_bytes())
+        .map(|c| String::from_utf8(c.into_owned()).unwrap())
+}
+
+#[test]
+fn filter_until_included_puts_the_delimiter_in_the_header() {
+    // M3-b: the README client example matches and strips the routing prefix
+    assert_eq!(
+        included("^(1|3|5|7|9)#", "#", Some(100), Some(""), "1#payload"),
+        Some("payload".into())
+    );
+    assert_eq!(
+        included("^(1|3|5|7|9)#", "#", Some(100), Some(""), "2#payload"),
+        None
+    );
+    // A pattern anchored before the delimiter no longer matches with it included
+    assert_eq!(
+        included("^(1|3|5|7|9)$", "#", Some(100), None, "1#payload"),
+        None
+    );
+    assert_eq!(
+        included("^(1|3|5|7|9)#$", "#", Some(100), None, "1#payload"),
+        Some("1#payload".into())
+    );
+}
+
+#[test]
+fn filter_until_included_edges() {
+    // Multi-byte delimiter, delimiter not found, delimiter cut by the limit
+    assert_eq!(
+        included("^ab::$", "::", None, Some("X"), "ab::cd::ef"),
+        Some("Xcd::ef".into())
+    );
+    assert_eq!(included("cd", "#", None, None, "abcd"), Some("abcd".into()));
+    assert_eq!(included("^ab#$", "#", Some(2), None, "ab#cd"), None);
+    assert_eq!(
+        included("^ab$", "#", Some(2), None, "ab#cd"),
+        Some("ab#cd".into())
+    );
+}
+
+#[test]
+fn verify_rejects_until_included_without_filter() {
+    let mut c = config();
+    c.clients[0].filter_until_included = Some(true);
+    assert!(err(c).contains("filtering option but filter is not defined"));
+    let mut c = config();
+    c.filter_until_included = Some(false);
+    assert!(err(c).contains("filtering option but filter is not defined"));
 }
 
 #[test]
@@ -440,16 +515,16 @@ fn filter_unicode_classes_do_not_match_invalid_utf8() {
 #[test]
 fn filter_borrows_the_package_unless_it_replaces() {
     let data = b"Hello world";
-    let f = Filter::new("ell", Some("r"), Some(11), None).unwrap();
+    let f = Filter::new("ell", Some("r"), false, Some(11), None).unwrap();
     assert!(matches!(f.apply(data), Some(Cow::Borrowed(_))));
-    let f = Filter::new("ell", Some("r"), Some(11), Some("ELL")).unwrap();
+    let f = Filter::new("ell", Some("r"), false, Some(11), Some("ELL")).unwrap();
     assert!(matches!(f.apply(data), Some(Cow::Owned(_))));
 }
 
 #[test]
 fn filter_clone_matches_like_the_original() {
     // Each worker gets a clone (its own regex cache); it must behave the same
-    let f = Filter::new(r"^(\d)-(\d)", Some(" "), Some(10), Some("$2-$1")).unwrap();
+    let f = Filter::new(r"^(\d)-(\d)", Some(" "), false, Some(10), Some("$2-$1")).unwrap();
     let g = f.clone();
     assert_eq!(f.apply(b"1-2 rest"), g.apply(b"1-2 rest"));
     assert_eq!(g.apply(b"1-2 rest").unwrap().as_ref(), b"2-1 rest");

@@ -52,6 +52,7 @@ Every configuration will have
 
 - `filter`: this is a Regular Expression that will be matched with the header of the package
 - `filter_until`: the header of the package will be as long until this substring is reached (the minimum between filter\_until and filter\_limit will be used)
+- `filter_until_included`: `true` makes the `filter_until` substring part of the header, so the Regular Expression can match it and `filter_replace` replaces it too (useful to strip a routing prefix such as `1#`); `false` (default) leaves it out of the header
 - `filter_limit`: the header of the package will be as long until these total bytes is reached (the minimum between filter\_until and filter\_limit will be used)
 - `filter_replace`: if this filter option is defined the Regular Expression will be replaced with this string (which may contain $X groups from Regex)
 
@@ -187,6 +188,7 @@ clients:
     deleteblock : 100                   # optional
     filter      : "^(1|3|5|7|9)#"       # optional
     filter_until: "#"                   # optional
+    filter_until_included: true         # optional
     filter_limit: 100                   # optional
     filter_replace: ""                  # optional
   - name        : "DB2"
@@ -200,6 +202,7 @@ clients:
     hardlimit   : 410                   # optional
     filter      : "^(0|2|4|6|8)#"       # optional
     filter_until: "#"                   # optional
+    filter_until_included: true         # optional
     filter_limit: 100                   # optional
     filter_replace: ""                  # optional
 ```

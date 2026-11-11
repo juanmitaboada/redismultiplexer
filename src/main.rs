@@ -79,6 +79,7 @@ struct ClientConfig {
     deleteblock: Option<u64>,
     filter: Option<String>,
     filter_until: Option<String>,
+    filter_until_included: Option<bool>,
     filter_limit: Option<usize>,
     filter_replace: Option<String>,
 }
@@ -99,6 +100,7 @@ impl Clone for ClientConfig {
             deleteblock: self.deleteblock,
             filter: self.filter.clone(),
             filter_until: self.filter_until.clone(),
+            filter_until_included: self.filter_until_included,
             filter_limit: self.filter_limit,
             filter_replace: self.filter_replace.clone(),
         }
@@ -119,6 +121,7 @@ struct Config {
     status: Option<String>,
     filter: Option<String>,
     filter_until: Option<String>,
+    filter_until_included: Option<bool>,
     filter_limit: Option<usize>,
     filter_replace: Option<String>,
     ordering: Option<String>,
@@ -142,6 +145,7 @@ impl Clone for Config {
             status: self.status.clone(),
             filter: self.filter.clone(),
             filter_until: self.filter_until.clone(),
+            filter_until_included: self.filter_until_included,
             filter_limit: self.filter_limit,
             filter_replace: self.filter_replace.clone(),
             ordering: self.ordering.clone(),
@@ -169,7 +173,8 @@ struct RedisLink {
 struct Filter {
     regex: Regex,
     until: Option<memchr::memmem::Finder<'static>>,
-    limit: usize, // 0: no limit
+    until_included: bool, // the delimiter belongs to the header (and to what is replaced)
+    limit: usize,         // 0: no limit
     replace: Option<Vec<u8>>,
 }
 
@@ -177,6 +182,7 @@ impl Filter {
     fn new(
         pattern: &str,
         until: Option<&str>,
+        until_included: bool,
         limit: Option<usize>,
         replace: Option<&str>,
     ) -> Result<Filter, String> {
@@ -186,6 +192,7 @@ impl Filter {
             until: until
                 .filter(|u| !u.is_empty())
                 .map(|u| memchr::memmem::Finder::new(u.as_bytes()).into_owned()),
+            until_included,
             limit: limit.unwrap_or(0),
             replace: replace.map(|r| r.as_bytes().to_vec()),
         })
@@ -200,8 +207,12 @@ impl Filter {
         } else {
             data
         };
-        let haystack = match self.until.as_ref().and_then(|f| f.find(slice)) {
-            Some(idx) => &slice[..idx],
+        let haystack = match &self.until {
+            Some(f) => match f.find(slice) {
+                Some(idx) if self.until_included => &slice[..idx + f.needle().len()],
+                Some(idx) => &slice[..idx],
+                None => slice,
+            },
             None => slice,
         };
         if !self.regex.is_match(haystack) {
@@ -233,6 +244,7 @@ fn build_filters(config: &Config) -> Result<Filters, String> {
             Filter::new(
                 f,
                 config.filter_until.as_deref(),
+                config.filter_until_included.unwrap_or(false),
                 config.filter_limit,
                 config.filter_replace.as_deref(),
             )
@@ -247,6 +259,7 @@ fn build_filters(config: &Config) -> Result<Filters, String> {
                 Filter::new(
                     f,
                     client.filter_until.as_deref(),
+                    client.filter_until_included.unwrap_or(false),
                     client.filter_limit,
                     client.filter_replace.as_deref(),
                 )
@@ -979,6 +992,7 @@ fn verify_config(config: Config) -> Result<Config, String> {
     match &source.filter {
         None => {
             if (source.filter_until != None)
+                || (source.filter_until_included != None)
                 || (source.filter_limit != None)
                 || (source.filter_replace != None)
             {
@@ -1106,6 +1120,7 @@ fn verify_config(config: Config) -> Result<Config, String> {
             match &client.filter {
                 None => {
                     if (client.filter_until != None)
+                        || (client.filter_until_included != None)
                         || (client.filter_limit != None)
                         || (client.filter_replace != None)
                     {
