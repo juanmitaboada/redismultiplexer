@@ -64,6 +64,29 @@ fn no_argument_banner_shows_the_version_only() {
 }
 
 #[test]
+fn bad_client_regex_is_refused_at_start() {
+    // M1F-8: the client regex was compiled with unwrap() in each worker, which panicked
+    // them all after the program had started; it is now a configuration error.
+    let mut ctx = Ctx::new("bad_client_regex");
+    let src = ctx.key("src");
+    let t0 = ctx.key("t0");
+    ctx.push(&src, &packages("x", 3));
+    let client = ctx.client_yaml("t0", &t0, "    filter: '('\n");
+    let cfg = ctx.config(&src, 1, "replicant", "", &[client]);
+    let mut p = ctx.spawn(&cfg);
+    p.wait_exit();
+    assert!(
+        p.stderr()
+            .contains("Client 't0' has a filter Regex '(' that doesn't compile"),
+        "{}",
+        p.stderr()
+    );
+    assert!(!p.stderr().contains("panicked"), "{}", p.stderr());
+    assert_eq!(ctx.llen(&src), 3);
+    assert!(!ctx.pid_file().exists());
+}
+
+#[test]
 fn invalid_config_exits_zero_current_behaviour() {
     // M1F-3: a configuration error is printed but the exit status is 0.
     let mut ctx = Ctx::new("invalid_config");

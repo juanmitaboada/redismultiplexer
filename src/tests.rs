@@ -52,17 +52,12 @@ fn filter_bytes(
     replace: Option<&str>,
     data: &[u8],
 ) -> Option<Vec<u8>> {
-    match match_filter(
-        re.map(|r| Regex::new(r).unwrap()),
-        until.map(str::to_string),
-        limit,
-        replace.map(str::to_string),
-        data.to_vec(),
-    ) {
-        MatchAnswer::Box(s) => Some(s),
-        MatchAnswer::Ok(false) => None,
-        MatchAnswer::Ok(true) => panic!("match_filter returned Ok(true)"),
-        MatchAnswer::Err(e) => panic!("match_filter returned Err({})", e),
+    match re {
+        None => Some(data.to_vec()),
+        Some(r) => Filter::new(r, until, limit, replace)
+            .unwrap()
+            .apply(data)
+            .map(|c| c.into_owned()),
     }
 }
 
@@ -440,6 +435,57 @@ fn filter_unicode_classes_do_not_match_invalid_utf8() {
         filter_bytes(Some("^.$"), None, None, None, "\u{e9}".as_bytes()),
         Some("\u{e9}".as_bytes().to_vec())
     );
+}
+
+#[test]
+fn filter_borrows_the_package_unless_it_replaces() {
+    let data = b"Hello world";
+    let f = Filter::new("ell", Some("r"), Some(11), None).unwrap();
+    assert!(matches!(f.apply(data), Some(Cow::Borrowed(_))));
+    let f = Filter::new("ell", Some("r"), Some(11), Some("ELL")).unwrap();
+    assert!(matches!(f.apply(data), Some(Cow::Owned(_))));
+}
+
+#[test]
+fn filter_clone_matches_like_the_original() {
+    // Each worker gets a clone (its own regex cache); it must behave the same
+    let f = Filter::new(r"^(\d)-(\d)", Some(" "), Some(10), Some("$2-$1")).unwrap();
+    let g = f.clone();
+    assert_eq!(f.apply(b"1-2 rest"), g.apply(b"1-2 rest"));
+    assert_eq!(g.apply(b"1-2 rest").unwrap().as_ref(), b"2-1 rest");
+}
+
+#[test]
+fn verify_rejects_a_client_regex_that_does_not_compile() {
+    // M1F-8: checked at start instead of panicking every worker
+    let mut c = config();
+    c.clients[0].filter = Some("(".into());
+    let e = err(c);
+    assert!(
+        e.contains("Client 't1' has a filter Regex '(' that doesn't compile"),
+        "{}",
+        e
+    );
+}
+
+#[test]
+fn verify_rejects_a_root_regex_that_does_not_compile() {
+    let mut c = config();
+    c.filter = Some("[".into());
+    let e = err(c);
+    assert!(e.contains("Filter Regex '[' doesn't compile"), "{}", e);
+}
+
+#[test]
+fn build_filters_keeps_client_order() {
+    let mut c = config();
+    c.clients.push(client("t2", "dst2"));
+    c.clients[1].filter = Some("^b".into());
+    let f = build_filters(&c).unwrap();
+    assert!(f.root.is_none());
+    assert_eq!(f.clients.len(), 2);
+    assert!(f.clients[0].is_none());
+    assert!(f.clients[1].as_ref().unwrap().apply(b"b").is_some());
 }
 
 // --- match_ordering ---

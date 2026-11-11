@@ -38,6 +38,7 @@
 use regex::bytes::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use std::borrow::Cow;
 use std::cmp;
 use std::io::{stderr, stdout, Write};
 use std::process;
@@ -158,14 +159,108 @@ struct RedisLink {
     sleeping_from: u64,      // If queue is stuck, when did it happened
     packages: u64,           // Packages we have seen from last check
     lastcheck: u64,          // When was the last check of queue's size (time limit)
-    regex: Option<Regex>,
+    filter: Option<Filter>,  // Client filter, compiled at start
 }
 
-#[allow(dead_code)]
-enum MatchAnswer {
-    Ok(bool),
-    Box(Vec<u8>),
-    Err(String),
+/// A compiled filter: a regex matched against the header of a package (its first `limit`
+/// bytes, cut at the first `until`), with an optional replacement of that header.
+/// Built once at start; each worker owns a clone, so no regex is cloned per package.
+#[derive(Clone)]
+struct Filter {
+    regex: Regex,
+    until: Option<memchr::memmem::Finder<'static>>,
+    limit: usize, // 0: no limit
+    replace: Option<Vec<u8>>,
+}
+
+impl Filter {
+    fn new(
+        pattern: &str,
+        until: Option<&str>,
+        limit: Option<usize>,
+        replace: Option<&str>,
+    ) -> Result<Filter, String> {
+        let regex = Regex::new(pattern).map_err(|e| e.to_string())?;
+        Ok(Filter {
+            regex,
+            until: until
+                .filter(|u| !u.is_empty())
+                .map(|u| memchr::memmem::Finder::new(u.as_bytes()).into_owned()),
+            limit: limit.unwrap_or(0),
+            replace: replace.map(|r| r.as_bytes().to_vec()),
+        })
+    }
+
+    /// None if the package does not match; otherwise the package to send, borrowed unless
+    /// the replacement changed it
+    fn apply<'a>(&self, data: &'a [u8]) -> Option<Cow<'a, [u8]>> {
+        // Limit counts bytes: it may cut a multibyte character, which is harmless
+        let slice = if self.limit > 0 {
+            &data[..cmp::min(self.limit, data.len())]
+        } else {
+            data
+        };
+        let haystack = match self.until.as_ref().and_then(|f| f.find(slice)) {
+            Some(idx) => &slice[..idx],
+            None => slice,
+        };
+        if !self.regex.is_match(haystack) {
+            return None;
+        }
+        match &self.replace {
+            None => Some(Cow::Borrowed(data)),
+            Some(r) => {
+                let replaced = self.regex.replace(haystack, r.as_slice());
+                Some(Cow::Owned(
+                    [&replaced[..], &data[haystack.len()..]].concat(),
+                ))
+            }
+        }
+    }
+}
+
+/// The root filter and one optional filter per client, in configuration order
+#[derive(Clone)]
+struct Filters {
+    root: Option<Filter>,
+    clients: Vec<Option<Filter>>,
+}
+
+/// Compile every filter of a configuration
+fn build_filters(config: &Config) -> Result<Filters, String> {
+    let root = match &config.filter {
+        Some(f) => Some(
+            Filter::new(
+                f,
+                config.filter_until.as_deref(),
+                config.filter_limit,
+                config.filter_replace.as_deref(),
+            )
+            .map_err(|e| format!("Filter Regex '{}' doesn't compile: {}", f, e))?,
+        ),
+        None => None,
+    };
+    let mut clients = Vec::new();
+    for client in &config.clients {
+        clients.push(match &client.filter {
+            Some(f) => Some(
+                Filter::new(
+                    f,
+                    client.filter_until.as_deref(),
+                    client.filter_limit,
+                    client.filter_replace.as_deref(),
+                )
+                .map_err(|e| {
+                    format!(
+                        "Client '{}' has a filter Regex '{}' that doesn't compile: {}",
+                        client.name, f, e
+                    )
+                })?,
+            ),
+            None => None,
+        });
+    }
+    Ok(Filters { root, clients })
 }
 
 /// Keep track of statistics per child
@@ -311,31 +406,8 @@ fn main() {
 
                 // If not error until here
                 if !error {
-                    // Render main filter regex
-                    let filter_regex: Option<Regex>;
-                    let regex_str: &str;
-                    if let Some(r) = inconfig.filter.clone() {
-                        regex_str = &r;
-                        let filter_temp = Regex::new(&regex_str);
-                        match filter_temp {
-                            Ok(f) => filter_regex = Some(f),
-                            Err(e) => {
-                                print_debug!(
-                                    PROGRAM_NAME,
-                                    stderr(),
-                                    COLOR_RED,
-                                    0,
-                                    "Filter Regex '{}' doesn't compile: {}",
-                                    r,
-                                    e
-                                );
-                                filter_regex = None;
-                                error = true;
-                            }
-                        }
-                    } else {
-                        filter_regex = None;
-                    }
+                    // Compile filters once (verify_config already checked that they compile)
+                    let filters = build_filters(&inconfig).expect("filters checked at start");
 
                     // Render main ordering regex
                     let ordering_regex: Option<Regex>;
@@ -444,7 +516,8 @@ fn main() {
                             let tx = children_tx.clone();
                             let qtx = queue_tx.clone();
                             let child_config = inconfig.clone();
-                            let fr = filter_regex.clone();
+                            // Each child owns its compiled filters (one regex cache per thread)
+                            let fr = filters.clone();
                             let or = ordering_regex.clone();
                             let handle = thread::spawn(move || {
                                 child(
@@ -1058,6 +1131,9 @@ fn verify_config(config: Config) -> Result<Config, String> {
         ));
     }
 
+    // Every filter must compile: a bad client regex used to panic the workers (M1F-8)
+    build_filters(&config)?;
+
     return Ok(config);
 }
 
@@ -1283,7 +1359,7 @@ fn child(
     qtx: Sender<(u16, Option<u128>, Option<Vec<u8>>)>,
     qrx: &Receiver<Vec<Vec<u8>>>,
     config: Config,
-    filter_regex: Option<Regex>,
+    filters: Filters,
 ) {
     #[cfg(feature = "debug")]
     print_debug!(
@@ -1341,7 +1417,7 @@ fn child(
 
                 // Connect to targets
                 let mut clients: Vec<RedisLink> = Vec::new();
-                for client in &config.clients {
+                for (client, filter) in config.clients.iter().zip(&filters.clients) {
                     match redis_connect(
                         id,
                         client.ssl,
@@ -1350,24 +1426,14 @@ fn child(
                         client.password.clone(),
                         true,
                     ) {
-                        Ok(link) => {
-                            let regex: Option<Regex>;
-                            let regex_str: &str;
-                            if let Some(r) = client.filter.clone() {
-                                regex_str = &r;
-                                regex = Some(Regex::new(&regex_str).unwrap());
-                            } else {
-                                regex = None;
-                            }
-                            clients.push(RedisLink {
-                                config: client.clone(),
-                                link: link,
-                                sleeping_from: 0,
-                                packages: 0,
-                                lastcheck: 0,
-                                regex: regex,
-                            })
-                        }
+                        Ok(link) => clients.push(RedisLink {
+                            config: client.clone(),
+                            link: link,
+                            sleeping_from: 0,
+                            packages: 0,
+                            lastcheck: 0,
+                            filter: filter.clone(),
+                        }),
                         Err(e) => {
                             print_debug!(
                                 PROGRAM_NAME,
@@ -1436,7 +1502,7 @@ fn child(
                                         ordering_limit,
                                         &qtx,
                                         &qrx,
-                                        &filter_regex,
+                                        &filters.root,
                                         &config,
                                         &mut clients,
                                         None,
@@ -1477,7 +1543,7 @@ fn child(
                                             ordering_limit,
                                             &qtx,
                                             &qrx,
-                                            &filter_regex,
+                                            &filters.root,
                                             &config,
                                             &mut clients,
                                             Some(raw_bdata),
@@ -1544,7 +1610,7 @@ fn child(
                                 ordering_limit,
                                 &qtx,
                                 &qrx,
-                                &filter_regex,
+                                &filters.root,
                                 &config,
                                 &mut clients,
                                 None,
@@ -1722,8 +1788,8 @@ fn blpop_cmd(channel: &str) -> redis::Cmd {
 }
 
 fn send_to_client(client: &mut RedisLink, data: &[u8]) -> Result<bool, String> {
-    // Preparre channels
-    let channel = client.config.channel.clone();
+    // Borrowed: config and link are distinct fields
+    let channel = &client.config.channel;
 
     #[cfg(feature = "debug")]
     print_debug!(
@@ -1736,7 +1802,7 @@ fn send_to_client(client: &mut RedisLink, data: &[u8]) -> Result<bool, String> {
         channel
     );
 
-    let result: redis::RedisResult<i32> = client.link.rpush(&channel, data);
+    let result: redis::RedisResult<i32> = client.link.rpush(channel, data);
     match result {
         Ok(_) => return Ok(true),
         Err(e) => return Err(format!("couldn't push to channel: {}", e)),
@@ -1980,95 +2046,27 @@ fn send(
     dirty_bdata: &[u8],
     deleted: &mut u64,
 ) -> Result<bool, String> {
-    match match_filter(
-        client.regex.clone(),
-        client.config.filter_until.clone(),
-        client.config.filter_limit,
-        client.config.filter_replace.clone(),
-        dirty_bdata.to_vec(),
-    ) {
-        MatchAnswer::Ok(true) => {
-            return Err(
-                "Programing Error: Unexpected answer from match_filter() at send()".to_string(),
-            )
-        }
-        MatchAnswer::Ok(false) => return Ok(false),
-        MatchAnswer::Box(bdata) => {
-            // If we can send to this queue
-            match can_send(id, client, deleted) {
-                // Allowed to send
-                Ok(true) => {
-                    // Try to send to this client
-                    match send_to_client(client, &bdata) {
-                        Ok(true) => return Ok(true),
-                        Ok(false) => return Ok(false),
-                        Err(e) => return Err(format!("error while sending to the client: {}", e)),
-                    }
-                }
+    let bdata = match &client.filter {
+        Some(f) => match f.apply(dirty_bdata) {
+            Some(b) => b,
+            None => return Ok(false),
+        },
+        None => Cow::Borrowed(dirty_bdata),
+    };
+    // If we can send to this queue
+    match can_send(id, client, deleted) {
+        // Allowed to send
+        Ok(true) => match send_to_client(client, &bdata) {
+            Ok(true) => Ok(true),
+            Ok(false) => Ok(false),
+            Err(e) => Err(format!("error while sending to the client: {}", e)),
+        },
 
-                // Not allowed to send
-                Ok(false) => return Ok(false),
+        // Not allowed to send
+        Ok(false) => Ok(false),
 
-                // There was an error
-                Err(e) => return Err(format!("error while checking queue: {}", e)),
-            }
-        }
-        MatchAnswer::Err(e) => return Err(format!("couldn't match the package: {}", e)),
-    }
-}
-
-fn match_filter(
-    regex: Option<Regex>,
-    until: Option<String>,
-    limit: Option<usize>,
-    replace: Option<String>,
-    bdata: Vec<u8>,
-) -> MatchAnswer {
-    if let Some(re) = regex {
-        // Find by limit (a byte count: it may cut a multibyte character, which is harmless)
-        let slice: &[u8];
-        if let Some(l) = limit {
-            if l > 0 {
-                slice = &bdata[..cmp::min(l, bdata.len())];
-            } else {
-                slice = &bdata;
-            }
-        } else {
-            slice = &bdata;
-        }
-
-        // Find by until
-        let haystack: &[u8];
-        if let Some(u) = until {
-            if u.len() > 0 {
-                if let Some(idx) = memchr::memmem::find(slice, u.as_bytes()) {
-                    haystack = &slice[..idx];
-                } else {
-                    haystack = &slice;
-                }
-            } else {
-                haystack = &slice;
-            }
-        } else {
-            haystack = &slice;
-        }
-
-        // Check if they match
-        if re.is_match(haystack) {
-            if let Some(r) = replace {
-                let replaced = re.replace(haystack, r.as_bytes());
-                let newbdata = [&replaced[..], &bdata[haystack.len()..]].concat();
-                return MatchAnswer::Box(newbdata);
-            } else {
-                return MatchAnswer::Box(bdata);
-            }
-        } else {
-            // No match, do not process
-            return MatchAnswer::Ok(false);
-        }
-    } else {
-        // No filter found
-        return MatchAnswer::Box(bdata);
+        // There was an error
+        Err(e) => Err(format!("error while checking queue: {}", e)),
     }
 }
 
@@ -2145,7 +2143,7 @@ fn process_package(
     ordering_limit: Option<usize>,
     qtx: &Sender<(u16, Option<u128>, Option<Vec<u8>>)>,
     qrx: &Receiver<Vec<Vec<u8>>>,
-    filter_regex: &Option<Regex>,
+    root_filter: &Option<Filter>,
     config: &Config,
     clients: &mut Vec<RedisLink>,
     package: Option<Vec<u8>>,
@@ -2222,28 +2220,13 @@ fn process_package(
             let total_clients = clients.len();
             let mut errors = 0;
 
-            match match_filter(
-                filter_regex.clone(),
-                config.filter_until.clone(),
-                config.filter_limit,
-                config.filter_replace.clone(),
-                package,
-            ) {
-                MatchAnswer::Ok(true) => {
-                    #[cfg(feature = "debug")]
-                    print_debug!(
-                        PROGRAM_NAME,
-                        stdout(),
-                        COLOR_CYAN,
-                        0,
-                        "{}: End unexpected process_package()",
-                        id
-                    );
-
-                    return Err("Programing Error: Unexpected answer from match_filter() at process_package()".to_string());
-                }
-                MatchAnswer::Ok(false) => errors = total_clients,
-                MatchAnswer::Box(bdata) => {
+            let filtered = match root_filter {
+                Some(f) => f.apply(&package),
+                None => Some(Cow::Borrowed(&package[..])),
+            };
+            match filtered {
+                None => errors = total_clients,
+                Some(bdata) => {
                     if config.mode == "replicant" {
                         // Send data to all clients
                         for client in clients.iter_mut() {
@@ -2327,15 +2310,6 @@ fn process_package(
                         }
                     }
                 }
-                MatchAnswer::Err(e) => print_debug!(
-                    PROGRAM_NAME,
-                    stderr(),
-                    COLOR_RED,
-                    0,
-                    "{}: Couldn't match the package: {}",
-                    id,
-                    e
-                ),
             }
 
             // If all clients have failed, drop the package and set error
