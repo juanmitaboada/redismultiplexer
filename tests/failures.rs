@@ -251,7 +251,57 @@ fn push_after_the_signal(test: &str, cell: Cell) {
     }
 }
 
+/// A target that is not refused but never answers, in the two places a thread can wait
+/// for it: the connect (`blackhole`: SYNs dropped, as behind a firewall that drops) and the
+/// reply (`silent`: the connection is accepted, nothing ever comes back). The healthy target
+/// still receives every package: the connect gives up after 2 s and a command after 5 s,
+/// then the target waits out its backoff (M3R-12 X1b; until then a thread waited for the
+/// kernel's connect timeout, about 2 min, or for ever).
+fn unanswering_target(test: &str, cell: Cell, port: u16) {
+    let mut ctx = Ctx::new(test);
+    let src = ctx.key("src");
+    let real: Vec<String> = (0..cell.targets())
+        .map(|i| ctx.key(&format!("t{}", i)))
+        .collect();
+    let mut clients: Vec<String> = real
+        .iter()
+        .enumerate()
+        .map(|(i, k)| ctx.client_yaml(&format!("t{}", i), k, ""))
+        .collect();
+    clients.insert(0, ctx.client_yaml_at("mute", "rmtest:mute", port));
+    let n = 200;
+    let input: Vec<String> = (0..n).map(seq_pkg).collect();
+    ctx.push(&src, &input);
+    let cfg = ctx.config(&src, cell.children, cell.mode(), cell.extra(), &clients);
+    let mut p = ctx.spawn(&cfg);
+    ctx.wait_for("every package at the healthy targets", |c| {
+        let got: usize = real.iter().map(|k| c.llen(k)).sum();
+        c.llen(&src) == 0
+            && got
+                == if cell.spreader {
+                    n as usize
+                } else {
+                    n as usize * real.len()
+                }
+    });
+    p.stop(&ctx.pid_file());
+    let lists: Vec<Vec<String>> = real.iter().map(|k| ctx.list(k)).collect();
+    assert_all(cell, &lists, n);
+}
+
+fn blackhole_target(test: &str, cell: Cell) {
+    let hole = blackhole();
+    unanswering_target(test, cell, hole.port);
+}
+
+fn silent_target(test: &str, cell: Cell) {
+    let mute = SilentTarget::start();
+    unanswering_target(test, cell, mute.port);
+}
+
 matrix!(target_closes, target_closes_mid_run, 2);
+matrix!(target_blackhole, blackhole_target, 2);
+matrix!(target_silent, silent_target, 2);
 matrix!(target_unreachable, target_unreachable_from_start, 2);
 matrix!(wrongtype, wrongtype_target, 2);
 matrix!(stop_target_down, stop_with_a_target_down, 4);

@@ -599,6 +599,51 @@ impl SlowTarget {
     }
 }
 
+/// A stand-in target that accepts connections and reads what it is sent but never
+/// answers: a server that hung, or a peer gone silent behind a firewall.
+pub struct SilentTarget {
+    pub port: u16,
+}
+
+impl SilentTarget {
+    pub fn start() -> SilentTarget {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        thread::spawn(move || {
+            for mut stream in listener.incoming().flatten() {
+                thread::spawn(move || {
+                    let mut buf = [0u8; 4096];
+                    while matches!(std::io::Read::read(&mut stream, &mut buf), Ok(n) if n > 0) {}
+                });
+            }
+        });
+        SilentTarget { port }
+    }
+}
+
+/// A local port whose connections hang: its accept queue is full, so the kernel drops
+/// new SYNs as a host behind a firewall that drops packets does (no refusal, no answer).
+pub struct Blackhole {
+    pub port: u16,
+    _listener: TcpListener,
+    _filler: TcpStream,
+}
+
+pub fn blackhole() -> Blackhole {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    // Linux: listen() again sets the backlog; with 0 one pending connection fills it
+    // SAFETY: a valid listening socket owned by `listener`
+    let rc = unsafe { libc::listen(std::os::fd::AsRawFd::as_raw_fd(&listener), 0) };
+    assert_eq!(rc, 0, "listen");
+    let filler = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    Blackhole {
+        port,
+        _listener: listener,
+        _filler: filler,
+    }
+}
+
 /// A local port where nothing listens (connections are refused)
 pub fn closed_port() -> u16 {
     let l = TcpListener::bind("127.0.0.1:0").unwrap();

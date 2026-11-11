@@ -164,7 +164,8 @@ impl Clone for Config {
 struct RedisLink {
     config: ClientConfig,            // Client configuration
     link: Option<redis::Connection>, // None while the target cannot be reached (L3b)
-    retry_at: Option<Instant>,       // no connect attempt before this (at most one a second)
+    retry_at: Option<Instant>,       // no connect attempt before this
+    backoff: Duration,               // wait after the next failure: 1 s, doubling to 5 s
     sleeping_from: u64,              // If queue is stuck, when did it happened
     packages: u64,                   // Packages we have seen from last check
     lastcheck: u64,                  // When was the last check of queue's size (time limit)
@@ -1303,6 +1304,7 @@ fn new_targets(id: u16, config: &Config, filters: &Filters) -> Vec<RedisLink> {
             config: client.clone(),
             link: None,
             retry_at: None,
+            backoff: TARGET_BACKOFF_MIN,
             sleeping_from: 0,
             packages: 0,
             lastcheck: 0,
@@ -1351,18 +1353,34 @@ fn ensure_link(id: u16, client: &mut RedisLink) -> bool {
                 client.config.channel,
                 e
             );
-            client.retry_at = Some(now + Duration::from_secs(1));
+            mark_down(client);
             false
         }
     }
 }
 
-/// After a command error on a target: a broken connection is dropped and reconnected at
-/// most once a second; a server error (wrong type, out of memory) keeps the link
+/// No link until the backoff has passed; the next failure waits twice as long, up to
+/// TARGET_BACKOFF_MAX (plan 2.2). A command that succeeds resets it.
+fn mark_down(client: &mut RedisLink) {
+    client.link = None;
+    client.retry_at = Some(Instant::now() + client.backoff);
+    client.backoff = cmp::min(client.backoff * 2, TARGET_BACKOFF_MAX);
+}
+
+/// A command error that leaves the connection unusable: an I/O error, or a timeout (the
+/// late reply would be read as the answer to the next command)
+fn link_broken(client: &mut RedisLink, e: &redis::RedisError) {
+    if e.is_io_error() || e.is_timeout() || e.is_unrecoverable_error() {
+        mark_down(client);
+    }
+}
+
+/// After a command error on a target: a broken connection is dropped and reconnected after
+/// the backoff (link_broken() did it where the error was seen); a server error (wrong type,
+/// out of memory) keeps the link
 fn target_failed(client: &mut RedisLink) {
     if client.link.as_ref().is_some_and(|l| !l.is_open()) {
-        client.link = None;
-        client.retry_at = Some(Instant::now() + Duration::from_secs(1));
+        mark_down(client);
     }
 }
 
@@ -1788,7 +1806,7 @@ fn redis_connect(
     hostname: String,
     port: u16,
     password: String,
-    _is_client: bool,
+    is_client: bool,
 ) -> Result<redis::Connection, String> {
     // If Redis server needs secure connection
     let mut uri_scheme = "redis";
@@ -1811,7 +1829,7 @@ fn redis_connect(
         }
         let redis_conn_url_debug =
             format!("{}://:{}@{}:{}", uri_scheme, password_debug, hostname, port);
-        if _is_client {
+        if is_client {
             print_debug!(
                 PROGRAM_NAME,
                 stdout(),
@@ -1834,13 +1852,22 @@ fn redis_connect(
         }
     }
 
-    match redis::Client::open(redis_conn_url)
-        .expect("Invalid connection URL")
-        .get_connection()
-    {
-        Ok(c) => return Ok(c),
-        Err(e) => return Err(format!("Couldn't connect to Redis Server: {}", e)),
+    let client = redis::Client::open(redis_conn_url).expect("Invalid connection URL");
+    if !is_client {
+        return client
+            .get_connection()
+            .map_err(|e| format!("Couldn't connect to Redis Server: {}", e));
     }
+    // A target that drops packets instead of refusing would hold the thread for the
+    // kernel's connect timeout (about 2 min), and one that stops answering would hold it
+    // for ever: bounded here, so the other targets keep receiving (M3R-12 X1b)
+    let link = client
+        .get_connection_with_timeout(TARGET_CONNECT_TIMEOUT)
+        .map_err(|e| format!("Couldn't connect to Redis Server: {}", e))?;
+    link.set_read_timeout(Some(TARGET_IO_TIMEOUT))
+        .and_then(|_| link.set_write_timeout(Some(TARGET_IO_TIMEOUT)))
+        .map_err(|e| format!("Couldn't set the timeouts: {}", e))?;
+    Ok(link)
 }
 
 /// BLPOP with a one second timeout, sent as an integer as redis 0.19 did:
@@ -1873,8 +1900,14 @@ fn send_to_client(client: &mut RedisLink, data: &[u8]) -> Result<bool, String> {
         .req_packed_command(&client.request)
         .and_then(|v| v.extract_error())
     {
-        Ok(_) => Ok(true),
-        Err(e) => Err(format!("couldn't push to channel: {}", e)),
+        Ok(_) => {
+            client.backoff = TARGET_BACKOFF_MIN;
+            Ok(true)
+        }
+        Err(e) => {
+            link_broken(client, &e);
+            Err(format!("couldn't push to channel: {}", e))
+        }
     }
 }
 
@@ -2039,17 +2072,23 @@ fn can_send(id: u16, client: &mut RedisLink, deleted: &mut u64) -> Result<bool, 
                                             client.config.deleteblock.unwrap() as isize,
                                             MAX_QUEUE_SIZE,
                                         );
-                                    match result{
+                                    match result {
                                         Ok(_) => *deleted += client.config.deleteblock.unwrap(),
-                                        Err(e) => return Err(format!("error in deleteblock while deleting block with {} elements: {}", client.config.deleteblock.unwrap(), e)),
+                                        Err(e) => {
+                                            link_broken(client, &e);
+                                            return Err(format!("error in deleteblock while deleting block with {} elements: {}", client.config.deleteblock.unwrap(), e));
+                                        }
                                     }
 
                                     // Read len again
                                     let result: redis::RedisResult<i32> =
                                         link(&mut client.link)?.llen(&client.config.channel);
-                                    match result{
+                                    match result {
                                         Ok(len) => actual_len = len as u64,
-                                        Err(e) => return Err(format!("error in deleteblock while requesting the length to the channel: {}", e)),
+                                        Err(e) => {
+                                            link_broken(client, &e);
+                                            return Err(format!("error in deleteblock while requesting the length to the channel: {}", e));
+                                        }
                                     }
                                 }
                             }
@@ -2086,7 +2125,10 @@ fn can_send(id: u16, client: &mut RedisLink, deleted: &mut u64) -> Result<bool, 
                 // If not stuck, can keep sending
                 return Ok(client.sleeping_from == 0);
             }
-            Err(e) => return Err(format!("error requesting the length to the channel: {}", e)),
+            Err(e) => {
+                link_broken(client, &e);
+                return Err(format!("error requesting the length to the channel: {}", e));
+            }
         };
     } else {
         // Count down packages
