@@ -41,9 +41,14 @@ fn status_counts(test: &str, cell: Cell) {
         c.llen(&src) == 0 && got == 1000
     });
     let status = ctx.dir.join("rm.status");
-    // Written every 10 s from the start
-    ctx.wait_for("status file", |_| status.exists());
-    let first = totals(&std::fs::read_to_string(&status).unwrap());
+    // Written every 10 s from the start. The write is not atomic (truncate, then write;
+    // atomic is stage 4, M3-e): wait for a complete one, not just for the file
+    let mut json = String::new();
+    ctx.wait_for("a complete status file", |_| {
+        json = std::fs::read_to_string(&status).unwrap_or_default();
+        json.trim_end().ends_with('}') && json.contains("\"total_drop\":")
+    });
+    let first = totals(&json);
     p.stop(&ctx.pid_file());
     let last = totals(&std::fs::read_to_string(&status).unwrap());
     let sum = [0, 1, 2].map(|i| first[i] + last[i]);
