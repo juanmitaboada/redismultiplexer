@@ -192,10 +192,70 @@ fn stop_with_a_target_down(test: &str, cell: Cell) {
     stop_under_load_cell(test, cell, true, Duration::from_millis(300), "INT");
 }
 
+/// After the signal, packages keep arriving while the workers may still be inside a BLPOP
+/// of up to 1 s: whatever a worker pops then must still be delivered (the sender flushes
+/// only after every worker has left, M3R-15) or stay in the source. Before the fix a sender
+/// told to finish before the workers were joined lost such packages.
+fn push_after_the_signal(test: &str, cell: Cell) {
+    let mut ctx = Ctx::new(test);
+    let src = ctx.key("src");
+    let real: Vec<String> = (0..cell.targets())
+        .map(|i| ctx.key(&format!("t{}", i)))
+        .collect();
+    let clients: Vec<String> = real
+        .iter()
+        .enumerate()
+        .map(|(i, k)| ctx.client_yaml(&format!("t{}", i), k, ""))
+        .collect();
+    let cfg = ctx.config(&src, cell.children, cell.mode(), cell.extra(), &clients);
+    let mut next = 0u64;
+    // Two runs: each must account for every package
+    for _ in 0..2 {
+        let mut p = ctx.spawn(&cfg);
+        ctx.push(&src, &[seq_pkg(next)]);
+        next += 1;
+        ctx.wait_for("first package delivered", |c| {
+            real.iter().map(|k| c.llen(k)).sum::<usize>() == next as usize
+        });
+        // Idle now: every worker waits in a BLPOP
+        p.signal("INT");
+        let until = Instant::now() + Duration::from_millis(1200);
+        while Instant::now() < until {
+            ctx.push(&src, &[seq_pkg(next)]);
+            next += 1;
+            thread::sleep(Duration::from_millis(20));
+        }
+        let st = p.wait_exit();
+        assert!(st.success(), "exit status {:?}", st);
+        // What is left in the source goes to the next run
+        let left: Vec<String> = ctx.list(&src);
+        let delivered: Vec<String> = real.iter().flat_map(|k| ctx.list(k)).collect();
+        assert_eq!(
+            delivered.len() + left.len(),
+            next as usize,
+            "delivered {} + left {} != pushed {}",
+            delivered.len(),
+            left.len(),
+            next
+        );
+        let mut all: Vec<String> = delivered.into_iter().chain(left).collect();
+        all.sort();
+        all.dedup();
+        assert_eq!(all.len(), next as usize, "a package delivered twice");
+        // Start the next run from an empty source: move what is left into a target
+        let rest = ctx.list(&src);
+        if !rest.is_empty() {
+            ctx.ltrim(&src, 1, 0);
+            ctx.push(&real[0], &rest);
+        }
+    }
+}
+
 matrix!(target_closes, target_closes_mid_run, 2);
 matrix!(target_unreachable, target_unreachable_from_start, 2);
 matrix!(wrongtype, wrongtype_target, 2);
 matrix!(stop_target_down, stop_with_a_target_down, 4);
+matrix!(after_signal, push_after_the_signal, 2);
 
 /// With ordering, what the stop flushes towards targets that cannot be reached is counted
 /// as dropped and reaches the status file in the last write, after the stop; the program
