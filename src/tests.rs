@@ -938,3 +938,41 @@ fn verify_accepts_empty_client_name_current_behaviour() {
     c.clients[0].name = String::new();
     assert!(verify_config(c).is_ok());
 }
+
+#[test]
+fn each_child_reads_only_its_own_queuer_answers_and_stop_order() {
+    // M2R-2, M3R-9: a child that reads another child's answers works until the stop, then
+    // hangs or loses its last packages. Deterministic: fails on every run if the pairing
+    // between links() and answer_child() is wrong.
+    for n in [1u16, 2, 3, 8] {
+        let l = links(n);
+        assert_eq!(
+            (l.answers.len(), l.stops.len(), l.children.len()),
+            (n as usize, n as usize, n as usize)
+        );
+        for id in 0..n {
+            answer_child(&l.answers, id, vec![id.to_be_bytes().to_vec()]);
+            l.stops[id as usize].send(id % 2 == 0).unwrap();
+        }
+        for (k, (id, answers, stop)) in l.children.iter().enumerate() {
+            assert_eq!(*id as usize, k, "children are listed in id order");
+            assert_eq!(
+                answers.try_recv().unwrap(),
+                vec![id.to_be_bytes().to_vec()],
+                "answers of child {}",
+                id
+            );
+            assert!(
+                answers.try_recv().is_err(),
+                "child {} got another child's answer",
+                id
+            );
+            assert_eq!(
+                stop.try_recv().unwrap(),
+                id % 2 == 0,
+                "stop order of child {}",
+                id
+            );
+        }
+    }
+}

@@ -499,25 +499,11 @@ fn main() {
                             mpsc::channel();
                         let (children_tx, children_rx): (Sender<Statistics>, Receiver<Statistics>) =
                             mpsc::channel();
-                        let mut keepworkings: Vec<Sender<bool>> = Vec::new();
-                        let mut queues_channels: Vec<Sender<Vec<Vec<u8>>>> = Vec::new();
-                        let mut children_channels: Vec<(Receiver<Vec<Vec<u8>>>, Receiver<bool>)> =
-                            Vec::new();
-                        for _ in 0..inconfig.children {
-                            // Create queue channels for every child
-                            let (qtx, qrx): (Sender<Vec<Vec<u8>>>, Receiver<Vec<Vec<u8>>>) =
-                                mpsc::channel();
-
-                            // Create channels for every child
-                            let (tx, rx): (Sender<bool>, Receiver<bool>) = mpsc::channel();
-
-                            // Save channel information
-                            children_channels.push((qrx, rx));
-
-                            // Remember the channel so we can talk later with the child
-                            queues_channels.push(qtx);
-                            keepworkings.push(tx);
-                        }
+                        let Links {
+                            answers: queues_channels,
+                            stops: keepworkings,
+                            children: children_channels,
+                        } = links(inconfig.children);
 
                         // Prepare list of handles
                         let mut handles: Vec<thread::JoinHandle<_>> = Vec::new();
@@ -539,12 +525,9 @@ fn main() {
                             )
                         });
 
-                        // Spawn a number of threads and collect their join handles
-                        for id in 0..inconfig.children {
-                            // Get channel for the child
-                            // Take channels in creation order: the queuer answers child id on queues_channels[id]
-                            let (qrx, rx) = children_channels.remove(0);
-
+                        // Spawn a number of threads and collect their join handles; each child
+                        // gets the ends paired with its id by links()
+                        for (id, qrx, rx) in children_channels {
                             // Clone config and execute thread
                             let tx = children_tx.clone();
                             let qtx = queue_tx.clone();
@@ -1378,7 +1361,7 @@ fn queuer(
                 );
 
                 // Answer to the child
-                children_tx[id as usize].send(list).unwrap();
+                answer_child(&children_tx, id, list);
 
                 // Send the size of the queue
                 stat_tx.send(Some(ordered_packages.len())).unwrap();
@@ -1396,6 +1379,36 @@ fn queuer(
 
     #[cfg(feature = "debug")]
     print_debug!(PROGRAM_NAME, stdout(), COLOR_BLUE, 0, "Queue: Ends");
+}
+
+/// Channel ends between main, the queuer and the children. The queuer answers child `id` on
+/// `answers[id]` and main stops it on `stops[id]`; `children` yields each child id with the
+/// receiving ends of those same channels, so a child reads only its own answers (M2R-2)
+struct Links {
+    answers: Vec<Sender<Vec<Vec<u8>>>>,
+    stops: Vec<Sender<bool>>,
+    children: Vec<(u16, Receiver<Vec<Vec<u8>>>, Receiver<bool>)>,
+}
+
+fn links(children: u16) -> Links {
+    let mut links = Links {
+        answers: Vec::new(),
+        stops: Vec::new(),
+        children: Vec::new(),
+    };
+    for id in 0..children {
+        let (qtx, qrx) = mpsc::channel();
+        let (tx, rx) = mpsc::channel();
+        links.answers.push(qtx);
+        links.stops.push(tx);
+        links.children.push((id, qrx, rx));
+    }
+    links
+}
+
+/// The queuer's answer to the request of child `id`
+fn answer_child(answers: &[Sender<Vec<Vec<u8>>>], id: u16, list: Vec<Vec<u8>>) {
+    answers[id as usize].send(list).unwrap();
 }
 
 /// Manage the full process from a child
