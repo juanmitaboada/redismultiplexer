@@ -51,7 +51,7 @@ use std::time::{Duration, Instant};
 use std::{cmp::Reverse, collections::BinaryHeap};
 
 // use std::env;
-use redis::Commands;
+use redis::{Commands, ConnectionLike};
 use std::fs;
 use std::path::Path;
 
@@ -168,6 +168,7 @@ struct RedisLink {
     packages: u64,           // Packages we have seen from last check
     lastcheck: u64,          // When was the last check of queue's size (time limit)
     filter: Option<Filter>,  // Client filter, compiled at start
+    request: Vec<u8>,        // RPUSH request buffer, reused for every package
 }
 
 /// A compiled filter: a regex matched against the header of a package (its first `limit`
@@ -1455,6 +1456,7 @@ fn connect_targets(id: u16, config: &Config, filters: &Filters) -> Result<Vec<Re
             packages: 0,
             lastcheck: 0,
             filter: filter.clone(),
+            request: Vec::new(),
         });
     }
     Ok(clients)
@@ -1531,6 +1533,8 @@ fn child(
                     let mut dropped: u64 = 0;
                     let mut deleted: u64 = 0;
                     let mut cursor: usize = 0; // spreader: next target to try
+                                               // The BLPOP request never changes: encoded once per connection (M3-o)
+                    let blpop = blpop_cmd(&config.channel).get_packed_command();
                     let mut lasttime = get_current_time();
                     while keepworking {
                         // Check if we should save statistics
@@ -1555,8 +1559,9 @@ fn child(
                         // Check if we got requested to finish
                         if !request_finish {
                             // Get a new package
-                            let item: redis::RedisResult<redis::Value> =
-                                blpop_cmd(&config.channel).query(&mut source);
+                            let item: redis::RedisResult<redis::Value> = source
+                                .req_packed_command(&blpop)
+                                .and_then(|v| v.extract_error());
                             match item {
                                 Ok(redis::Value::Nil) => {
                                     // Nothing came: refresh the targets' limits state
@@ -1817,11 +1822,30 @@ fn send_to_client(client: &mut RedisLink, data: &[u8]) -> Result<bool, String> {
         channel
     );
 
-    let result: redis::RedisResult<i32> = client.link.rpush(channel, data);
-    match result {
-        Ok(_) => return Ok(true),
-        Err(e) => return Err(format!("couldn't push to channel: {}", e)),
-    };
+    // Encoded into the target's reused buffer and sent as is (M3-o): no command object, no
+    // allocation and one copy of the payload; the crate still reads and checks the reply
+    pack_rpush(&mut client.request, channel.as_bytes(), data);
+    match client
+        .link
+        .req_packed_command(&client.request)
+        .and_then(|v| v.extract_error())
+    {
+        Ok(_) => Ok(true),
+        Err(e) => Err(format!("couldn't push to channel: {}", e)),
+    }
+}
+
+/// `RPUSH key value` in RESP, written into `buf` (cleared first): the bytes the crate's
+/// command builder produces, without building a command
+fn pack_rpush(buf: &mut Vec<u8>, key: &[u8], value: &[u8]) {
+    buf.clear();
+    buf.extend_from_slice(b"*3\r\n$5\r\nRPUSH\r\n");
+    for arg in [key, value] {
+        // Writing into a Vec cannot fail
+        let _ = write!(buf, "${}\r\n", arg.len());
+        buf.extend_from_slice(arg);
+        buf.extend_from_slice(b"\r\n");
+    }
 }
 
 fn can_check_queue(

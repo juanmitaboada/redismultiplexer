@@ -1215,3 +1215,33 @@ fn held_packages_compare_by_ts_then_arrival_order() {
     assert!(a == b);
     assert!(a != c && a < c);
 }
+
+// --- request encoding (M3-o) ---
+
+#[test]
+fn rpush_is_packed_byte_for_byte_as_the_crate_packs_it() {
+    let mut buf = Vec::new();
+    let mut cases = 0;
+    let keys: [&[u8]; 4] = [
+        b"q",
+        b"rmtest:a:b:t0",
+        "clave-\u{e9}".as_bytes(),
+        &[0, 255, b'\r', b'\n'],
+    ];
+    for key in keys {
+        for len in [0usize, 1, 9, 10, 99, 100, 255, 1000, 65536] {
+            let value: Vec<u8> = (0..len).map(|i| (i * 7 + len) as u8).collect();
+            pack_rpush(&mut buf, key, &value);
+            let want = redis::cmd("RPUSH")
+                .arg(key)
+                .arg(&value[..])
+                .get_packed_command();
+            assert_eq!(buf, want, "key {:?} len {}", key, len);
+            cases += 1;
+        }
+    }
+    // The buffer is reused: a shorter request after a longer one leaves nothing behind
+    pack_rpush(&mut buf, b"k", b"v");
+    assert_eq!(buf, b"*3\r\n$5\r\nRPUSH\r\n$1\r\nk\r\n$1\r\nv\r\n");
+    assert_eq!(cases, 36);
+}
