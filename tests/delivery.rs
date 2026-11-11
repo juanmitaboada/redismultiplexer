@@ -1,95 +1,62 @@
-//! Statistics and a failing target on the delivery paths (stage 3: workers deliver
-//! directly, ordered packages go through the sender).
+//! Statistics on the delivery paths (stage 3: workers deliver directly, ordered packages go
+//! through the sender). Failing targets are in failures.rs.
 
 mod common;
 
 use common::*;
 
-/// The status file's counts of the first 10 s interval account for every package, with the
-/// workers' and the sender's counters summed by main (per-worker atomic statistics).
-fn status_counts(test: &str, ordering: bool) {
+/// `total_*` of one status file write
+fn totals(json: &str) -> [u64; 3] {
+    ["total_in", "total_out", "total_drop"].map(|key| {
+        let at = json.find(&format!("\"{}\":", key)).expect(key) + key.len() + 3;
+        json[at..]
+            .split(|c: char| !c.is_ascii_digit())
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap()
+    })
+}
+
+/// The status file accounts for every package, with the workers' and the sender's
+/// counters summed by main (per-worker atomic statistics): the periodic write after 10 s
+/// plus the last write, made after the stop (M3R-12), hold every package once.
+fn status_counts(test: &str, cell: Cell) {
     let mut ctx = Ctx::new(test);
     let src = ctx.key("src");
-    let t0 = ctx.key("t0");
+    let real: Vec<String> = (0..cell.targets())
+        .map(|i| ctx.key(&format!("t{}", i)))
+        .collect();
+    let clients: Vec<String> = real
+        .iter()
+        .enumerate()
+        .map(|(i, k)| ctx.client_yaml(&format!("t{}", i), k, ""))
+        .collect();
     let input: Vec<String> = (0..1000).map(seq_pkg).collect();
     ctx.push(&src, &input);
-    let extra = if ordering { ORDERING_1S } else { "" };
-    let cfg = ctx.config(
-        &src,
-        2,
-        "replicant",
-        extra,
-        &[ctx.client_yaml("t0", &t0, "")],
-    );
+    let cfg = ctx.config(&src, cell.children, cell.mode(), cell.extra(), &clients);
     let mut p = ctx.spawn(&cfg);
-    ctx.wait_drained(&src, &[(&t0, 1000)]);
+    ctx.wait_for("every package delivered", |c| {
+        let got: usize = real.iter().map(|k| c.llen(k)).sum();
+        c.llen(&src) == 0 && got == 1000
+    });
     let status = ctx.dir.join("rm.status");
     // Written every 10 s from the start
     ctx.wait_for("status file", |_| status.exists());
+    let first = totals(&std::fs::read_to_string(&status).unwrap());
     p.stop(&ctx.pid_file());
-    let json = std::fs::read_to_string(&status).unwrap();
-    for (key, want) in [("total_in", 1000), ("total_out", 1000), ("total_drop", 0)] {
-        assert!(
-            json.contains(&format!("\"{}\":{}", key, want)),
-            "{} != {} in {}",
-            key,
-            want,
-            json
-        );
-    }
-    if ordering {
+    let last = totals(&std::fs::read_to_string(&status).unwrap());
+    let sum = [0, 1, 2].map(|i| first[i] + last[i]);
+    assert_eq!(
+        sum,
+        [1000, 1000, 0],
+        "in, out, drop: {:?} + {:?}",
+        first,
+        last
+    );
+    if cell.ordering {
         assert!(p.stdout().contains("Queue: 0 regs"), "{}", p.stdout());
     }
 }
 
-#[test]
-fn status_file_counts_every_package() {
-    status_counts("status_counts", false);
-}
-
-#[test]
-fn status_file_counts_every_package_with_ordering() {
-    status_counts("status_counts_o", true);
-}
-
-/// A target whose key is not a list answers every command with an error: the other target
-/// still gets every package, from the workers and from the sender.
-fn failing_target(test: &str, ordering: bool) {
-    let mut ctx = Ctx::new(test);
-    let src = ctx.key("src");
-    let t0 = ctx.key("t0");
-    let bad = ctx.key("bad");
-    let _: () = ctx.cmd(&["SET", &bad, "not a list"]);
-    let input: Vec<String> = (0..200).map(seq_pkg).collect();
-    ctx.push(&src, &input);
-    let extra = if ordering { ORDERING_1S } else { "" };
-    let cfg = ctx.config(
-        &src,
-        2,
-        "replicant",
-        extra,
-        &[
-            ctx.client_yaml("t0", &t0, ""),
-            ctx.client_yaml("bad", &bad, ""),
-        ],
-    );
-    let mut p = ctx.spawn(&cfg);
-    ctx.wait_drained(&src, &[(&t0, 200)]);
-    p.stop(&ctx.pid_file());
-    let mut got = ctx.list(&t0);
-    got.sort();
-    let mut want = input.clone();
-    want.sort();
-    assert_eq!(got, want);
-    assert!(p.stderr().contains("WRONGTYPE"), "{}", p.stderr());
-}
-
-#[test]
-fn failing_target_does_not_stop_the_other() {
-    failing_target("failing_target", false);
-}
-
-#[test]
-fn failing_target_does_not_stop_the_other_with_ordering() {
-    failing_target("failing_target_o", true);
-}
+matrix!(status_file_counts_every_package, status_counts, 2);

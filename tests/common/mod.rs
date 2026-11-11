@@ -440,17 +440,40 @@ pub fn stop_under_load_with(
     run_for: Duration,
     sig: &str,
 ) -> StopRun {
+    let cell = Cell {
+        ordering,
+        spreader: false,
+        children,
+    };
+    stop_under_load_cell(test, cell, false, run_for, sig)
+}
+
+/// Stop under load for a matrix cell. Replicant delivers to one target, spreader to two
+/// (every package must be on exactly one of them). With `target_down` one more target is
+/// configured on a port that refuses connections the whole run (M3R-12): it never takes
+/// anything and must not keep the others from receiving or the stop from accounting.
+pub fn stop_under_load_cell(
+    test: &str,
+    cell: Cell,
+    target_down: bool,
+    run_for: Duration,
+    sig: &str,
+) -> StopRun {
     let mut ctx = Ctx::new(test);
     let src = ctx.key("src");
-    let t0 = ctx.key("t0");
-    let extra = if ordering { ORDERING_1S } else { "" };
-    let cfg = ctx.config(
-        &src,
-        children,
-        "replicant",
-        extra,
-        &[ctx.client_yaml("t0", &t0, "")],
-    );
+    let real: Vec<String> = (0..cell.targets())
+        .map(|i| ctx.key(&format!("t{}", i)))
+        .collect();
+    let mut clients: Vec<String> = real
+        .iter()
+        .enumerate()
+        .map(|(i, k)| ctx.client_yaml(&format!("t{}", i), k, ""))
+        .collect();
+    if target_down {
+        clients.push(ctx.client_yaml_at("down", "rmtest:down", closed_port()));
+    }
+    let cfg = ctx.config(&src, cell.children, cell.mode(), cell.extra(), &clients);
+    let t0 = real[0].clone();
     let done = Arc::new(AtomicBool::new(false));
     let producer = {
         let (url, src, done) = (ctx.ep.url.clone(), src.clone(), done.clone());
@@ -475,13 +498,20 @@ pub fn stop_under_load_with(
     };
     ctx.wait_for("source loaded", |c| c.llen(&src) >= 10_000);
     let mut p = ctx.spawn(&cfg);
-    // With ordering the first release comes after one buffer time (whole seconds)
+    // With ordering the first release comes after one buffer time
     ctx.wait_for("first package delivered", |c| c.llen(&t0) > 0);
     thread::sleep(run_for);
     p.stop_with(&ctx.pid_file(), sig);
     done.store(true, Ordering::SeqCst);
     let pushed = producer.join().unwrap();
-    let delivered: Vec<u64> = ctx.list(&t0).iter().map(|s| seq_of(s)).collect();
+    let mut delivered: Vec<u64> = Vec::new();
+    for k in &real {
+        let got: Vec<u64> = ctx.list(k).iter().map(|s| seq_of(s)).collect();
+        if cell.in_order() {
+            assert!(got.windows(2).all(|w| w[0] < w[1]), "{} not in order", k);
+        }
+        delivered.extend(got);
+    }
     let left: Vec<u64> = ctx.list(&src).iter().map(|s| seq_of(s)).collect();
     assert_eq!(
         delivered.len() + left.len(),
@@ -509,36 +539,70 @@ pub fn stop_under_load_with(
 /// reply, and every pushed value is recorded in arrival order across all connections. A
 /// test sets how long a batch takes to deliver, whatever the speed of the machine.
 /// LLEN answers 0 (never over a limit); any other command answers +OK.
+/// close() takes it down for good: the port refuses connections and every open
+/// connection is closed. A request is either recorded and answered before close() or not
+/// recorded at all, so a test knows exactly what reached it.
 pub struct SlowTarget {
     pub port: u16,
-    pushed: Arc<Mutex<Vec<String>>>,
+    shared: Arc<Mutex<SlowState>>,
+}
+
+#[derive(Default)]
+struct SlowState {
+    pushed: Vec<String>,
+    closed: bool,
+    streams: Vec<TcpStream>,
 }
 
 impl SlowTarget {
     pub fn start(delay: Duration) -> SlowTarget {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
-        let pushed = Arc::new(Mutex::new(Vec::new()));
-        let rec = pushed.clone();
-        // The accept thread ends with the test process; each connection thread ends when
-        // the program closes its connection
+        let shared = Arc::new(Mutex::new(SlowState::default()));
+        let st = shared.clone();
+        // The accept thread ends at close() (dropping the listener closes the port) or with
+        // the test process; each connection thread ends when its connection closes
         thread::spawn(move || {
             for stream in listener.incoming().flatten() {
-                let rec = rec.clone();
-                thread::spawn(move || slow_target_serve(stream, delay, rec));
+                let mut g = st.lock().unwrap();
+                if g.closed {
+                    return;
+                }
+                g.streams.push(stream.try_clone().unwrap());
+                drop(g);
+                let st = st.clone();
+                thread::spawn(move || slow_target_serve(stream, delay, st));
             }
         });
-        SlowTarget { port, pushed }
+        SlowTarget { port, shared }
     }
 
     /// Values pushed so far, in arrival order
     pub fn pushed(&self) -> Vec<String> {
-        self.pushed.lock().unwrap().clone()
+        self.shared.lock().unwrap().pushed.clone()
     }
 
     pub fn count(&self) -> usize {
-        self.pushed.lock().unwrap().len()
+        self.shared.lock().unwrap().pushed.len()
     }
+
+    /// Take the target down: open connections are closed and the port refuses new ones
+    pub fn close(&self) {
+        let mut g = self.shared.lock().unwrap();
+        g.closed = true;
+        for s in g.streams.drain(..) {
+            let _ = s.shutdown(std::net::Shutdown::Both);
+        }
+        drop(g);
+        // Wake the accept loop so it sees `closed` and drops the listener
+        let _ = TcpStream::connect(("127.0.0.1", self.port));
+    }
+}
+
+/// A local port where nothing listens (connections are refused)
+pub fn closed_port() -> u16 {
+    let l = TcpListener::bind("127.0.0.1:0").unwrap();
+    l.local_addr().unwrap().port()
 }
 
 /// One RESP request (an array of bulk strings), or None at end of stream
@@ -561,7 +625,7 @@ fn resp_request(r: &mut impl BufRead) -> Option<Vec<Vec<u8>>> {
     Some(args)
 }
 
-fn slow_target_serve(stream: TcpStream, delay: Duration, rec: Arc<Mutex<Vec<String>>>) {
+fn slow_target_serve(stream: TcpStream, delay: Duration, st: Arc<Mutex<SlowState>>) {
     let mut w = stream.try_clone().unwrap();
     let mut r = BufReader::new(stream);
     while let Some(args) = resp_request(&mut r) {
@@ -569,16 +633,22 @@ fn slow_target_serve(stream: TcpStream, delay: Duration, rec: Arc<Mutex<Vec<Stri
             .first()
             .map(|c| String::from_utf8_lossy(c).to_ascii_uppercase())
             .unwrap_or_default();
+        if cmd == "RPUSH" {
+            thread::sleep(delay);
+        }
+        // Recorded and answered under the lock, so close() falls before or after a request
+        let mut g = st.lock().unwrap();
+        if g.closed {
+            return;
+        }
         let reply = match cmd.as_str() {
             "RPUSH" => {
-                thread::sleep(delay);
-                let mut v = rec.lock().unwrap();
-                v.extend(
+                g.pushed.extend(
                     args[2..]
                         .iter()
                         .map(|a| String::from_utf8_lossy(a).into_owned()),
                 );
-                format!(":{}\r\n", v.len())
+                format!(":{}\r\n", g.pushed.len())
             }
             "LLEN" => ":0\r\n".to_string(),
             _ => "+OK\r\n".to_string(),
@@ -587,4 +657,106 @@ fn slow_target_serve(stream: TcpStream, delay: Duration, rec: Arc<Mutex<Vec<Stri
             return;
         }
     }
+}
+
+/// One cell of the test matrix (project rule, M3R-12): ordering on or off, replicant or
+/// spreader, one child or several.
+#[derive(Clone, Copy, Debug)]
+pub struct Cell {
+    pub ordering: bool,
+    pub spreader: bool,
+    pub children: u16,
+}
+
+impl Cell {
+    pub fn mode(&self) -> &'static str {
+        if self.spreader {
+            "spreader"
+        } else {
+            "replicant"
+        }
+    }
+
+    pub fn extra(&self) -> &'static str {
+        if self.ordering {
+            ORDERING_1S
+        } else {
+            ""
+        }
+    }
+
+    /// Healthy targets a matrix test uses: one for replicant, two for spreader
+    pub fn targets(&self) -> usize {
+        if self.spreader {
+            2
+        } else {
+            1
+        }
+    }
+
+    /// Whether each target receives the packages in source order: with ordering (one
+    /// sender, `ts` = push order) or with one child
+    pub fn in_order(&self) -> bool {
+        self.ordering || self.children == 1
+    }
+}
+
+/// Eight #[test] functions, one per cell of the matrix, each calling `$body(name, cell)`
+/// with a test name unique to the cell.
+#[macro_export]
+macro_rules! matrix {
+    ($name:ident, $body:path, $several:expr) => {
+        mod $name {
+            use super::*;
+            fn run(o: bool, s: bool, c: u16) {
+                let tag = format!(
+                    "{}_{}_{}_{}",
+                    stringify!($name),
+                    if o { "on" } else { "off" },
+                    if s { "spr" } else { "rep" },
+                    c
+                );
+                $body(
+                    &tag,
+                    Cell {
+                        ordering: o,
+                        spreader: s,
+                        children: c,
+                    },
+                );
+            }
+            #[test]
+            fn off_replicant_one() {
+                run(false, false, 1)
+            }
+            #[test]
+            fn off_replicant_several() {
+                run(false, false, $several)
+            }
+            #[test]
+            fn off_spreader_one() {
+                run(false, true, 1)
+            }
+            #[test]
+            fn off_spreader_several() {
+                run(false, true, $several)
+            }
+            #[test]
+            fn on_replicant_one() {
+                run(true, false, 1)
+            }
+            #[test]
+            fn on_replicant_several() {
+                run(true, false, $several)
+            }
+            #[test]
+            fn on_spreader_one() {
+                run(true, true, 1)
+            }
+            #[test]
+            fn on_spreader_several() {
+                run(true, true, $several)
+            }
+        }
+    };
 }

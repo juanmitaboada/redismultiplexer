@@ -162,13 +162,14 @@ impl Clone for Config {
 
 /// Keep track of clients we are connected to
 struct RedisLink {
-    config: ClientConfig,    // Client configuration
-    link: redis::Connection, // Client opened link to Redis
-    sleeping_from: u64,      // If queue is stuck, when did it happened
-    packages: u64,           // Packages we have seen from last check
-    lastcheck: u64,          // When was the last check of queue's size (time limit)
-    filter: Option<Filter>,  // Client filter, compiled at start
-    request: Vec<u8>,        // RPUSH request buffer, reused for every package
+    config: ClientConfig,            // Client configuration
+    link: Option<redis::Connection>, // None while the target cannot be reached (L3b)
+    retry_at: Option<Instant>,       // no connect attempt before this (at most one a second)
+    sleeping_from: u64,              // If queue is stuck, when did it happened
+    packages: u64,                   // Packages we have seen from last check
+    lastcheck: u64,                  // When was the last check of queue's size (time limit)
+    filter: Option<Filter>,          // Client filter, compiled at start
+    request: Vec<u8>,                // RPUSH request buffer, reused for every package
 }
 
 /// A compiled filter: a regex matched against the header of a package (its first `limit`
@@ -656,149 +657,13 @@ fn main() {
                                     if (get_current_time_with_ms() - (STATISTICS_SECONDS * 1000))
                                         > lasttime
                                     {
-                                        // Counts of every child since the last report
-                                        let (incoming, outgoing, dropped, deleted) =
-                                            take_counts(&stats);
-
-                                        // Show statistics
-                                        let diff: f64 = ((get_current_time_with_ms() - lasttime)
-                                            as f64)
-                                            / 1000.0;
-                                        print_debug!(
-                                            PROGRAM_NAME,
-                                            stdout(),
-                                            COLOR_BLUE,
-                                            COLOR_NOTAIL,
-                                            "{} - ",
-                                            inconfig.name
-                                        );
-                                        print_debug!(
-                                            PROGRAM_NAME,
-                                            stdout(),
-                                            COLOR_CYAN,
-                                            COLOR_NOHEAD_NOTAIL,
-                                            "Incoming: {:.1} regs/sec",
-                                            (incoming as f64) / diff
-                                        );
-                                        print_debug!(
-                                            PROGRAM_NAME,
-                                            stdout(),
-                                            COLOR_WHITE,
-                                            COLOR_NOHEAD_NOTAIL,
-                                            " | "
-                                        );
-                                        if inconfig.ordering != None {
-                                            print_debug!(
-                                                PROGRAM_NAME,
-                                                stdout(),
-                                                COLOR_GREEN,
-                                                COLOR_NOHEAD_NOTAIL,
-                                                "Queue: {} regs",
-                                                ordered.as_ref().map_or(0, |b| b.len())
-                                            );
-                                            print_debug!(
-                                                PROGRAM_NAME,
-                                                stdout(),
-                                                COLOR_WHITE,
-                                                COLOR_NOHEAD_NOTAIL,
-                                                " | "
-                                            );
-                                        }
-                                        print_debug!(
-                                            PROGRAM_NAME,
-                                            stdout(),
-                                            COLOR_GREEN,
-                                            COLOR_NOHEAD_NOTAIL,
-                                            "Outgoing: {:.1} regs/sec",
-                                            (outgoing as f64) / diff
-                                        );
-                                        print_debug!(
-                                            PROGRAM_NAME,
-                                            stdout(),
-                                            COLOR_WHITE,
-                                            COLOR_NOHEAD_NOTAIL,
-                                            " | "
-                                        );
-                                        print_debug!(
-                                            PROGRAM_NAME,
-                                            stdout(),
-                                            COLOR_RED,
-                                            COLOR_NOHEAD_NOTAIL,
-                                            "Dropped: {:.1} regs/sec",
-                                            (dropped as f64) / diff
-                                        );
-                                        if deleted > 0 {
-                                            print_debug!(
-                                                PROGRAM_NAME,
-                                                stdout(),
-                                                COLOR_WHITE,
-                                                COLOR_NOHEAD_NOTAIL,
-                                                " | "
-                                            );
-                                            print_debug!(
-                                                PROGRAM_NAME,
-                                                stdout(),
-                                                COLOR_YELLOW,
-                                                COLOR_NOHEAD_NOTAIL,
-                                                "Deleted: {:.1} regs/sec",
-                                                (deleted as f64) / diff
-                                            );
-                                        }
-
-                                        // Show stuck clients
-                                        let stucks: Vec<String> =
-                                            stuck_clients(&stats, inconfig.clients.len())
-                                                .into_iter()
-                                                .map(|c| {
-                                                    let client = &inconfig.clients[c];
-                                                    format!("{}:{}", client.name, client.channel)
-                                                })
-                                                .collect();
-                                        if stucks.len() > 0 {
-                                            print_debug!(
-                                                PROGRAM_NAME,
-                                                stdout(),
-                                                COLOR_YELLOW,
-                                                COLOR_NOHEAD_NOTAIL,
-                                                "  -> Stucked: [ {} ]",
-                                                stucks.join(", ")
-                                            );
-                                        }
-
-                                        // Write statistics
-                                        if let Some(status) = &statusfile {
-                                            let stat = json!({
-                                                "date": get_current_time(),
-                                                "in": (incoming as f64) / diff,
-                                                "out": (outgoing as f64) / diff,
-                                                "drop": (dropped as f64) / diff,
-                                                "deleted": (deleted as f64) / diff,
-                                                "total_in": incoming,
-                                                "total_out": outgoing,
-                                                "total_drop": dropped,
-                                                "total_deleted": deleted,
-                                            });
-                                            match fs::write(status, stat.to_string()) {
-                                                Ok(_) => (),
-                                                Err(e) => print_debug!(
-                                                    PROGRAM_NAME,
-                                                    stderr(),
-                                                    COLOR_RED,
-                                                    0,
-                                                    "Unable to write STATUS at {}: {}",
-                                                    status,
-                                                    e
-                                                ),
-                                            }
-                                        }
-
-                                        // Show tail
-                                        print_debug!(
-                                            PROGRAM_NAME,
-                                            stdout(),
-                                            COLOR_WHITE,
-                                            COLOR_NOHEAD,
-                                            ""
+                                        statistics(
+                                            &inconfig.name,
+                                            ordered.as_deref(),
+                                            &inconfig.clients,
+                                            &stats,
+                                            &statusfile,
+                                            lasttime,
                                         );
                                         lasttime = get_current_time_with_ms();
                                     }
@@ -846,6 +711,17 @@ fn main() {
                             buffer.finish();
                             handle.join().unwrap();
                         }
+
+                        // What was counted since the last line, the flush and any drop at the
+                        // stop included, still reaches the status file (M3R-12)
+                        statistics(
+                            &inconfig.name,
+                            ordered.as_deref(),
+                            &inconfig.clients,
+                            &stats,
+                            &statusfile,
+                            lasttime,
+                        );
 
                         print_debug!(PROGRAM_NAME, stdout(), COLOR_GREEN, 0, "Program finished!");
                     }
@@ -1382,44 +1258,18 @@ fn sender(
     filters: Filters,
     stats: Arc<Vec<WorkerStats>>,
 ) {
-    let mut clients: Option<Vec<RedisLink>> = None;
+    // One link per target, kept for the whole run: a target that cannot be reached is
+    // retried at most once a second while the others keep receiving (M3R-12, L3b)
+    let mut clients = new_targets(id, &config, &filters);
     let mut cursor: usize = 0;
     send_ordered(buffer, hold, |batch| {
         let (mut outgoing, mut dropped, mut deleted) = (0, 0, 0);
-        // Connect on the first batch, and again after a failure; while the targets cannot
-        // be reached the batch waits, unless the program is stopping
-        while clients.is_none() {
-            match connect_targets(id, &config, &filters) {
-                Ok(c) => clients = Some(c),
-                Err(e) => {
-                    print_debug!(
-                        PROGRAM_NAME,
-                        stderr(),
-                        COLOR_RED,
-                        0,
-                        "Error while connecting to target Redis Server: {}",
-                        e
-                    );
-                    if buffer.state.lock().unwrap().finish {
-                        worker_slot(&stats, id).add(0, 0, batch.len() as u64, 0);
-                        return;
-                    }
-                    // Retry in a second, or stop retrying once the program stops
-                    pause(
-                        || buffer.state.lock().unwrap().finish,
-                        Duration::from_secs(1),
-                    );
-                }
-            }
-        }
-        let targets = clients.as_mut().unwrap();
-        let mut failed = false;
         for package in &batch {
-            failed |= deliver(
+            deliver(
                 id,
                 &filters.root,
                 &config,
-                targets,
+                &mut clients,
                 &mut cursor,
                 package,
                 &mut outgoing,
@@ -1429,43 +1279,92 @@ fn sender(
         }
         report(
             worker_slot(&stats, id),
-            targets,
+            &clients,
             0,
             outgoing,
             dropped,
             deleted,
         );
-        // A target error may mean a broken connection: open new ones for the next batch
-        // (a worker does the same through its idle refresh)
-        if failed {
-            clients = None;
-        }
     });
 }
 
-/// Open one connection per target, in configuration order, each with its compiled filter
-fn connect_targets(id: u16, config: &Config, filters: &Filters) -> Result<Vec<RedisLink>, String> {
-    let mut clients = Vec::new();
-    for (client, filter) in config.clients.iter().zip(&filters.clients) {
-        let link = redis_connect(
-            id,
-            client.ssl,
-            client.hostname.clone(),
-            client.port,
-            client.password.clone(),
-            true,
-        )?;
-        clients.push(RedisLink {
+/// One link per target, in configuration order, each with its compiled filter; every
+/// target gets a first connect attempt now
+fn new_targets(id: u16, config: &Config, filters: &Filters) -> Vec<RedisLink> {
+    let mut clients: Vec<RedisLink> = config
+        .clients
+        .iter()
+        .zip(&filters.clients)
+        .map(|(client, filter)| RedisLink {
             config: client.clone(),
-            link,
+            link: None,
+            retry_at: None,
             sleeping_from: 0,
             packages: 0,
             lastcheck: 0,
             filter: filter.clone(),
             request: Vec::new(),
-        });
+        })
+        .collect();
+    for client in clients.iter_mut() {
+        ensure_link(id, client);
     }
-    Ok(clients)
+    clients
+}
+
+/// Whether the target has a link, connecting it first when it has none and its retry time
+/// has come; a failed attempt waits a second before the next one
+fn ensure_link(id: u16, client: &mut RedisLink) -> bool {
+    if client.link.is_some() {
+        return true;
+    }
+    let now = Instant::now();
+    if client.retry_at.is_some_and(|at| now < at) {
+        return false;
+    }
+    match redis_connect(
+        id,
+        client.config.ssl,
+        client.config.hostname.clone(),
+        client.config.port,
+        client.config.password.clone(),
+        true,
+    ) {
+        Ok(link) => {
+            client.link = Some(link);
+            client.retry_at = None;
+            true
+        }
+        Err(e) => {
+            print_debug!(
+                PROGRAM_NAME,
+                stderr(),
+                COLOR_RED,
+                0,
+                "Error while connecting to target '{}:{}@{}': {}",
+                client.config.hostname,
+                client.config.port,
+                client.config.channel,
+                e
+            );
+            client.retry_at = Some(now + Duration::from_secs(1));
+            false
+        }
+    }
+}
+
+/// After a command error on a target: a broken connection is dropped and reconnected at
+/// most once a second; a server error (wrong type, out of memory) keeps the link
+fn target_failed(client: &mut RedisLink) {
+    if client.link.as_ref().is_some_and(|l| !l.is_open()) {
+        client.link = None;
+        client.retry_at = Some(Instant::now() + Duration::from_secs(1));
+    }
+}
+
+/// The open link of a target (callers ensure_link() first)
+fn link(link: &mut Option<redis::Connection>) -> Result<&mut redis::Connection, String> {
+    link.as_mut().ok_or_else(|| "not connected".to_string())
 }
 
 /// Manage the full process from a child
@@ -1493,6 +1392,10 @@ fn child(
     let mut keepworking = true;
     let mut request_finish = false;
 
+    // The targets live as long as the worker: a source error reconnects the source only,
+    // and a target that cannot be reached does not keep the worker from the others (L3b)
+    let mut clients = new_targets(id, &config, &filters);
+
     // Prepare the retention data
     while keepworking {
         // Stopped while (re)connecting: a worker holds nothing between packages
@@ -1514,25 +1417,7 @@ fn child(
             Ok(link) => {
                 source = link;
 
-                // Connect to targets
-                let mut clients = match connect_targets(id, &config, &filters) {
-                    Ok(c) => c,
-                    Err(e) => {
-                        print_debug!(
-                            PROGRAM_NAME,
-                            stderr(),
-                            COLOR_RED,
-                            0,
-                            "Error while connecting to target Redis Server: {}",
-                            e
-                        );
-                        error = true;
-                        Vec::new()
-                    }
-                };
-
-                // No error until here, keep going
-                if !error {
+                {
                     // Keep working while allowed
                     let mut incoming: u64 = 0;
                     let mut outgoing: u64 = 0;
@@ -1571,21 +1456,7 @@ fn child(
                             match item {
                                 Ok(redis::Value::Nil) => {
                                     // Nothing came: refresh the targets' limits state
-                                    match refresh(id, &mut clients, &mut deleted) {
-                                        Ok(_) => (),
-                                        Err(e) => {
-                                            error = true;
-                                            print_debug!(
-                                                PROGRAM_NAME,
-                                                stderr(),
-                                                COLOR_RED,
-                                                0,
-                                                "{}: process_package() has failed: {}",
-                                                id,
-                                                e
-                                            );
-                                        }
-                                    }
+                                    refresh(id, &mut clients, &mut deleted);
                                 }
                                 Ok(redis::Value::Array(data)) => {
                                     // This is the expected data
@@ -1687,8 +1558,6 @@ fn child(
                         dropped,
                         deleted,
                     );
-                } else {
-                    pause(|| stop.load(Ordering::Relaxed), Duration::from_secs(1));
                 }
             }
             Err(e) => {
@@ -1745,6 +1614,153 @@ fn pause(stopping: impl Fn() -> bool, time: Duration) {
         }
         thread::sleep(left.min(Duration::from_millis(100)));
     }
+}
+
+/// The statistics line and the status file: every worker's and the sender's counts since
+/// the last call, `lasttime` (ms), as rates and as interval totals
+fn statistics(
+    name: &str,
+    ordered: Option<&OrderBuffer>,
+    clients: &[ClientConfig],
+    stats: &[WorkerStats],
+    statusfile: &Option<String>,
+    lasttime: u128,
+) {
+    // Counts of every child since the last report
+    let (incoming, outgoing, dropped, deleted) = take_counts(stats);
+
+    // Show statistics
+    // The final call can come right after a periodic one: keep the rates finite
+    let diff: f64 = (((get_current_time_with_ms() - lasttime) as f64) / 1000.0).max(0.001);
+    print_debug!(
+        PROGRAM_NAME,
+        stdout(),
+        COLOR_BLUE,
+        COLOR_NOTAIL,
+        "{} - ",
+        name
+    );
+    print_debug!(
+        PROGRAM_NAME,
+        stdout(),
+        COLOR_CYAN,
+        COLOR_NOHEAD_NOTAIL,
+        "Incoming: {:.1} regs/sec",
+        (incoming as f64) / diff
+    );
+    print_debug!(
+        PROGRAM_NAME,
+        stdout(),
+        COLOR_WHITE,
+        COLOR_NOHEAD_NOTAIL,
+        " | "
+    );
+    if ordered.is_some() {
+        print_debug!(
+            PROGRAM_NAME,
+            stdout(),
+            COLOR_GREEN,
+            COLOR_NOHEAD_NOTAIL,
+            "Queue: {} regs",
+            ordered.map_or(0, |b| b.len())
+        );
+        print_debug!(
+            PROGRAM_NAME,
+            stdout(),
+            COLOR_WHITE,
+            COLOR_NOHEAD_NOTAIL,
+            " | "
+        );
+    }
+    print_debug!(
+        PROGRAM_NAME,
+        stdout(),
+        COLOR_GREEN,
+        COLOR_NOHEAD_NOTAIL,
+        "Outgoing: {:.1} regs/sec",
+        (outgoing as f64) / diff
+    );
+    print_debug!(
+        PROGRAM_NAME,
+        stdout(),
+        COLOR_WHITE,
+        COLOR_NOHEAD_NOTAIL,
+        " | "
+    );
+    print_debug!(
+        PROGRAM_NAME,
+        stdout(),
+        COLOR_RED,
+        COLOR_NOHEAD_NOTAIL,
+        "Dropped: {:.1} regs/sec",
+        (dropped as f64) / diff
+    );
+    if deleted > 0 {
+        print_debug!(
+            PROGRAM_NAME,
+            stdout(),
+            COLOR_WHITE,
+            COLOR_NOHEAD_NOTAIL,
+            " | "
+        );
+        print_debug!(
+            PROGRAM_NAME,
+            stdout(),
+            COLOR_YELLOW,
+            COLOR_NOHEAD_NOTAIL,
+            "Deleted: {:.1} regs/sec",
+            (deleted as f64) / diff
+        );
+    }
+
+    // Show stuck clients
+    let stucks: Vec<String> = stuck_clients(stats, clients.len())
+        .into_iter()
+        .map(|c| {
+            let client = &clients[c];
+            format!("{}:{}", client.name, client.channel)
+        })
+        .collect();
+    if stucks.len() > 0 {
+        print_debug!(
+            PROGRAM_NAME,
+            stdout(),
+            COLOR_YELLOW,
+            COLOR_NOHEAD_NOTAIL,
+            "  -> Stucked: [ {} ]",
+            stucks.join(", ")
+        );
+    }
+
+    // Write statistics
+    if let Some(status) = statusfile {
+        let stat = json!({
+            "date": get_current_time(),
+            "in": (incoming as f64) / diff,
+            "out": (outgoing as f64) / diff,
+            "drop": (dropped as f64) / diff,
+            "deleted": (deleted as f64) / diff,
+            "total_in": incoming,
+            "total_out": outgoing,
+            "total_drop": dropped,
+            "total_deleted": deleted,
+        });
+        match fs::write(status, stat.to_string()) {
+            Ok(_) => (),
+            Err(e) => print_debug!(
+                PROGRAM_NAME,
+                stderr(),
+                COLOR_RED,
+                0,
+                "Unable to write STATUS at {}: {}",
+                status,
+                e
+            ),
+        }
+    }
+
+    // Show tail
+    print_debug!(PROGRAM_NAME, stdout(), COLOR_WHITE, COLOR_NOHEAD, "");
 }
 
 /// A worker's counts since its last report and the stuck state of its targets
@@ -1849,8 +1865,7 @@ fn send_to_client(client: &mut RedisLink, data: &[u8]) -> Result<bool, String> {
     // Encoded into the target's reused buffer and sent as is (M3-o): no command object, no
     // allocation and one copy of the payload; the crate still reads and checks the reply
     pack_rpush(&mut client.request, channel.as_bytes(), data);
-    match client
-        .link
+    match link(&mut client.link)?
         .req_packed_command(&client.request)
         .and_then(|v| v.extract_error())
     {
@@ -1988,7 +2003,7 @@ fn can_send(id: u16, client: &mut RedisLink, deleted: &mut u64) -> Result<bool, 
         }
 
         // Let's check the queue
-        let result: redis::RedisResult<i32> = client.link.llen(&client.config.channel);
+        let result: redis::RedisResult<i32> = link(&mut client.link)?.llen(&client.config.channel);
         match result {
             Ok(len) => {
                 if client.config.hardlimit != None {
@@ -2015,7 +2030,7 @@ fn can_send(id: u16, client: &mut RedisLink, deleted: &mut u64) -> Result<bool, 
                                 while actual_len >= client.config.hardlimit.unwrap() {
                                     // Trim elements from the queue
                                     let result: redis::RedisResult<redis::Value> =
-                                        client.link.ltrim(
+                                        link(&mut client.link)?.ltrim(
                                             &client.config.channel,
                                             client.config.deleteblock.unwrap() as isize,
                                             MAX_QUEUE_SIZE,
@@ -2027,7 +2042,7 @@ fn can_send(id: u16, client: &mut RedisLink, deleted: &mut u64) -> Result<bool, 
 
                                     // Read len again
                                     let result: redis::RedisResult<i32> =
-                                        client.link.llen(&client.config.channel);
+                                        link(&mut client.link)?.llen(&client.config.channel);
                                     match result{
                                         Ok(len) => actual_len = len as u64,
                                         Err(e) => return Err(format!("error in deleteblock while requesting the length to the channel: {}", e)),
@@ -2157,7 +2172,8 @@ fn ordering_ts(re: &Regex, limit: Option<usize>, data: &[u8]) -> Result<u128, &'
 
 /// Deliver one package to the targets the mode selects, through the root and client filters
 /// and the limits; counted as outgoing when at least one target took it, else as dropped.
-/// True when a target answered with an error (its connection may be broken).
+/// A target without a link is skipped (not taken) until its retry time; one whose command
+/// fails keeps or loses its link as target_failed() decides.
 fn deliver(
     id: u16,
     root_filter: &Option<Filter>,
@@ -2168,29 +2184,32 @@ fn deliver(
     outgoing: &mut u64,
     dropped: &mut u64,
     deleted: &mut u64,
-) -> bool {
-    let mut failed = false;
+) {
     let bdata = match root_filter {
         Some(f) => f.apply(package),
         None => Some(Cow::Borrowed(package)),
     };
-    let mut attempt = |client: &mut RedisLink, bdata: &[u8]| match send(id, client, bdata, deleted)
-    {
-        Ok(sent) => sent,
-        Err(e) => {
-            print_debug!(
-                PROGRAM_NAME,
-                stderr(),
-                COLOR_RED,
-                0,
-                "Error while sending to '{}:{}@{}': {}",
-                config.hostname,
-                config.port,
-                config.channel,
-                e
-            );
-            failed = true;
-            false
+    let mut attempt = |client: &mut RedisLink, bdata: &[u8]| {
+        if !ensure_link(id, client) {
+            return false;
+        }
+        match send(id, client, bdata, deleted) {
+            Ok(sent) => sent,
+            Err(e) => {
+                print_debug!(
+                    PROGRAM_NAME,
+                    stderr(),
+                    COLOR_RED,
+                    0,
+                    "Error while sending to '{}:{}@{}': {}",
+                    config.hostname,
+                    config.port,
+                    config.channel,
+                    e
+                );
+                target_failed(client);
+                false
+            }
         }
     };
     let delivered = match bdata {
@@ -2213,7 +2232,6 @@ fn deliver(
     } else {
         *dropped += 1;
     }
-    failed
 }
 
 /// Spreader target selection: try the targets in turn from `cursor`, at most one full turn;
@@ -2230,14 +2248,28 @@ fn spread(cursor: &mut usize, n: usize, mut attempt: impl FnMut(usize) -> bool) 
     None
 }
 
-/// The idle path: refresh the limits state of every target (1.0.8 behaviour, M3F-7 is stage 4)
-fn refresh(id: u16, clients: &mut [RedisLink], deleted: &mut u64) -> Result<(), String> {
+/// The idle path: refresh the limits state of every reachable target (1.0.8 behaviour,
+/// M3F-7 is stage 4); a failing target is handled alone, the worker goes on
+fn refresh(id: u16, clients: &mut [RedisLink], deleted: &mut u64) {
     for client in clients.iter_mut() {
+        if !ensure_link(id, client) {
+            continue;
+        }
         // Only the refresh matters, not whether it could send
-        can_send(id, client, deleted)
-            .map_err(|e| format!("couldn't check queue for {}: {}", client.config.channel, e))?;
+        if let Err(e) = can_send(id, client, deleted) {
+            print_debug!(
+                PROGRAM_NAME,
+                stderr(),
+                COLOR_RED,
+                0,
+                "{}: couldn't check queue for {}: {}",
+                id,
+                client.config.channel,
+                e
+            );
+            target_failed(client);
+        }
     }
-    Ok(())
 }
 
 #[cfg(test)]

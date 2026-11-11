@@ -33,6 +33,40 @@ fn stop_under_load_four_children_with_ordering() {
     stop_under_load("stop_load_c4_ordering", 4, true, Duration::from_millis(300));
 }
 
+// Spreader cells of the matrix (two targets, every package on exactly one of them or left
+// in the source). The signal does not change the path inside the program (one handler sets
+// one flag), so SIGTERM and SIGHUP are run with replicant only.
+
+fn spreader(test: &str, children: u16, ordering: bool) {
+    let cell = Cell {
+        ordering,
+        spreader: true,
+        children,
+    };
+    let run_for = Duration::from_millis(if ordering { 300 } else { 500 });
+    stop_under_load_cell(test, cell, false, run_for, "INT");
+}
+
+#[test]
+fn stop_under_load_spreader_one_child() {
+    spreader("stop_load_spr_c1", 1, false);
+}
+
+#[test]
+fn stop_under_load_spreader_one_child_with_ordering() {
+    spreader("stop_load_spr_c1_o", 1, true);
+}
+
+#[test]
+fn stop_under_load_spreader_four_children() {
+    spreader("stop_load_spr_c4", 4, false);
+}
+
+#[test]
+fn stop_under_load_spreader_four_children_with_ordering() {
+    spreader("stop_load_spr_c4_o", 4, true);
+}
+
 // SIGTERM (`systemctl stop`) and SIGHUP stop as SIGINT does (M3-l = la, M3F-3): before,
 // SIGTERM killed the process at once, losing the ordering buffer and leaving the pid file.
 
