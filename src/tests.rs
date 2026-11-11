@@ -1170,3 +1170,48 @@ fn spreader_by_index_matches_the_old_rotation() {
     }
     assert_eq!(cases, 60000);
 }
+
+#[test]
+fn pause_ends_early_on_stop() {
+    let start = Instant::now();
+    pause(|| true, Duration::from_secs(5));
+    assert!(start.elapsed() < Duration::from_millis(50));
+    let start = Instant::now();
+    pause(|| false, Duration::from_millis(250));
+    assert!(start.elapsed() >= Duration::from_millis(250));
+    let stop = AtomicBool::new(false);
+    let start = Instant::now();
+    thread::scope(|s| {
+        s.spawn(|| {
+            thread::sleep(Duration::from_millis(150));
+            stop.store(true, Ordering::Relaxed);
+        });
+        pause(|| stop.load(Ordering::Relaxed), Duration::from_secs(5));
+    });
+    assert!(start.elapsed() < Duration::from_secs(1));
+}
+
+#[test]
+fn held_packages_compare_by_ts_then_arrival_order() {
+    let now = Instant::now();
+    let a = Held {
+        ts: 1,
+        seq: 0,
+        arrival: now,
+        data: b"a".to_vec(),
+    };
+    let b = Held {
+        ts: 1,
+        seq: 0,
+        arrival: now + Duration::from_secs(1),
+        data: b"b".to_vec(),
+    };
+    let c = Held {
+        ts: 1,
+        seq: 1,
+        arrival: now,
+        data: b"a".to_vec(),
+    };
+    assert!(a == b);
+    assert!(a != c && a < c);
+}
