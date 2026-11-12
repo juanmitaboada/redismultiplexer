@@ -71,8 +71,10 @@ struct ClientConfig {
     hostname: String,
     port: u16,
     password: String,
-    username: Option<String>, // Redis 6 ACL user (M3-i)
-    database: Option<u32>,    // SELECT on connect, 0 when absent (M1F-10)
+    username: Option<String>,     // Redis 6 ACL user (M3-i)
+    database: Option<u32>,        // SELECT on connect, 0 when absent (M1F-10)
+    connect_timeout: Option<f64>, // seconds, 0 = the kernel's, as 1.0.8 (M3R-19)
+    command_timeout: Option<f64>, // seconds, 0 = wait for ever, as 1.0.8 (M3R-19)
     channel: String,
     timelimit: Option<u64>,
     checklimit: Option<u64>,
@@ -97,6 +99,8 @@ impl Clone for ClientConfig {
             password: self.password.clone(),
             username: self.username.clone(),
             database: self.database,
+            connect_timeout: self.connect_timeout,
+            command_timeout: self.command_timeout,
             channel: self.channel.clone(),
             timelimit: self.timelimit,
             checklimit: self.checklimit,
@@ -120,8 +124,10 @@ struct Config {
     hostname: String,
     port: u16,
     password: String,
-    username: Option<String>, // Redis 6 ACL user (M3-i)
-    database: Option<u32>,    // SELECT on connect, 0 when absent (M1F-10)
+    username: Option<String>,     // Redis 6 ACL user (M3-i)
+    database: Option<u32>,        // SELECT on connect, 0 when absent (M1F-10)
+    connect_timeout: Option<f64>, // seconds, 0 = the kernel's, as 1.0.8 (M3R-19)
+    command_timeout: Option<f64>, // seconds, 0 = wait for ever, as 1.0.8 (M3R-19)
     channel: String,
     children: u16,
     mode: String,
@@ -149,6 +155,8 @@ impl Clone for Config {
             password: self.password.clone(),
             username: self.username.clone(),
             database: self.database,
+            connect_timeout: self.connect_timeout,
+            command_timeout: self.command_timeout,
             channel: self.channel.clone(),
             children: self.children,
             mode: self.mode.clone(),
@@ -192,9 +200,33 @@ struct Endpoint {
     username: Option<String>,
     password: Option<String>,
     database: u32,
+    connect_timeout: Option<Duration>, // None: no limit
+    command_timeout: Option<Duration>, // None: no limit
+}
+
+/// A timeout key as a Duration: absent is `default`, 0 is no limit (None). Checked by
+/// verify_config, so a value that is not a duration cannot reach here.
+fn timeout_key(value: Option<f64>, default: Duration) -> Option<Duration> {
+    match value {
+        None => Some(default),
+        Some(0.0) => None,
+        Some(v) => Duration::try_from_secs_f64(v).ok(),
+    }
+}
+
+/// Error text when a timeout key is not 0 or a positive number of seconds a Duration holds
+fn check_timeout(owner: &str, key: &str, value: Option<f64>) -> Result<(), String> {
+    match value {
+        Some(v) if v != 0.0 && Duration::try_from_secs_f64(v).is_err() => Err(format!(
+            "{} has an invalid {} {}: use 0 (no limit) or a positive number of seconds",
+            owner, key, v
+        )),
+        _ => Ok(()),
+    }
 }
 
 impl Endpoint {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         ssl: Option<bool>,
         host: &str,
@@ -202,6 +234,8 @@ impl Endpoint {
         username: &Option<String>,
         password: &str,
         database: Option<u32>,
+        connect_timeout: Option<f64>,
+        command_timeout: Option<f64>,
     ) -> Endpoint {
         Endpoint {
             ssl: ssl.unwrap_or(false),
@@ -211,6 +245,8 @@ impl Endpoint {
             username: username.clone().filter(|u| !u.is_empty()),
             password: Some(password.to_string()).filter(|p| !p.is_empty()),
             database: database.unwrap_or(0),
+            connect_timeout: timeout_key(connect_timeout, DEFAULT_CONNECT_TIMEOUT),
+            command_timeout: timeout_key(command_timeout, DEFAULT_COMMAND_TIMEOUT),
         }
     }
 
@@ -222,6 +258,8 @@ impl Endpoint {
             &config.username,
             &config.password,
             config.database,
+            config.connect_timeout,
+            config.command_timeout,
         )
     }
 
@@ -233,6 +271,8 @@ impl Endpoint {
             &config.username,
             &config.password,
             config.database,
+            config.connect_timeout,
+            config.command_timeout,
         )
     }
 
@@ -924,6 +964,11 @@ fn verify_config(config: Config) -> Result<Config, String> {
         ));
     }
 
+    // Timeouts: 0 or a positive number of seconds
+    let owner = format!("Source '{}'", source.name);
+    check_timeout(&owner, "connect_timeout", source.connect_timeout)?;
+    check_timeout(&owner, "command_timeout", source.command_timeout)?;
+
     // === FILTERS ===
 
     // Filter
@@ -1012,6 +1057,11 @@ fn verify_config(config: Config) -> Result<Config, String> {
                     client.name, client.hostname, client.port, client.channel
                 ));
             }
+
+            // Timeouts: 0 or a positive number of seconds
+            let owner = format!("Client '{}'", client.name);
+            check_timeout(&owner, "connect_timeout", client.connect_timeout)?;
+            check_timeout(&owner, "command_timeout", client.command_timeout)?;
 
             // Verify that source and target are not the same
             if (source.hostname == client.hostname)
@@ -1896,19 +1946,20 @@ fn redis_connect(
 
     let client = redis::Client::open(endpoint.info())
         .map_err(|e| format!("Invalid connection settings: {}", e))?;
-    if !is_client {
-        return client
-            .get_connection()
-            .map_err(|e| format!("Couldn't connect to Redis Server: {}", e));
-    }
-    // A target that drops packets instead of refusing would hold the thread for the
+    // A server that drops packets instead of refusing would hold the thread for the
     // kernel's connect timeout (about 2 min), and one that stops answering would hold it
-    // for ever: bounded here, so the other targets keep receiving (M3R-12 X1b)
-    let link = client
-        .get_connection_with_timeout(TARGET_CONNECT_TIMEOUT)
-        .map_err(|e| format!("Couldn't connect to Redis Server: {}", e))?;
-    link.set_read_timeout(Some(TARGET_IO_TIMEOUT))
-        .and_then(|_| link.set_write_timeout(Some(TARGET_IO_TIMEOUT)))
+    // for ever: bounded unless the configuration asks for the old wait (M3R-12 X1b, M3R-19)
+    let link = match endpoint.connect_timeout {
+        Some(t) => client.get_connection_with_timeout(t),
+        None => client.get_connection(),
+    }
+    .map_err(|e| format!("Couldn't connect to Redis Server: {}", e))?;
+    // The source's BLPOP waits up to its own timeout before the server answers
+    let read = endpoint
+        .command_timeout
+        .map(|t| if is_client { t } else { t + BLPOP_WAIT });
+    link.set_read_timeout(read)
+        .and_then(|_| link.set_write_timeout(endpoint.command_timeout))
         .map_err(|e| format!("Couldn't set the timeouts: {}", e))?;
     Ok(link)
 }
@@ -1917,7 +1968,7 @@ fn redis_connect(
 /// Commands::blpop takes an f64 and sends "1.0", which servers before 6.0 reject
 fn blpop_cmd(channel: &str) -> redis::Cmd {
     let mut cmd = redis::cmd("BLPOP");
-    cmd.arg(channel).arg(1);
+    cmd.arg(channel).arg(BLPOP_WAIT.as_secs());
     cmd
 }
 

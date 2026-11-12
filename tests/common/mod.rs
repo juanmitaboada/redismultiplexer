@@ -449,6 +449,10 @@ pub fn packages(tag: &str, n: usize) -> Vec<String> {
     (0..n).map(|i| format!("{}-{:05}", tag, i)).collect()
 }
 
+/// Client lines with short timeouts for a target that never answers (S4-6, M3R-22): the
+/// failure tests need not wait out the 2 s and 5 s defaults
+pub const SHORT_TIMEOUTS: &str = "    connect_timeout: 0.2\n    command_timeout: 0.5\n";
+
 /// Ordering with a 1 s buffer on the `ts` field of `seq_pkg` packages.
 pub const ORDERING_1S: &str =
     "ordering: '\"ts\": *(?P<ts>\\d+),'\nordering_buffer_time: 1\nordering_limit: 200\n";

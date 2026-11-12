@@ -11,6 +11,8 @@ fn client(name: &str, channel: &str) -> ClientConfig {
         password: String::new(),
         username: None,
         database: None,
+        connect_timeout: None,
+        command_timeout: None,
         channel: channel.to_string(),
         timelimit: None,
         checklimit: None,
@@ -35,6 +37,8 @@ fn config() -> Config {
         password: String::new(),
         username: None,
         database: None,
+        connect_timeout: None,
+        command_timeout: None,
         channel: "src".to_string(),
         children: 1,
         mode: "replicant".to_string(),
@@ -1335,7 +1339,8 @@ fn endpoint_reads_as_the_url_did_where_the_url_worked() {
         for host in hosts {
             for port in [6379u16, 6390, 1, 65535] {
                 for password in passwords {
-                    let ep = Endpoint::new(Some(ssl), host, port, &None, password, None);
+                    let ep =
+                        Endpoint::new(Some(ssl), host, port, &None, password, None, None, None);
                     match url_info(ssl, host, port, password) {
                         Ok(url) if url.redis.password.as_deref().unwrap_or("") == password => {
                             assert!(
@@ -1373,13 +1378,22 @@ fn endpoint_reads_as_the_url_did_where_the_url_worked() {
 
 #[test]
 fn endpoint_database_and_username() {
-    let ep = Endpoint::new(None, "h", 1, &Some("app".to_string()), "pw", Some(3));
+    let ep = Endpoint::new(
+        None,
+        "h",
+        1,
+        &Some("app".to_string()),
+        "pw",
+        Some(3),
+        None,
+        None,
+    );
     let info = ep.info();
     assert_eq!(info.redis.db, 3);
     assert_eq!(info.redis.username.as_deref(), Some("app"));
     assert_eq!(info.redis.password.as_deref(), Some("pw"));
     // Empty user and password mean none, as the URL path read them: no AUTH
-    let ep = Endpoint::new(None, "h", 1, &Some(String::new()), "", None);
+    let ep = Endpoint::new(None, "h", 1, &Some(String::new()), "", None, None, None);
     assert_eq!(
         (ep.info().redis.username, ep.info().redis.password),
         (None, None)
@@ -1406,4 +1420,56 @@ fn yaml_database_and_username_are_optional() {
     );
     // A database below 0 is not a database
     assert!(parse_yaml(&base.replace("channel: c\n", "channel: c\ndatabase: -1\n")).is_err());
+}
+
+#[test]
+fn timeouts_default_zero_and_values() {
+    let ep = |c: Option<f64>, m: Option<f64>| Endpoint::new(None, "h", 1, &None, "", None, c, m);
+    // Absent: 2 s and 5 s, as since the stage 3 fix round
+    let d = ep(None, None);
+    assert_eq!(d.connect_timeout, Some(Duration::from_secs(2)));
+    assert_eq!(d.command_timeout, Some(Duration::from_secs(5)));
+    // 0: no limit, as 1.0.8 waited
+    let z = ep(Some(0.0), Some(0.0));
+    assert_eq!((z.connect_timeout, z.command_timeout), (None, None));
+    // Decimals
+    let v = ep(Some(0.25), Some(30.0));
+    assert_eq!(v.connect_timeout, Some(Duration::from_millis(250)));
+    assert_eq!(v.command_timeout, Some(Duration::from_secs(30)));
+}
+
+#[test]
+fn verify_rejects_timeouts_that_are_not_durations() {
+    for bad in [-1.0, f64::NAN, f64::INFINITY, 1e30] {
+        let mut c = config();
+        c.connect_timeout = Some(bad);
+        assert!(err(c).contains("invalid connect_timeout"), "{}", bad);
+        let mut c = config();
+        c.clients[0].command_timeout = Some(bad);
+        assert!(err(c).contains("invalid command_timeout"), "{}", bad);
+    }
+    let mut c = config();
+    c.connect_timeout = Some(0.0);
+    c.clients[0].command_timeout = Some(0.5);
+    assert!(verify_config(c).is_ok());
+}
+
+#[test]
+fn yaml_timeouts_accept_integers_and_decimals() {
+    let base = "name: s\nhostname: h\nport: 1\npassword: ''\nchannel: c\nchildren: 1\nmode: replicant\nclients:\n  - name: t\n    hostname: h\n    port: 1\n    password: ''\n    channel: d\n";
+    let c = parse_yaml(base).unwrap();
+    assert_eq!((c.connect_timeout, c.command_timeout), (None, None));
+    let with = base.replace(
+        "channel: c\n",
+        "channel: c\nconnect_timeout: 3\ncommand_timeout: 0\n",
+    ) + "    connect_timeout: 0.2\n    command_timeout: 1.5\n";
+    let c = parse_yaml(&with).unwrap();
+    assert_eq!(
+        (c.connect_timeout, c.command_timeout),
+        (Some(3.0), Some(0.0))
+    );
+    assert_eq!(
+        (c.clients[0].connect_timeout, c.clients[0].command_timeout),
+        (Some(0.2), Some(1.5))
+    );
 }

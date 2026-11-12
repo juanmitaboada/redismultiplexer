@@ -254,9 +254,10 @@ fn push_after_the_signal(test: &str, cell: Cell) {
 /// A target that is not refused but never answers, in the two places a thread can wait
 /// for it: the connect (`blackhole`: SYNs dropped, as behind a firewall that drops) and the
 /// reply (`silent`: the connection is accepted, nothing ever comes back). The healthy target
-/// still receives every package: the connect gives up after 2 s and a command after 5 s,
-/// then the target waits out its backoff (M3R-12 X1b; until then a thread waited for the
-/// kernel's connect timeout, about 2 min, or for ever).
+/// still receives every package: the connect and the command give up after their timeouts
+/// (here the short ones of SHORT_TIMEOUTS), then the target waits out its backoff (M3R-12
+/// X1b; until then a thread waited for the kernel's connect timeout, about 2 min, or for
+/// ever).
 fn unanswering_target(test: &str, cell: Cell, port: u16) {
     let mut ctx = Ctx::new(test);
     let src = ctx.key("src");
@@ -268,7 +269,11 @@ fn unanswering_target(test: &str, cell: Cell, port: u16) {
         .enumerate()
         .map(|(i, k)| ctx.client_yaml(&format!("t{}", i), k, ""))
         .collect();
-    clients.insert(0, ctx.client_yaml_at("mute", "rmtest:mute", port));
+    // Short timeouts (S4-6): the defaults are asserted in timeouts.rs
+    clients.insert(
+        0,
+        ctx.client_yaml_at("mute", "rmtest:mute", port) + SHORT_TIMEOUTS,
+    );
     let n = 200;
     let input: Vec<String> = (0..n).map(seq_pkg).collect();
     ctx.push(&src, &input);
