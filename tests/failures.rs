@@ -304,7 +304,58 @@ fn silent_target(test: &str, cell: Cell) {
     unanswering_target(test, cell, mute.port);
 }
 
+/// A blackholed target (its connects hang until the connect timeout) does not stall the
+/// others: the attempts run outside the delivering threads (S4-3, X1c). Packages are fed at
+/// a steady rate after the first failed attempt; the healthy targets must keep growing,
+/// never standing still for as long as an attempt lasts (2 s, the default kept here on
+/// purpose). Before X1c each retry held the thread for those 2 s.
+fn blackhole_does_not_stall(test: &str, cell: Cell) {
+    let hole = blackhole();
+    let mut ctx = Ctx::new(test);
+    let src = ctx.key("src");
+    let real: Vec<String> = (0..cell.targets())
+        .map(|i| ctx.key(&format!("t{}", i)))
+        .collect();
+    let mut clients: Vec<String> = real
+        .iter()
+        .enumerate()
+        .map(|(i, k)| ctx.client_yaml(&format!("t{}", i), k, ""))
+        .collect();
+    // Last, so a stall cannot hide before the first delivery
+    clients.push(ctx.client_yaml_at("hole", "rmtest:hole", hole.port));
+    let cfg = ctx.config(&src, cell.children, cell.mode(), cell.extra(), &clients);
+    let p = ctx.spawn(&cfg);
+    ctx.wait_for("the first connect attempt failed", |_| {
+        p.stderr().contains("Error while connecting")
+    });
+    // 6 s of packages: retries come 1 s and 3 s after the first failure, each lasting 2 s
+    let n = 6000;
+    let feeder = feed(&ctx, &src, n);
+    // The sender holds packages 1 s (ordering): measure once they flow
+    let delivered = |c: &mut Ctx| real.iter().map(|k| c.llen(k)).sum::<usize>();
+    ctx.wait_for("the first delivery", |c| delivered(c) > 0);
+    let (mut last, mut since, mut worst) = (0, Instant::now(), Duration::ZERO);
+    while !feeder.is_finished() {
+        let now = delivered(&mut ctx);
+        if now != last {
+            worst = worst.max(since.elapsed());
+            last = now;
+            since = Instant::now();
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    feeder.join().unwrap();
+    let mut p = p;
+    p.stop(&ctx.pid_file());
+    assert!(
+        worst < Duration::from_millis(1000),
+        "the healthy targets stood still for {:?}",
+        worst
+    );
+}
+
 matrix!(target_closes, target_closes_mid_run, 2);
+matrix!(blackhole_no_stall, blackhole_does_not_stall, 2);
 matrix!(target_blackhole, blackhole_target, 2);
 matrix!(target_silent, silent_target, 2);
 matrix!(target_unreachable, target_unreachable_from_start, 2);

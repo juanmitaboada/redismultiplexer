@@ -9,6 +9,9 @@ pub static MAX_QUEUE_SIZE: isize = 100000000;
 // `command_timeout` keys, root (source) and per client (M3R-19)
 pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 pub const DEFAULT_COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
+// How long a delivering thread waits for a connect attempt before it goes on without the
+// target (X1c): a reachable target connects within it and takes the package
+pub const CONNECT_GRACE: Duration = Duration::from_millis(100);
 // BLPOP's own wait: the server answers nil after it when the source is empty
 pub const BLPOP_WAIT: Duration = Duration::from_secs(1);
 pub const TARGET_BACKOFF_MIN: Duration = Duration::from_secs(1);

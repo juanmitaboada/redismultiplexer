@@ -187,7 +187,13 @@ struct RedisLink {
     lastcheck: u64,                  // When was the last check of queue's size (time limit)
     filter: Option<Filter>,          // Client filter, compiled at start
     request: Vec<u8>,                // RPUSH request buffer, reused for every package
+    endpoint: Endpoint,              // where to connect, built once
+    connecting: Option<Connecting>,  // an attempt running outside this thread (X1c)
 }
+
+/// The result of a connect attempt that runs in its own short-lived thread, so a target
+/// that does not answer never holds the thread that delivers (S4-3 = a, X1c)
+type Connecting = Receiver<Result<redis::Connection, String>>;
 
 /// Where and how to connect (M3-i): built from the configuration and handed to the crate as
 /// is, never formatted into a URL, so a password reaches AUTH exactly as written (M1F-7)
@@ -1446,25 +1452,40 @@ fn new_targets(id: u16, config: &Config, filters: &Filters) -> Vec<RedisLink> {
             lastcheck: 0,
             filter: filter.clone(),
             request: Vec::new(),
+            endpoint: Endpoint::target(client),
+            connecting: None,
         })
         .collect();
+    // Every first attempt at once, then wait for all of them: before the first package a
+    // thread waits for its slowest target, not for the sum of them
     for client in clients.iter_mut() {
-        ensure_link(id, client);
+        client.connecting = Some(connect_in_background(id, &client.endpoint));
+    }
+    for client in clients.iter_mut() {
+        if let Some(rx) = client.connecting.take() {
+            let result = rx
+                .recv()
+                .unwrap_or_else(|_| Err("connect thread ended".to_string()));
+            connected(client, result);
+        }
     }
     clients
 }
 
-/// Whether the target has a link, connecting it first when it has none and its retry time
-/// has come; a failed attempt waits a second before the next one
-fn ensure_link(id: u16, client: &mut RedisLink) -> bool {
-    if client.link.is_some() {
-        return true;
-    }
-    let now = Instant::now();
-    if client.retry_at.is_some_and(|at| now < at) {
-        return false;
-    }
-    match redis_connect(id, &Endpoint::target(&client.config), true) {
+/// A connect attempt in its own thread; its result comes through the returned channel.
+/// If nobody waits for it any more, the link it makes is dropped with the channel.
+fn connect_in_background(id: u16, endpoint: &Endpoint) -> Connecting {
+    let (tx, rx) = mpsc::channel();
+    let endpoint = endpoint.clone();
+    thread::spawn(move || {
+        let _ = tx.send(redis_connect(id, &endpoint, true));
+    });
+    rx
+}
+
+/// Takes the result of a connect attempt: the link, or the error line and the backoff
+fn connected(client: &mut RedisLink, result: Result<redis::Connection, String>) -> bool {
+    match result {
         Ok(link) => {
             client.link = Some(link);
             client.retry_at = None;
@@ -1484,6 +1505,37 @@ fn ensure_link(id: u16, client: &mut RedisLink) -> bool {
             );
             mark_down(client);
             false
+        }
+    }
+}
+
+/// Whether the target has a link. Without one, once its retry time has come a connect
+/// attempt starts in its own thread; this thread waits for it at most CONNECT_GRACE (a
+/// target that answers is connected inline and takes the package) and otherwise goes on
+/// without the target, picking the result up on a later package (S4-3 = a, X1c). A failed
+/// attempt waits out the backoff before the next one.
+fn ensure_link(id: u16, client: &mut RedisLink) -> bool {
+    if client.link.is_some() {
+        return true;
+    }
+    // An attempt already running is only looked at, never waited for again
+    let (rx, grace) = match client.connecting.take() {
+        Some(rx) => (rx, Duration::ZERO),
+        None => {
+            if client.retry_at.is_some_and(|at| Instant::now() < at) {
+                return false;
+            }
+            (connect_in_background(id, &client.endpoint), CONNECT_GRACE)
+        }
+    };
+    match rx.recv_timeout(grace) {
+        Ok(result) => connected(client, result),
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            client.connecting = Some(rx);
+            false
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            connected(client, Err("connect thread ended".to_string()))
         }
     }
 }
