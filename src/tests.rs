@@ -1150,15 +1150,64 @@ fn verify_accepts_two_of_three_ordering_options_current_behaviour() {
 }
 
 #[test]
-fn verify_limits_all_or_nothing() {
+fn verify_limits_hardlimit_enables_defaults() {
+    // M3-f = fa: a hardlimit alone turns the limits on; softlimit 80 % of it, at least 1
+    // (L4c-2); timelimit 1 s and checklimit 10000, each when not given (L4c-5)
+    let limits = |hard: u64, soft: Option<u64>, time: Option<u64>, check: Option<u64>| {
+        let mut c = config();
+        c.clients[0].hardlimit = Some(hard);
+        c.clients[0].softlimit = soft;
+        c.clients[0].timelimit = time;
+        c.clients[0].checklimit = check;
+        let t = verify_config(c).expect("a hardlimit is enough").clients[0].clone();
+        (t.softlimit, t.timelimit, t.checklimit)
+    };
+    assert_eq!(
+        limits(10, None, None, None),
+        (Some(8), Some(1), Some(10000))
+    );
+    assert_eq!(limits(7, None, None, None).0, Some(5));
+    assert_eq!(limits(1, None, None, None).0, Some(1));
+    assert_eq!(limits(u64::MAX, None, None, None).0, Some(u64::MAX / 5 * 4));
+    assert_eq!(
+        limits(10, Some(3), None, None),
+        (Some(3), Some(1), Some(10000))
+    );
+    assert_eq!(
+        limits(10, None, Some(60), None),
+        (Some(8), Some(60), Some(10000))
+    );
+    assert_eq!(
+        limits(10, None, None, Some(50)),
+        (Some(8), Some(1), Some(50))
+    );
+    // A file valid for 1.0.8 (all four) keeps its values
+    assert_eq!(
+        limits(10, Some(5), Some(1), Some(1)),
+        (Some(5), Some(1), Some(1))
+    );
+}
+
+#[test]
+fn verify_limits_need_a_hardlimit() {
+    for key in ["timelimit", "checklimit", "softlimit"] {
+        let mut c = config();
+        let t = &mut c.clients[0];
+        match key {
+            "timelimit" => t.timelimit = Some(1),
+            "checklimit" => t.checklimit = Some(1),
+            _ => t.softlimit = Some(5),
+        }
+        assert!(
+            err(c).contains(&format!("sets {} without hardlimit", key)),
+            "{}",
+            key
+        );
+    }
+    // At 0 they are not set, also with hardlimit at 0
     let mut c = config();
-    c.clients[0].hardlimit = Some(10);
-    assert!(err(c).contains("must set all limits"));
-    let mut c = config();
-    c.clients[0].timelimit = Some(1);
-    c.clients[0].checklimit = Some(1);
-    c.clients[0].softlimit = Some(5);
-    c.clients[0].hardlimit = Some(10);
+    c.clients[0].softlimit = Some(0);
+    c.clients[0].hardlimit = Some(0);
     assert!(verify_config(c).is_ok());
 }
 

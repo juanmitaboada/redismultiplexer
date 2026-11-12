@@ -307,3 +307,44 @@ fn stuck_freed_while_idle(tag: &str, cell: Cell) {
 
 matrix!(no_llen, no_llen_without_limits, 4);
 matrix!(idle_recheck, stuck_freed_while_idle, 4);
+
+/// A hardlimit alone turns the limits on (M3-f = fa): stuck at 10, freed under the default
+/// softlimit of 8 (L4c-2), checked at the first offer and then every second or 10000
+/// packages (L4c-5). The parent refused the file ("must set all limits"). One cell: the
+/// defaults are set once at start, the same for every thread.
+#[test]
+fn hardlimit_alone() {
+    let mut ctx = Ctx::new("hardlimit_alone");
+    let src = ctx.key("src");
+    let t0 = ctx.key("t0");
+    let filler = packages("old", 10);
+    ctx.push(&t0, &filler);
+    let cfg = ctx.config(
+        &src,
+        1,
+        "replicant",
+        "",
+        &[ctx.client_yaml("t0", &t0, "    hardlimit: 10\n")],
+    );
+    let mut p = ctx.spawn(&cfg);
+    ctx.push(&src, &packages("lost", 5));
+    ctx.wait_for("stuck", |c| {
+        c.llen(&src) == 0 && p.stderr().contains("stuck!")
+    });
+    // At 8 (the default softlimit) it stays stuck; at 7 it is freed
+    ctx.ltrim(&t0, 2, -1);
+    thread::sleep(Duration::from_millis(2500));
+    assert!(
+        !p.stderr().contains("freed!"),
+        "freed at the softlimit, not under it"
+    );
+    ctx.ltrim(&t0, 1, -1);
+    ctx.wait_for("freed", |_| p.stderr().contains("freed!"));
+    let fresh = packages("new", 3);
+    ctx.push(&src, &fresh);
+    ctx.wait_drained(&src, &[(&t0, 10)]);
+    p.stop(&ctx.pid_file());
+    let mut want = filler[3..].to_vec();
+    want.extend(fresh);
+    assert_eq!(ctx.list(&t0), want);
+}

@@ -2,6 +2,9 @@ use std::time::Duration;
 
 pub static PROGRAM_NAME: &str = "RedisMultiplexer";
 pub static STATISTICS_SECONDS: u128 = 10;
+// Defaults of a target with a hardlimit and no timelimit or checklimit (M3-f, L4c-5)
+pub const DEFAULT_TIMELIMIT: u64 = 1;
+pub const DEFAULT_CHECKLIMIT: u64 = 10000;
 // How often a target without timelimit and checklimit is checked (L1a: monotonic clock)
 pub const DEFAULT_CHECK: Duration = Duration::from_secs(1);
 

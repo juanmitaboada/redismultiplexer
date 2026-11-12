@@ -1101,40 +1101,18 @@ fn verify_config(config: Config) -> Result<Config, String> {
 
             // === LIMITS ===
 
-            // If some config is set, all must be set
-            let mut configured = 0;
-
-            // Timelimit
-            match client.timelimit {
-                None => (),
-                Some(0) => (),
-                _ => configured += 1,
-            }
-
-            // Checklimit
-            match client.checklimit {
-                None => (),
-                Some(0) => (),
-                _ => configured += 1,
-            }
-
-            // Softlimit
-            match client.softlimit {
-                None => (),
-                Some(0) => (),
-                _ => configured += 1,
-            }
-
-            // Hardlimit
-            match client.hardlimit {
-                None => (),
-                Some(0) => (),
-                _ => configured += 1,
-            }
-
-            // Show error if any
-            if (configured > 0) && (configured < 4) {
-                return Err(format!("Client '{}' is using limits, so you must set all limits: timelimit, checklimit, softlimit and hardlimit to be bigger than 0", client.name));
+            // A hardlimit turns the limits on, the other keys have defaults (M3-f = fa); any
+            // of them without a hardlimit is an error (they would do nothing). 0 is not set.
+            if client.hardlimit.unwrap_or(0) == 0 {
+                for (key, value) in [
+                    ("timelimit", client.timelimit),
+                    ("checklimit", client.checklimit),
+                    ("softlimit", client.softlimit),
+                ] {
+                    if value.unwrap_or(0) > 0 {
+                        return Err(format!("Client '{}' sets {} without hardlimit: the limits need a hardlimit bigger than 0", client.name, key));
+                    }
+                }
             }
 
             // An endless LTRIM loop while the target is over hardlimit (M3F-4)
@@ -1187,8 +1165,23 @@ fn verify_config(config: Config) -> Result<Config, String> {
     let mut config = config;
     for client in config.clients.iter_mut() {
         zero_limits_are_absent(client);
+        limits_defaults(client);
     }
     return Ok(config);
+}
+
+/// A target with a hardlimit and some of the other limit keys absent (M3-f = fa): softlimit
+/// 80 % of hardlimit, at least 1 so it can be freed (L4c-2); timelimit 1 s and checklimit
+/// 10000, each when not given, so a check comes at whichever is first (L4c-5)
+fn limits_defaults(client: &mut ClientConfig) {
+    if let Some(hard) = client.hardlimit {
+        client
+            .softlimit
+            // hard * 4 / 5 without overflowing a u64
+            .get_or_insert(cmp::max(1, hard / 5 * 4 + hard % 5 * 4 / 5));
+        client.timelimit.get_or_insert(DEFAULT_TIMELIMIT);
+        client.checklimit.get_or_insert(DEFAULT_CHECKLIMIT);
+    }
 }
 
 /// A limit key at 0 is not set (L4c-1): the check above always read it so, and now the
