@@ -825,7 +825,52 @@ fn unbounded_target_waited_seven_seconds(test: &str, cell: Cell) {
     assert!(p.stderr().contains("not connected yet"));
 }
 
+/// Every target restarted while the source is idle (a Redis restarted at night): the idle
+/// path of every thread, the workers' and the sender's, finds the broken link (PING) and
+/// reconnects it before packages come, so none is lost to it (L4c-6). Reproduced on the
+/// parent of this change: 0 of 20 delivered without ordering (the idle path sent nothing to
+/// a target that was not stuck), and 0 of 20 with ordering on the 4a tip too (the sender had
+/// no idle path).
+fn restarted_while_idle(test: &str, cell: Cell) {
+    let mut ctx = Ctx::new(test);
+    let src = ctx.key("src");
+    let mut targets: Vec<SlowTarget> = (0..cell.targets())
+        .map(|_| SlowTarget::start(Duration::ZERO))
+        .collect();
+    let clients: Vec<String> = targets
+        .iter()
+        .enumerate()
+        .map(|(i, t)| {
+            ctx.client_yaml_at(
+                &format!("t{}", i),
+                &format!("rmtest:{}:{}", test, i),
+                t.port,
+            )
+        })
+        .collect();
+    let cfg = ctx.config(&src, cell.children, cell.mode(), cell.extra(), &clients);
+    let mut p = ctx.spawn(&cfg);
+    thread::sleep(Duration::from_millis(1500));
+    for t in targets.iter_mut() {
+        *t = t.restart();
+    }
+    // Idle for longer than a turn of the idle path plus the 1 s backoff
+    thread::sleep(Duration::from_millis(3000));
+    let all: Vec<String> = (0..20).map(seq_pkg).collect();
+    ctx.push(&src, &all);
+    let want = if cell.spreader {
+        20
+    } else {
+        20 * targets.len()
+    };
+    ctx.wait_for("every package at the restarted targets", |_| {
+        targets.iter().map(|t| t.count()).sum::<usize>() == want
+    });
+    p.stop(&ctx.pid_file());
+}
+
 matrix!(target_closes, target_closes_mid_run, 2);
+matrix!(restarted_idle, restarted_while_idle, 2);
 matrix!(silent_start, silent_start_bounded, 2);
 matrix!(blackhole_start, blackhole_start_bounded, 2);
 matrix!(late_start, late_target_loses_nothing, 2);

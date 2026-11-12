@@ -799,7 +799,9 @@ fn ordered_sender_delivers_every_worker_package_once_in_ts_order() {
         let sink = out.clone();
         let b = buffer.clone();
         let sender = thread::spawn(move || {
-            send_ordered(&b, hold, |batch| sink.lock().unwrap().extend(batch));
+            send_ordered(&b, hold, |batch| {
+                sink.lock().unwrap().extend(batch.unwrap_or_default())
+            });
         });
         let pushers: Vec<_> = (0..workers)
             .map(|w| {
@@ -845,15 +847,38 @@ fn ordered_sender_delivers_every_worker_package_once_in_ts_order() {
 }
 
 #[test]
+fn ordered_sender_idle_turn_once_a_second() {
+    // L4c-3, L4c-6: with nothing to deliver the sender gets one idle turn a second (its
+    // idle path), not before the first second and not more often
+    let buffer = Arc::new(OrderBuffer::new());
+    let turns = Arc::new(Mutex::new(Vec::new()));
+    let (b, log) = (buffer.clone(), turns.clone());
+    let start = Instant::now();
+    let sender = thread::spawn(move || {
+        send_ordered(&b, Duration::ZERO, |batch| {
+            log.lock().unwrap().push((batch.is_none(), start.elapsed()))
+        })
+    });
+    thread::sleep(Duration::from_millis(2500));
+    buffer.finish();
+    sender.join().unwrap();
+    let turns = turns.lock().unwrap().clone();
+    assert_eq!(turns.len(), 2, "{:?}", turns);
+    assert!(turns.iter().all(|(idle, _)| *idle), "{:?}", turns);
+    assert!(turns[0].1 >= DEFAULT_CHECK, "{:?}", turns);
+    assert!(turns[1].1 >= turns[0].1 + DEFAULT_CHECK, "{:?}", turns);
+}
+
+#[test]
 fn ordered_sender_waits_without_spinning_and_wakes_on_push() {
-    // Nothing held: the sender waits on the condition variable (no periodic wake-up) and a
-    // push into the empty buffer wakes it.
+    // Nothing held: the sender waits on the condition variable (an idle turn once a second
+    // only, below) and a push into the empty buffer wakes it.
     let buffer = Arc::new(OrderBuffer::new());
     let out = Arc::new(Mutex::new(Vec::new()));
     let (b, sink) = (buffer.clone(), out.clone());
     let sender = thread::spawn(move || {
         send_ordered(&b, Duration::ZERO, |batch| {
-            sink.lock().unwrap().extend(batch)
+            sink.lock().unwrap().extend(batch.unwrap_or_default())
         })
     });
     thread::sleep(Duration::from_millis(50));

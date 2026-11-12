@@ -616,7 +616,7 @@ pub fn stop_under_load_cell(
 /// A stand-in Redis target that is slow on purpose: each RPUSH waits `delay` before its
 /// reply, and every pushed value is recorded in arrival order across all connections. A
 /// test sets how long a batch takes to deliver, whatever the speed of the machine.
-/// LLEN answers 0 (never over a limit); any other command answers +OK.
+/// LLEN answers 0 (never over a limit) and is counted; any other command answers +OK.
 /// close() takes it down for good: the port refuses connections and every open
 /// connection is closed. A request is either recorded and answered before close() or not
 /// recorded at all, so a test knows exactly what reached it.
@@ -629,6 +629,7 @@ pub struct SlowTarget {
 struct SlowState {
     pushed: Vec<String>,
     client_delay: Duration,
+    llens: usize,
     closed: bool,
     streams: Vec<TcpStream>,
     on_client: OnClient,
@@ -721,6 +722,11 @@ impl SlowTarget {
         self.shared.lock().unwrap().pushed.len()
     }
 
+    /// LLEN commands received so far
+    pub fn llens(&self) -> usize {
+        self.shared.lock().unwrap().llens
+    }
+
     /// Take the target down: open connections are closed and the port refuses new ones
     pub fn close(&self) {
         let mut g = self.shared.lock().unwrap();
@@ -731,6 +737,19 @@ impl SlowTarget {
         drop(g);
         // Wake the accept loop so it sees `closed` and drops the listener
         let _ = TcpStream::connect(("127.0.0.1", self.port));
+    }
+
+    /// The same target down and up again on its port, as a server restarted: every open
+    /// connection closed, then a fresh target (nothing pushed yet) on the same port
+    pub fn restart(&self) -> SlowTarget {
+        self.close();
+        // The accept loop drops the listener once it has seen `closed`
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while TcpListener::bind(("127.0.0.1", self.port)).is_err() {
+            assert!(Instant::now() < deadline, "port {} still bound", self.port);
+            thread::sleep(Duration::from_millis(10));
+        }
+        SlowTarget::start_on(self.port, Duration::ZERO, OnClient::Ok, AfterPush::Answer)
     }
 }
 
@@ -847,7 +866,10 @@ fn slow_target_serve(stream: TcpStream, delay: Duration, st: Arc<Mutex<SlowState
                     }
                 }
             }
-            "LLEN" => ":0\r\n".to_string(),
+            "LLEN" => {
+                g.llens += 1;
+                ":0\r\n".to_string()
+            }
             "CLIENT" if g.on_client == OnClient::Close => {
                 // A clone of the socket is kept for close(): shut it down for real
                 let _ = w.shutdown(std::net::Shutdown::Both);

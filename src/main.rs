@@ -1421,30 +1421,42 @@ fn next_release(st: &OrderState, hold: Duration) -> Option<Instant> {
         .and_then(|Reverse(head)| head.arrival.checked_add(hold))
 }
 
-/// The sender's loop: wait for due packages and hand each batch to `deliver` in order;
-/// end once finish() was called and the buffer is empty. No periodic wake-up: it sleeps
-/// until the head is due or a push into an empty buffer wakes it.
-fn send_ordered(buffer: &OrderBuffer, hold: Duration, mut deliver: impl FnMut(Vec<Vec<u8>>)) {
+/// The sender's loop: wait for due packages and hand each batch to `turn` in order, as
+/// `Some(batch)`; end once finish() was called and the buffer is empty. After a second
+/// with nothing delivered it calls `turn(None)`, once a second while that lasts, so the
+/// sender looks after its target links as the workers do on their idle path (L4c-3,
+/// L4c-6). Otherwise it sleeps until the head is due or a push into an empty buffer
+/// wakes it.
+fn send_ordered(buffer: &OrderBuffer, hold: Duration, mut turn: impl FnMut(Option<Vec<Vec<u8>>>)) {
     let mut st = buffer.state.lock().unwrap();
+    let mut active = Instant::now();
     loop {
         let batch = release(&mut st, Instant::now(), hold);
         if !batch.is_empty() {
             // Deliver without the lock, so children keep pushing meanwhile
             drop(st);
-            deliver(batch);
+            turn(Some(batch));
+            active = Instant::now();
             st = buffer.state.lock().unwrap();
             continue;
         }
         if st.finish {
             return;
         }
-        st = match next_release(&st, hold) {
-            Some(due) => {
-                let wait = due.saturating_duration_since(Instant::now());
-                buffer.wake.wait_timeout(st, wait).unwrap().0
-            }
-            None => buffer.wake.wait(st).unwrap(),
+        let tick = active + DEFAULT_CHECK;
+        if Instant::now() >= tick {
+            drop(st);
+            turn(None);
+            active = Instant::now();
+            st = buffer.state.lock().unwrap();
+            continue;
+        }
+        let until = match next_release(&st, hold) {
+            Some(due) => cmp::min(due, tick),
+            None => tick,
         };
+        let wait = until.saturating_duration_since(Instant::now());
+        st = buffer.wake.wait_timeout(st, wait).unwrap().0;
     }
 }
 
@@ -1462,20 +1474,26 @@ fn sender(
     // Nothing to deliver before the workers pop; at the stop finish() ends the wait
     let mut clients = new_targets(id, &config, &filters, || buffer.finished());
     let mut cursor: usize = 0;
-    send_ordered(buffer, hold, |batch| {
+    send_ordered(buffer, hold, |turn| {
         let (mut outgoing, mut dropped, mut deleted) = (0, 0, 0);
-        for package in &batch {
-            deliver(
-                id,
-                &filters.root,
-                &config,
-                &mut clients,
-                &mut cursor,
-                package,
-                &mut outgoing,
-                &mut dropped,
-                &mut deleted,
-            );
+        match turn {
+            Some(batch) => {
+                for package in &batch {
+                    deliver(
+                        id,
+                        &filters.root,
+                        &config,
+                        &mut clients,
+                        &mut cursor,
+                        package,
+                        &mut outgoing,
+                        &mut dropped,
+                        &mut deleted,
+                    );
+                }
+            }
+            // Nothing for a second: the idle path, as a worker's
+            None => refresh(id, &mut clients, &mut deleted),
         }
         report(
             worker_slot(&stats, id),
@@ -2272,6 +2290,12 @@ fn can_check_queue(
 }
 
 fn can_send(id: u16, client: &mut RedisLink, deleted: &mut u64) -> Result<bool, String> {
+    // Without a hardlimit a target has no limits: nothing would read its length, so no
+    // LLEN (1.0.8 sent one every second per target and thread, M3F-7)
+    if client.config.hardlimit.is_none() {
+        return Ok(true);
+    }
+
     // Check if we can check queue
     if can_check_queue(
         client.config.timelimit,
@@ -2550,15 +2574,35 @@ fn spread(cursor: &mut usize, n: usize, mut attempt: impl FnMut(usize) -> bool) 
     None
 }
 
-/// The idle path: refresh the limits state of every reachable target (1.0.8 behaviour,
-/// M3F-7 is stage 4); a failing target is handled alone, the worker goes on
+/// The idle path, at each empty BLPOP (once a second): a target that is down gets its
+/// reconnect attempt; a stuck target is re-checked, at most once a second, whatever its
+/// timelimit and checklimit say, so it is freed while nothing comes (L4c-3); every other
+/// connected target gets a PING, which finds a link that broke while the source was idle
+/// (a target restarted) before the next packages meet it (L4c-6). 1.0.8 ran the full
+/// check of every target here: an LLEN whose answer nothing read for a target without
+/// limits, and one taken from the countdown as if a package had gone (M3F-7). A failing
+/// target is handled alone, the worker goes on.
 fn refresh(id: u16, clients: &mut [RedisLink], deleted: &mut u64) {
     for client in clients.iter_mut() {
         if !ensure_link(id, client) {
             continue;
         }
-        // Only the refresh matters, not whether it could send
-        if let Err(e) = can_send(id, client, deleted) {
+        let result = if client.stuck_since.is_some() {
+            // Re-checked less than a second ago: not yet
+            if client
+                .last_check
+                .is_some_and(|at| at.elapsed() < DEFAULT_CHECK)
+            {
+                continue;
+            }
+            // Never checked counts as due: this check runs whatever the limits say
+            client.last_check = None;
+            // Only the refresh matters, not whether it could send
+            can_send(id, client, deleted).map(|_| ())
+        } else {
+            ping(client)
+        };
+        if let Err(e) = result {
             print_debug!(
                 PROGRAM_NAME,
                 stderr(),
@@ -2572,6 +2616,15 @@ fn refresh(id: u16, clients: &mut [RedisLink], deleted: &mut u64) {
             target_failed(client);
         }
     }
+}
+
+/// A PING on a target's link; an error that broke the link drops it
+fn ping(client: &mut RedisLink) -> Result<(), String> {
+    let result: redis::RedisResult<String> = redis::cmd("PING").query(link(&mut client.link)?);
+    result.map(|_| ()).map_err(|e| {
+        link_broken(client, &e);
+        format!("error on PING: {}", e)
+    })
 }
 
 #[cfg(test)]
