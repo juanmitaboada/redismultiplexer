@@ -81,7 +81,8 @@ fn command_timeout_default_is_five_seconds() {
         "mt_default",
         mute.port,
         "",
-        "Error while sending",
+        // The first command that waits is CLIENT SETNAME, at the connect
+        "Error while connecting",
         Duration::from_secs(15),
     )
     .expect("no send error within 15 s");
@@ -99,7 +100,7 @@ fn command_timeout_key() {
         "mt_key",
         mute.port,
         "    command_timeout: 0.4\n",
-        "Error while sending",
+        "Error while connecting",
         Duration::from_secs(10),
     )
     .expect("no send error within 10 s");
@@ -114,7 +115,7 @@ fn command_timeout_zero_waits_as_1_0_8() {
         "mt_zero",
         mute.port,
         "    command_timeout: 0\n",
-        "Error while sending",
+        "Error while",
         Duration::from_secs(7),
     );
     assert_eq!(t, None, "gave up although the key asks to wait");

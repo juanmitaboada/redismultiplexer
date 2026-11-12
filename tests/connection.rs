@@ -211,3 +211,67 @@ fn tls_target() {
     got.sort();
     assert_eq!(got, all, "{}", p.stderr());
 }
+
+#[test]
+fn connections_are_named() {
+    // CLIENT SETNAME on every connection: source, each worker's targets, the sender's
+    let mut ctx = Ctx::new("names");
+    let src = ctx.key("src");
+    let t0 = ctx.key("t0");
+    let client = ctx.client_yaml("t 0", &t0, "");
+    let cfg = ctx.config(&src, 2, "replicant", ORDERING_1S, &[client]);
+    let mut p = ctx.spawn(&cfg);
+    ctx.push(&src, &[seq_pkg(1)]);
+    ctx.wait_drained(&src, &[(&t0, 1)]);
+    let list: String = ctx.cmd(&["CLIENT", "LIST"]);
+    p.stop(&ctx.pid_file());
+    for name in [
+        "redismultiplexer:source:-:src0",
+        "redismultiplexer:source:-:src1",
+        "redismultiplexer:source:t_0:w0",
+        "redismultiplexer:source:t_0:w1",
+        "redismultiplexer:source:t_0:sender",
+    ] {
+        assert!(
+            list.contains(&format!("name={} ", name)),
+            "{} not in\n{}",
+            name,
+            list
+        );
+    }
+}
+
+/// A target that refuses CLIENT SETNAME, or closes the connection on it, still gets
+/// every package: the name is never a condition for a connection (M3R-2's proxy case)
+fn setname_is_optional(test: &str, on_client: OnClient) {
+    let mut ctx = Ctx::new(test);
+    let src = ctx.key("src");
+    let target = SlowTarget::start_with(std::time::Duration::ZERO, on_client);
+    let all = packages("n", 30);
+    ctx.push(&src, &all);
+    let client = ctx.client_yaml_at("t0", "rmtest:named", target.port);
+    let cfg = ctx.config(&src, 2, "replicant", "", &[client]);
+    let mut p = ctx.spawn(&cfg);
+    ctx.wait_for("every package at the target", |c| {
+        c.llen(&src) == 0 && target.count() == all.len()
+    });
+    p.stop(&ctx.pid_file());
+    let mut got = target.pushed();
+    got.sort();
+    assert_eq!(got, all);
+    assert!(
+        !p.stderr().contains("Error while connecting"),
+        "{}",
+        p.stderr()
+    );
+}
+
+#[test]
+fn setname_refused_is_ignored() {
+    setname_is_optional("setname_refused", OnClient::Error);
+}
+
+#[test]
+fn setname_closing_peer_gets_a_connection_without_it() {
+    setname_is_optional("setname_closed", OnClient::Close);
+}

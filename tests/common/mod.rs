@@ -630,13 +630,32 @@ struct SlowState {
     pushed: Vec<String>,
     closed: bool,
     streams: Vec<TcpStream>,
+    on_client: OnClient,
+}
+
+/// What a SlowTarget does with a CLIENT command (CLIENT SETNAME at each connect)
+#[derive(Clone, Copy, Default, PartialEq)]
+pub enum OnClient {
+    #[default]
+    Ok,
+    /// An error reply, as a server whose ACL denies the command
+    Error,
+    /// Closes the connection, as a proxy that does not allow the command (M3R-2)
+    Close,
 }
 
 impl SlowTarget {
     pub fn start(delay: Duration) -> SlowTarget {
+        SlowTarget::start_with(delay, OnClient::Ok)
+    }
+
+    pub fn start_with(delay: Duration, on_client: OnClient) -> SlowTarget {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
-        let shared = Arc::new(Mutex::new(SlowState::default()));
+        let shared = Arc::new(Mutex::new(SlowState {
+            on_client,
+            ..SlowState::default()
+        }));
         let st = shared.clone();
         // The accept thread ends at close() (dropping the listener closes the port) or with
         // the test process; each connection thread ends when its connection closes
@@ -774,6 +793,14 @@ fn slow_target_serve(stream: TcpStream, delay: Duration, st: Arc<Mutex<SlowState
                 format!(":{}\r\n", g.pushed.len())
             }
             "LLEN" => ":0\r\n".to_string(),
+            "CLIENT" if g.on_client == OnClient::Close => {
+                // A clone of the socket is kept for close(): shut it down for real
+                let _ = w.shutdown(std::net::Shutdown::Both);
+                return;
+            }
+            "CLIENT" if g.on_client == OnClient::Error => {
+                "-NOPERM this user has no permissions to run the 'client' command\r\n".to_string()
+            }
             _ => "+OK\r\n".to_string(),
         };
         if w.write_all(reply.as_bytes()).is_err() {

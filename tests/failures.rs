@@ -300,8 +300,16 @@ fn blackhole_target(test: &str, cell: Cell) {
 }
 
 fn silent_target(test: &str, cell: Cell) {
+    // Silent from the first command: CLIENT SETNAME at the connect times out
     let mute = SilentTarget::start();
     unanswering_target(test, cell, mute.port);
+}
+
+fn stalled_target(test: &str, cell: Cell) {
+    // Answers the connect and CLIENT SETNAME, then never answers an RPUSH: the command
+    // timeout on a working link
+    let stall = SlowTarget::start(Duration::from_secs(3600));
+    unanswering_target(test, cell, stall.port);
 }
 
 /// A blackholed target (its connects hang until the connect timeout) does not stall the
@@ -354,10 +362,107 @@ fn blackhole_does_not_stall(test: &str, cell: Cell) {
     );
 }
 
+/// Threads that hold links to the targets: each worker, and the sender with ordering
+fn link_holders(cell: Cell) -> usize {
+    cell.children as usize + cell.ordering as usize
+}
+
+/// A target that stays unreachable prints one line per thread when it goes down, not one
+/// per failed retry (S4-4 = a): about 4 s with a 0.2 s connect timeout is three or four
+/// attempts per thread.
+fn one_line_while_down(test: &str, cell: Cell) {
+    let hole = blackhole();
+    let mut ctx = Ctx::new(test);
+    let src = ctx.key("src");
+    let t0 = ctx.key("t0");
+    let clients = [
+        ctx.client_yaml("t0", &t0, ""),
+        ctx.client_yaml_at("hole", "rmtest:hole", hole.port) + SHORT_TIMEOUTS,
+    ];
+    let cfg = ctx.config(&src, cell.children, cell.mode(), cell.extra(), &clients);
+    let mut p = ctx.spawn(&cfg);
+    let feeder = feed(&ctx, &src, 4000);
+    feeder.join().unwrap();
+    p.stop(&ctx.pid_file());
+    let lines = p.stderr().matches("Error while connecting").count();
+    assert_eq!(lines, link_holders(cell), "{}", p.stderr());
+}
+
+/// The program's connections to `target` (their names end in `:<target>:<role>`) killed
+/// on the server; how many there were
+fn kill_connections(ctx: &mut Ctx, target: &str) -> usize {
+    let list: String = ctx.cmd(&["CLIENT", "LIST"]);
+    let ids: Vec<String> = list
+        .lines()
+        .filter(|l| l.contains(&format!("name=redismultiplexer:source:{}:", target)))
+        .filter_map(|l| l.split(' ').find_map(|f| f.strip_prefix("id=")))
+        .map(|id| id.to_string())
+        .collect();
+    for id in &ids {
+        let _: i64 = ctx.cmd(&["CLIENT", "KILL", "ID", id]);
+    }
+    ids.len()
+}
+
+/// A target's connections killed in the middle of a run (plan 6: killed_target_connection_
+/// recovers, found by the names CLIENT SETNAME gives them): delivery to it resumes after
+/// the backoff and each thread says once that it is back. Nothing reaches a target twice.
+fn killed_connections_recover(test: &str, cell: Cell) {
+    let mut ctx = Ctx::new(test);
+    let src = ctx.key("src");
+    let keys: Vec<String> = (0..cell.targets())
+        .map(|i| ctx.key(&format!("t{}", i)))
+        .collect();
+    let clients: Vec<String> = keys
+        .iter()
+        // Named after the key: other tests' programs run beside this one on the server
+        .map(|k| ctx.client_yaml(k, k, ""))
+        .collect();
+    let cfg = ctx.config(&src, cell.children, cell.mode(), cell.extra(), &clients);
+    let mut p = ctx.spawn(&cfg);
+    let n = 5000;
+    let feeder = feed(&ctx, &src, n);
+    ctx.wait_for("deliveries to t0", |c| c.llen(&keys[0]) > 200);
+    let killed = kill_connections(&mut ctx, &keys[0].clone());
+    assert_eq!(killed, link_holders(cell), "connections named for t0");
+    let at_kill = ctx.llen(&keys[0]);
+    feeder.join().unwrap();
+    ctx.wait_for("the source drained", |c| c.llen(&src) == 0);
+    ctx.wait_for("deliveries to t0 after the kill", |c| {
+        c.llen(&keys[0]) > at_kill + 500
+    });
+    p.stop(&ctx.pid_file());
+    // The threads that deliver notice at their next RPUSH: every worker, or with ordering
+    // the sender (the workers send nothing then, and notice only when they go idle)
+    let back = p.stderr().matches("is back after").count();
+    let delivering = if cell.ordering {
+        1
+    } else {
+        cell.children as usize
+    };
+    assert!(
+        back >= delivering && back <= killed,
+        "{} back lines for {} killed: {}",
+        back,
+        killed,
+        p.stderr()
+    );
+    for k in &keys {
+        let mut l = ctx.list(k);
+        let len = l.len();
+        l.sort();
+        l.dedup();
+        assert_eq!(l.len(), len, "a package twice on {}", k);
+    }
+}
+
 matrix!(target_closes, target_closes_mid_run, 2);
+matrix!(down_one_line, one_line_while_down, 2);
+matrix!(killed_recover, killed_connections_recover, 2);
 matrix!(blackhole_no_stall, blackhole_does_not_stall, 2);
 matrix!(target_blackhole, blackhole_target, 2);
 matrix!(target_silent, silent_target, 2);
+matrix!(target_stalled, stalled_target, 2);
 matrix!(target_unreachable, target_unreachable_from_start, 2);
 matrix!(wrongtype, wrongtype_target, 2);
 matrix!(stop_target_down, stop_with_a_target_down, 4);

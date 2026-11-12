@@ -189,6 +189,8 @@ struct RedisLink {
     request: Vec<u8>,                // RPUSH request buffer, reused for every package
     endpoint: Endpoint,              // where to connect, built once
     connecting: Option<Connecting>,  // an attempt running outside this thread (X1c)
+    down_since: Option<Instant>,     // when it was last seen working, while it is down
+    attempts: u32,                   // failed connects since it went down (S4-4)
 }
 
 /// The result of a connect attempt that runs in its own short-lived thread, so a target
@@ -208,6 +210,17 @@ struct Endpoint {
     database: u32,
     connect_timeout: Option<Duration>, // None: no limit
     command_timeout: Option<Duration>, // None: no limit
+    name: Option<String>,              // CLIENT SETNAME after the connect
+}
+
+/// The name a connection gets with CLIENT SETNAME, so operators and tests can tell them
+/// apart: `redismultiplexer:<source>:<target>:<role>`; what a name may not hold (spaces,
+/// control characters, anything outside printable ASCII) becomes `_`
+fn connection_name(source: &str, target: &str, role: &str) -> String {
+    format!("{}:{}:{}:{}", "redismultiplexer", source, target, role)
+        .chars()
+        .map(|c| if c.is_ascii_graphic() { c } else { '_' })
+        .collect()
 }
 
 /// A timeout key as a Duration: absent is `default`, 0 is no limit (None). Checked by
@@ -253,6 +266,14 @@ impl Endpoint {
             database: database.unwrap_or(0),
             connect_timeout: timeout_key(connect_timeout, DEFAULT_CONNECT_TIMEOUT),
             command_timeout: timeout_key(command_timeout, DEFAULT_COMMAND_TIMEOUT),
+            name: None,
+        }
+    }
+
+    fn named(self, name: String) -> Endpoint {
+        Endpoint {
+            name: Some(name),
+            ..self
         }
     }
 
@@ -1452,8 +1473,14 @@ fn new_targets(id: u16, config: &Config, filters: &Filters) -> Vec<RedisLink> {
             lastcheck: 0,
             filter: filter.clone(),
             request: Vec::new(),
-            endpoint: Endpoint::target(client),
+            endpoint: Endpoint::target(client).named(connection_name(
+                &config.name,
+                &client.name,
+                &role(id, config),
+            )),
             connecting: None,
+            down_since: None,
+            attempts: 0,
         })
         .collect();
     // Every first attempt at once, then wait for all of them: before the first package a
@@ -1472,6 +1499,16 @@ fn new_targets(id: u16, config: &Config, filters: &Filters) -> Vec<RedisLink> {
     clients
 }
 
+/// The role in a connection's name: `w<k>` for worker k, `sender` for the sender (its id
+/// is the one after the last worker's)
+fn role(id: u16, config: &Config) -> String {
+    if id == config.children {
+        "sender".to_string()
+    } else {
+        format!("w{}", id)
+    }
+}
+
 /// A connect attempt in its own thread; its result comes through the returned channel.
 /// If nobody waits for it any more, the link it makes is dropped with the channel.
 fn connect_in_background(id: u16, endpoint: &Endpoint) -> Connecting {
@@ -1483,26 +1520,46 @@ fn connect_in_background(id: u16, endpoint: &Endpoint) -> Connecting {
     rx
 }
 
-/// Takes the result of a connect attempt: the link, or the error line and the backoff
+/// Takes the result of a connect attempt: the link, or the backoff. One line when the
+/// target goes down and one when it is back; the failed retries in between print nothing
+/// (S4-4 = a)
 fn connected(client: &mut RedisLink, result: Result<redis::Connection, String>) -> bool {
     match result {
         Ok(link) => {
             client.link = Some(link);
             client.retry_at = None;
+            if let Some(since) = client.down_since.take() {
+                print_debug!(
+                    PROGRAM_NAME,
+                    stderr(),
+                    COLOR_GREEN,
+                    0,
+                    "Target '{}:{}@{}' is back after {:.1} s ({} failed connects)",
+                    client.config.hostname,
+                    client.config.port,
+                    client.config.channel,
+                    since.elapsed().as_secs_f64(),
+                    client.attempts
+                );
+            }
+            client.attempts = 0;
             true
         }
         Err(e) => {
-            print_debug!(
-                PROGRAM_NAME,
-                stderr(),
-                COLOR_RED,
-                0,
-                "Error while connecting to target '{}:{}@{}': {}",
-                client.config.hostname,
-                client.config.port,
-                client.config.channel,
-                e
-            );
+            if client.down_since.is_none() {
+                print_debug!(
+                    PROGRAM_NAME,
+                    stderr(),
+                    COLOR_RED,
+                    0,
+                    "Error while connecting to target '{}:{}@{}': {}",
+                    client.config.hostname,
+                    client.config.port,
+                    client.config.channel,
+                    e
+                );
+            }
+            client.attempts += 1;
             mark_down(client);
             false
         }
@@ -1543,6 +1600,7 @@ fn ensure_link(id: u16, client: &mut RedisLink) -> bool {
 /// No link until the backoff has passed; the next failure waits twice as long, up to
 /// TARGET_BACKOFF_MAX (plan 2.2). A command that succeeds resets it.
 fn mark_down(client: &mut RedisLink) {
+    client.down_since.get_or_insert_with(Instant::now);
     client.link = None;
     client.retry_at = Some(Instant::now() + client.backoff);
     client.backoff = cmp::min(client.backoff * 2, TARGET_BACKOFF_MAX);
@@ -1598,7 +1656,9 @@ fn child(
     // The targets live as long as the worker: a source error reconnects the source only,
     // and a target that cannot be reached does not keep the worker from the others (L3b)
     let mut clients = new_targets(id, &config, &filters);
-    let source_endpoint = Endpoint::source(&config);
+    // `-`: a source connection has no target
+    let source_endpoint =
+        Endpoint::source(&config).named(connection_name(&config.name, "-", &format!("src{}", id)));
 
     // Prepare the retention data
     while keepworking {
@@ -2013,6 +2073,28 @@ fn redis_connect(
     link.set_read_timeout(read)
         .and_then(|_| link.set_write_timeout(endpoint.command_timeout))
         .map_err(|e| format!("Couldn't set the timeouts: {}", e))?;
+    let mut link = link;
+    if let Some(name) = &endpoint.name {
+        // The name is for operators: refused (ACL, renamed command) it is skipped; a peer
+        // that closes on the command (a proxy, M3R-2) gets a fresh connection without it;
+        // one that does not answer within the command timeout is not usable at all
+        if let Err(e) = redis::cmd("CLIENT")
+            .arg("SETNAME")
+            .arg(name)
+            .query::<()>(&mut link)
+        {
+            if e.is_timeout() {
+                return Err(format!("no answer to CLIENT SETNAME: {}", e));
+            }
+            if e.is_io_error() || !link.is_open() {
+                let unnamed = Endpoint {
+                    name: None,
+                    ..endpoint.clone()
+                };
+                return redis_connect(_id, &unnamed, is_client);
+            }
+        }
+    }
     Ok(link)
 }
 
