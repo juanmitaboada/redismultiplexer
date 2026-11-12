@@ -622,7 +622,44 @@ fn backoff_grows_and_resets_sender() {
     backoff_grows_and_resets("backoff_sender", true);
 }
 
+/// A target that does not answer does not hold a thread's start: the first connects run
+/// at once and a thread waits for them at most 1 s, so the healthy targets get the first
+/// packages long before the silent one's 5 s command timeout (X1c). Before, every thread
+/// waited for each first connect, CLIENT SETNAME included.
+fn silent_target_does_not_hold_the_start(test: &str, cell: Cell) {
+    let mute = SilentTarget::start();
+    let mut ctx = Ctx::new(test);
+    let src = ctx.key("src");
+    let real: Vec<String> = (0..cell.targets())
+        .map(|i| ctx.key(&format!("t{}", i)))
+        .collect();
+    let mut clients: Vec<String> = real
+        .iter()
+        .enumerate()
+        .map(|(i, k)| ctx.client_yaml(&format!("t{}", i), k, ""))
+        .collect();
+    // Default timeouts on purpose: the start must not wait for them
+    clients.insert(0, ctx.client_yaml_at("mute", "rmtest:mute", mute.port));
+    let input: Vec<String> = (0..20).map(seq_pkg).collect();
+    ctx.push(&src, &input);
+    let cfg = ctx.config(&src, cell.children, cell.mode(), cell.extra(), &clients);
+    let start = Instant::now();
+    let mut p = ctx.spawn(&cfg);
+    ctx.wait_for("the first package at a healthy target", |c| {
+        real.iter().map(|k| c.llen(k)).sum::<usize>() > 0
+    });
+    let first = start.elapsed();
+    p.stop(&ctx.pid_file());
+    // 1 s of start grace, 1 s of ordering hold, margin for a loaded machine
+    assert!(
+        first < Duration::from_secs(4),
+        "first delivery after {:?}",
+        first
+    );
+}
+
 matrix!(target_closes, target_closes_mid_run, 2);
+matrix!(silent_start, silent_target_does_not_hold_the_start, 2);
 matrix!(ambiguous_closes, ambiguous_close, 2);
 matrix!(ambiguous_silent_push, ambiguous_silent, 2);
 matrix!(down_one_line, one_line_while_down, 2);

@@ -1483,17 +1483,24 @@ fn new_targets(id: u16, config: &Config, filters: &Filters) -> Vec<RedisLink> {
             attempts: 0,
         })
         .collect();
-    // Every first attempt at once, then wait for all of them: before the first package a
-    // thread waits for its slowest target, not for the sum of them
+    // Every first attempt at once, then wait for them up to START_GRACE: a reachable
+    // target is connected before the first package, one that does not answer does not
+    // hold the start (its attempt goes on in the background, X1c)
     for client in clients.iter_mut() {
         client.connecting = Some(connect_in_background(id, &client.endpoint));
     }
+    let deadline = Instant::now() + START_GRACE;
     for client in clients.iter_mut() {
         if let Some(rx) = client.connecting.take() {
-            let result = rx
-                .recv()
-                .unwrap_or_else(|_| Err("connect thread ended".to_string()));
-            connected(client, result);
+            match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+                Ok(result) => {
+                    connected(client, result);
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => client.connecting = Some(rx),
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    connected(client, Err("connect thread ended".to_string()));
+                }
+            }
         }
     }
     clients
