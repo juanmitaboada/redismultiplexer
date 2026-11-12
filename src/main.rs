@@ -182,9 +182,9 @@ struct RedisLink {
     link: Option<redis::Connection>, // None while the target cannot be reached (L3b)
     retry_at: Option<Instant>,       // no connect attempt before this
     backoff: Duration,               // wait after the next failure: 1 s, doubling to 5 s
-    sleeping_from: u64,              // If queue is stuck, when did it happened
+    stuck_since: Option<Instant>,    // Some while the queue is stuck (hardlimit reached)
     packages: u64,                   // Packages we have seen from last check
-    lastcheck: u64,                  // When was the last check of queue's size (time limit)
+    last_check: Option<Instant>,     // last check of the queue's size; None: never (L1a)
     filter: Option<Filter>,          // Client filter, compiled at start
     request: Vec<u8>,                // RPUSH request buffer, reused for every package
     endpoint: Endpoint,              // where to connect, built once
@@ -1480,9 +1480,9 @@ fn new_targets(
             link: None,
             retry_at: None,
             backoff: TARGET_BACKOFF_MIN,
-            sleeping_from: 0,
+            stuck_since: None,
             packages: 0,
-            lastcheck: 0,
+            last_check: None,
             filter: filter.clone(),
             request: Vec::new(),
             endpoint: Endpoint::target(client).named(connection_name(
@@ -2095,7 +2095,7 @@ fn report(
 ) {
     slot.add(incoming, outgoing, dropped, deleted);
     for (flag, client) in slot.stuck.iter().zip(clients) {
-        flag.store(client.sleeping_from > 0, Ordering::Relaxed);
+        flag.store(client.stuck_since.is_some(), Ordering::Relaxed);
     }
 }
 
@@ -2216,104 +2216,29 @@ fn pack_rpush(buf: &mut Vec<u8>, key: &[u8], value: &[u8]) {
     }
 }
 
+/// Whether the queue of a target is due a check (L1a: monotonic clock, `>=`): never
+/// checked yet, `timelimit` seconds since the last check, or the countdown at 0. A target
+/// without `timelimit` and `checklimit` is checked every `DEFAULT_CHECK`.
 fn can_check_queue(
     timelimit: Option<u64>,
     checklimit: Option<u64>,
     packages: u64,
-    lastcheck: u64,
+    last_check: Option<Instant>,
+    now: Instant,
 ) -> bool {
-    #[cfg(feature = "debug")]
-    print_debug!(
-        PROGRAM_NAME,
-        stdout(),
-        COLOR_CYAN,
-        0,
-        "can_check_queue(): timelimit={:?}  checklimit={:?}   packages={}   lastcheck:{}",
-        timelimit,
-        checklimit,
-        packages,
-        lastcheck
-    );
-
-    // No config
+    let since = match last_check {
+        None => return true,
+        Some(at) => now.saturating_duration_since(at),
+    };
     if (timelimit == None) && (checklimit == None) {
-        // No configuration set, using default CHECK SECONDS
-        #[cfg(feature = "debug")]
-        print_debug!(
-            PROGRAM_NAME,
-            stdout(),
-            COLOR_WHITE,
-            0,
-            "can_check_queue(): No configuration set, using DEFAULT_CHECK_SECONDS={} -> {:?}",
-            DEFAULT_CHECK_SECONDS,
-            (lastcheck + DEFAULT_CHECK_SECONDS) < get_current_time()
-        );
-        return (lastcheck + DEFAULT_CHECK_SECONDS) < get_current_time();
-    } else {
-        // Check by timelimit
-        match timelimit {
-            None => (),
-            Some(ts) => {
-                if (lastcheck + ts) < get_current_time() {
-                    #[cfg(feature = "debug")]
-                    print_debug!(
-                        PROGRAM_NAME,
-                        stdout(),
-                        COLOR_GREEN,
-                        0,
-                        "can_check_queue(): timelimit=true"
-                    );
-                    return true;
-                } else {
-                    #[cfg(feature = "debug")]
-                    print_debug!(
-                        PROGRAM_NAME,
-                        stdout(),
-                        COLOR_RED,
-                        0,
-                        "can_check_queue(): timelimit=false"
-                    );
-                }
-            }
-        }
-        // Check by checklimit
-        match checklimit {
-            None => (),
-            Some(_) => {
-                if packages == 0 {
-                    #[cfg(feature = "debug")]
-                    print_debug!(
-                        PROGRAM_NAME,
-                        stdout(),
-                        COLOR_GREEN,
-                        0,
-                        "can_check_queue(): packages=true"
-                    );
-                    return true;
-                } else {
-                    #[cfg(feature = "debug")]
-                    print_debug!(
-                        PROGRAM_NAME,
-                        stdout(),
-                        COLOR_RED,
-                        0,
-                        "can_check_queue(): packages=false"
-                    );
-                }
-            }
+        return since >= DEFAULT_CHECK;
+    }
+    if let Some(t) = timelimit {
+        if since >= Duration::from_secs(t) {
+            return true;
         }
     }
-
-    #[cfg(feature = "debug")]
-    print_debug!(
-        PROGRAM_NAME,
-        stdout(),
-        COLOR_RED,
-        0,
-        "can_check_queue(): default=false"
-    );
-
-    return false;
+    checklimit.is_some() && packages == 0
 }
 
 fn can_send(id: u16, client: &mut RedisLink, deleted: &mut u64) -> Result<bool, String> {
@@ -2322,10 +2247,11 @@ fn can_send(id: u16, client: &mut RedisLink, deleted: &mut u64) -> Result<bool, 
         client.config.timelimit,
         client.config.checklimit,
         client.packages,
-        client.lastcheck,
+        client.last_check,
+        Instant::now(),
     ) {
         // Reset timers
-        client.lastcheck = get_current_time();
+        client.last_check = Some(Instant::now());
         match client.config.checklimit {
             None => client.packages = 0,
             Some(v) => client.packages = v,
@@ -2336,12 +2262,12 @@ fn can_send(id: u16, client: &mut RedisLink, deleted: &mut u64) -> Result<bool, 
         match result {
             Ok(len) => {
                 if client.config.hardlimit != None {
-                    if client.sleeping_from == 0 {
+                    if client.stuck_since.is_none() {
                         // The client is not sleeping
                         if (len as u64) >= client.config.hardlimit.unwrap() {
                             if client.config.deleteblock == None {
                                 // We lock the client
-                                client.sleeping_from = get_current_time();
+                                client.stuck_since = Some(Instant::now());
                                 print_debug!(
                                     PROGRAM_NAME,
                                     stderr(),
@@ -2389,7 +2315,7 @@ fn can_send(id: u16, client: &mut RedisLink, deleted: &mut u64) -> Result<bool, 
                         // The client is sleeping (stuck)
                         if (len as u64) < client.config.softlimit.unwrap() {
                             // We lock the client
-                            client.sleeping_from = 0;
+                            client.stuck_since = None;
                             print_debug!(
                                 PROGRAM_NAME,
                                 stderr(),
@@ -2407,7 +2333,7 @@ fn can_send(id: u16, client: &mut RedisLink, deleted: &mut u64) -> Result<bool, 
 
                 #[cfg(feature = "debug")]
                 {
-                    if client.sleeping_from == 0 {
+                    if client.stuck_since.is_none() {
                         print_debug!(PROGRAM_NAME, stdout(), COLOR_GREEN, 0, "{}: can_send(): not stuck yet :: len={}   softlimit={}   hardlimit{}   =>   true", id, len, client.config.softlimit.unwrap(), client.config.hardlimit.unwrap());
                     } else {
                         print_debug!(PROGRAM_NAME, stdout(), COLOR_RED, 0, "{}: can_send(): not stuck yet :: len={}   softlimit={}   hardlimit{}   =>   false", id, len, client.config.softlimit.unwrap(), client.config.hardlimit.unwrap());
@@ -2415,7 +2341,7 @@ fn can_send(id: u16, client: &mut RedisLink, deleted: &mut u64) -> Result<bool, 
                 }
 
                 // If not stuck, can keep sending
-                return Ok(client.sleeping_from == 0);
+                return Ok(client.stuck_since.is_none());
             }
             Err(e) => {
                 link_broken(client, &e);
@@ -2428,7 +2354,7 @@ fn can_send(id: u16, client: &mut RedisLink, deleted: &mut u64) -> Result<bool, 
 
         #[cfg(feature = "debug")]
         {
-            if client.sleeping_from == 0 {
+            if client.stuck_since.is_none() {
                 print_debug!(
                     PROGRAM_NAME,
                     stdout(),
@@ -2452,7 +2378,7 @@ fn can_send(id: u16, client: &mut RedisLink, deleted: &mut u64) -> Result<bool, 
         }
 
         // Return whatever is the status of the queue (we can not check it out)
-        return Ok(client.sleeping_from == 0);
+        return Ok(client.stuck_since.is_none());
     }
 }
 

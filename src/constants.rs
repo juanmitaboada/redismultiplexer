@@ -2,7 +2,8 @@ use std::time::Duration;
 
 pub static PROGRAM_NAME: &str = "RedisMultiplexer";
 pub static STATISTICS_SECONDS: u128 = 10;
-pub static DEFAULT_CHECK_SECONDS: u64 = 1;
+// How often a target without timelimit and checklimit is checked (L1a: monotonic clock)
+pub const DEFAULT_CHECK: Duration = Duration::from_secs(1);
 pub static MAX_QUEUE_SIZE: isize = 100000000;
 
 // Connections (plan 2.2, M3-g = ga): defaults of the `connect_timeout` and

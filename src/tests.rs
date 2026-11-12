@@ -921,24 +921,57 @@ fn ordering_ts_missing_or_unparsable() {
 // --- can_check_queue ---
 
 #[test]
-fn check_queue_default_interval_without_limits() {
-    assert!(can_check_queue(None, None, 0, 0));
-    assert!(!can_check_queue(None, None, 0, get_current_time()));
+fn check_queue_first_offer_checks() {
+    let now = Instant::now();
+    assert!(can_check_queue(None, None, 0, None, now));
+    assert!(can_check_queue(Some(3600), Some(100), 5, None, now));
 }
 
 #[test]
-fn check_queue_timelimit() {
-    let now = get_current_time();
-    assert!(can_check_queue(Some(5), None, 1, now - 10));
-    assert!(!can_check_queue(Some(5), None, 1, now));
+fn check_queue_default_interval_without_limits() {
+    // L1a: at exactly DEFAULT_CHECK since the last check, not one 1 ms before
+    let at = Instant::now();
+    assert!(!can_check_queue(None, None, 0, Some(at), at));
+    assert!(!can_check_queue(
+        None,
+        None,
+        0,
+        Some(at),
+        at + DEFAULT_CHECK - Duration::from_millis(1)
+    ));
+    assert!(can_check_queue(None, None, 0, Some(at), at + DEFAULT_CHECK));
+}
+
+#[test]
+fn check_queue_timelimit_in_milliseconds() {
+    // L1a: `timelimit: 5` is due at 5 s since the last check (1.0.8 and main: between 5
+    // and 6 s, whole wall-clock seconds and a strict compare)
+    let at = Instant::now();
+    let five = Duration::from_secs(5);
+    assert!(!can_check_queue(Some(5), None, 1, Some(at), at));
+    assert!(!can_check_queue(
+        Some(5),
+        None,
+        1,
+        Some(at),
+        at + five - Duration::from_millis(1)
+    ));
+    assert!(can_check_queue(Some(5), None, 1, Some(at), at + five));
+}
+
+#[test]
+fn check_queue_clock_never_goes_back() {
+    // An instant before the last check (cannot happen on a monotonic clock) is not due
+    let at = Instant::now() + Duration::from_secs(10);
+    assert!(!can_check_queue(Some(5), None, 1, Some(at), Instant::now()));
 }
 
 #[test]
 fn check_queue_checklimit() {
-    let now = get_current_time();
-    assert!(can_check_queue(None, Some(100), 0, now));
-    assert!(!can_check_queue(None, Some(100), 3, now));
-    assert!(can_check_queue(Some(3600), Some(100), 0, now));
+    let at = Instant::now();
+    assert!(can_check_queue(None, Some(100), 0, Some(at), at));
+    assert!(!can_check_queue(None, Some(100), 3, Some(at), at));
+    assert!(can_check_queue(Some(3600), Some(100), 0, Some(at), at));
 }
 
 // --- verify_config ---
