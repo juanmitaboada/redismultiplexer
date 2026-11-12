@@ -1179,7 +1179,27 @@ fn verify_config(config: Config) -> Result<Config, String> {
     // Every filter must compile: a bad client regex used to panic the workers (M1F-8)
     build_filters(&config)?;
 
+    let mut config = config;
+    for client in config.clients.iter_mut() {
+        zero_limits_are_absent(client);
+    }
     return Ok(config);
+}
+
+/// A limit key at 0 is not set (L4c-1): the check above always read it so, and now the
+/// delivery does too (a target with every limit at 0 was stuck for the whole run and
+/// dropped every package, M3F-17; `checklimit: 0` alone cost an LLEN per package)
+fn zero_limits_are_absent(client: &mut ClientConfig) {
+    for key in [
+        &mut client.timelimit,
+        &mut client.checklimit,
+        &mut client.softlimit,
+        &mut client.hardlimit,
+    ] {
+        if *key == Some(0) {
+            *key = None;
+        }
+    }
 }
 
 /// Read configuration and parse it from YAML format to Struct
@@ -1475,26 +1495,7 @@ fn new_targets(
         .clients
         .iter()
         .zip(&filters.clients)
-        .map(|(client, filter)| RedisLink {
-            config: client.clone(),
-            link: None,
-            retry_at: None,
-            backoff: TARGET_BACKOFF_MIN,
-            stuck_since: None,
-            packages: 0,
-            last_check: None,
-            filter: filter.clone(),
-            request: Vec::new(),
-            endpoint: Endpoint::target(client).named(connection_name(
-                &config.name,
-                &client.name,
-                &role(id, config),
-            )),
-            connecting: None,
-            down_since: None,
-            attempts: 0,
-            skip_noted: false,
-        })
+        .map(|(client, filter)| new_link(id, config, client, filter))
         .collect();
     // Every first attempt at once, then wait for each up to its own bound before the
     // first pop (M3R-23 = R23a): a target that answers late at start loses nothing, as in
@@ -1540,6 +1541,30 @@ fn start_bound(endpoint: &Endpoint) -> Duration {
     match (endpoint.connect_timeout, endpoint.command_timeout) {
         (Some(connect), Some(command)) => connect + command,
         _ => DEFAULT_CONNECT_TIMEOUT + DEFAULT_COMMAND_TIMEOUT,
+    }
+}
+
+/// A target's link state, not connected yet
+fn new_link(id: u16, config: &Config, client: &ClientConfig, filter: &Option<Filter>) -> RedisLink {
+    RedisLink {
+        config: client.clone(),
+        link: None,
+        retry_at: None,
+        backoff: TARGET_BACKOFF_MIN,
+        stuck_since: None,
+        packages: 0,
+        last_check: None,
+        filter: filter.clone(),
+        request: Vec::new(),
+        endpoint: Endpoint::target(client).named(connection_name(
+            &config.name,
+            &client.name,
+            &role(id, config),
+        )),
+        connecting: None,
+        down_since: None,
+        attempts: 0,
+        skip_noted: false,
     }
 }
 
@@ -2349,8 +2374,11 @@ fn can_send(id: u16, client: &mut RedisLink, deleted: &mut u64) -> Result<bool, 
             }
         };
     } else {
-        // Count down packages
-        client.packages -= 1;
+        // Count down packages, only with a checklimit (without one the counter was 0
+        // after every check and this underflowed: a panic in a debug build, A-C4, M1F-1)
+        if client.config.checklimit.is_some() {
+            client.packages = client.packages.saturating_sub(1);
+        }
 
         #[cfg(feature = "debug")]
         {

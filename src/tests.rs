@@ -974,6 +974,57 @@ fn check_queue_checklimit() {
     assert!(can_check_queue(Some(3600), Some(100), 0, Some(at), at));
 }
 
+#[test]
+fn countdown_without_checklimit_never_underflows() {
+    // A-C4, M1F-1: a target with limits and no checklimit, between two checks. Before,
+    // every offer took one from a counter left at 0: a panic in a debug build, a wrap to
+    // u64::MAX in a release build. No connection is used: no check is due.
+    let c = config();
+    let mut t = client("t1", "dst");
+    t.hardlimit = Some(10);
+    t.timelimit = Some(3600);
+    let mut link = new_link(0, &c, &t, &None);
+    link.last_check = Some(Instant::now());
+    let mut deleted = 0;
+    for _ in 0..3 {
+        assert_eq!(can_send(0, &mut link, &mut deleted), Ok(true));
+    }
+    assert_eq!(link.packages, 0);
+}
+
+#[test]
+fn countdown_with_checklimit_counts_down_to_zero() {
+    let c = config();
+    let mut t = client("t1", "dst");
+    t.hardlimit = Some(10);
+    t.checklimit = Some(2);
+    t.timelimit = Some(3600);
+    let mut link = new_link(0, &c, &t, &None);
+    link.last_check = Some(Instant::now());
+    link.packages = 2;
+    let mut deleted = 0;
+    assert_eq!(can_send(0, &mut link, &mut deleted), Ok(true));
+    assert_eq!(link.packages, 1);
+    assert_eq!(can_send(0, &mut link, &mut deleted), Ok(true));
+    assert_eq!(link.packages, 0);
+}
+
+#[test]
+fn zero_limits_read_as_absent() {
+    // L4c-1, M3F-17: accepted as "no limits" by the check, and now delivered so too
+    let mut c = config();
+    c.clients[0].timelimit = Some(0);
+    c.clients[0].checklimit = Some(0);
+    c.clients[0].softlimit = Some(0);
+    c.clients[0].hardlimit = Some(0);
+    let c = verify_config(c).expect("all limits at 0 is a target without limits");
+    let t = &c.clients[0];
+    assert_eq!(
+        (t.timelimit, t.checklimit, t.softlimit, t.hardlimit),
+        (None, None, None, None)
+    );
+}
+
 // --- verify_config ---
 
 fn err(c: Config) -> String {

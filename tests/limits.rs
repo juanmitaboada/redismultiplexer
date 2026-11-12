@@ -148,3 +148,32 @@ fn deleteblock_trims(tag: &str, cell: Cell) {
 
 matrix!(stall, stall_and_release, 4);
 matrix!(deleteblock, deleteblock_trims, 4);
+
+/// Every limit at 0 is a target without limits (L4c-1, M3F-17): before, the start
+/// accepted it as such but the delivery read `hardlimit: 0` as a limit, so the target
+/// was stuck at length 0 and every package dropped. One cell: the keys are read once at
+/// start, the same for every thread.
+#[test]
+fn zero_limits_are_no_limits() {
+    let mut ctx = Ctx::new("zero_limits");
+    let src = ctx.key("src");
+    let t0 = ctx.key("t0");
+    let zeros = "    timelimit: 0\n    checklimit: 0\n    softlimit: 0\n    hardlimit: 0\n";
+    let cfg = ctx.config(
+        &src,
+        1,
+        "replicant",
+        "",
+        &[ctx.client_yaml("t0", &t0, zeros)],
+    );
+    let mut p = ctx.spawn(&cfg);
+    let all = packages("p", 20);
+    ctx.push(&src, &all);
+    ctx.wait_drained(&src, &[(&t0, 20)]);
+    p.stop(&ctx.pid_file());
+    assert_eq!(ctx.list(&t0), all);
+    assert!(
+        !p.stderr().contains("stuck!"),
+        "a target without limits got stuck"
+    );
+}
