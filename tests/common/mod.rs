@@ -631,6 +631,19 @@ struct SlowState {
     closed: bool,
     streams: Vec<TcpStream>,
     on_client: OnClient,
+    after_push: AfterPush,
+}
+
+/// What a SlowTarget does after it records an RPUSH (M3R-20: a push the target may have
+/// applied while the program never learns it)
+#[derive(Clone, Copy, Default, PartialEq)]
+pub enum AfterPush {
+    #[default]
+    Answer,
+    /// Closes the connection instead of answering
+    Close,
+    /// Never answers: the program's command timeout ends the wait
+    Silent,
 }
 
 /// What a SlowTarget does with a CLIENT command (CLIENT SETNAME at each connect)
@@ -650,10 +663,26 @@ impl SlowTarget {
     }
 
     pub fn start_with(delay: Duration, on_client: OnClient) -> SlowTarget {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        SlowTarget::start_on(0, delay, on_client, AfterPush::Answer)
+    }
+
+    /// A target that records each RPUSH and then closes or stays silent (M3R-20)
+    pub fn ambiguous(after_push: AfterPush) -> SlowTarget {
+        SlowTarget::start_on(0, Duration::ZERO, OnClient::Ok, after_push)
+    }
+
+    /// On a given port (0: any), to bring a target up where one was refusing
+    pub fn start_on(
+        port: u16,
+        delay: Duration,
+        on_client: OnClient,
+        after_push: AfterPush,
+    ) -> SlowTarget {
+        let listener = TcpListener::bind(("127.0.0.1", port)).unwrap();
         let port = listener.local_addr().unwrap().port();
         let shared = Arc::new(Mutex::new(SlowState {
             on_client,
+            after_push,
             ..SlowState::default()
         }));
         let st = shared.clone();
@@ -790,7 +819,20 @@ fn slow_target_serve(stream: TcpStream, delay: Duration, st: Arc<Mutex<SlowState
                         .iter()
                         .map(|a| String::from_utf8_lossy(a).into_owned()),
                 );
-                format!(":{}\r\n", g.pushed.len())
+                match g.after_push {
+                    AfterPush::Answer => format!(":{}\r\n", g.pushed.len()),
+                    AfterPush::Close => {
+                        let _ = w.shutdown(std::net::Shutdown::Both);
+                        return;
+                    }
+                    AfterPush::Silent => {
+                        drop(g);
+                        // Keep the connection open and never answer
+                        loop {
+                            thread::sleep(Duration::from_secs(3600));
+                        }
+                    }
+                }
             }
             "LLEN" => ":0\r\n".to_string(),
             "CLIENT" if g.on_client == OnClient::Close => {

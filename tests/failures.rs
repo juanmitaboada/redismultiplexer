@@ -80,9 +80,10 @@ fn target_closes_mid_run(test: &str, cell: Cell) {
         cell.children,
         cell.mode(),
         cell.extra(),
+        // The failing target first: replicant goes on past it (M3R-21)
         &[
-            ctx.client_yaml("t0", &t0, ""),
             ctx.client_yaml_at("other", "rmtest:other", other.port),
+            ctx.client_yaml("t0", &t0, ""),
         ],
     );
     let mut p = ctx.spawn(&cfg);
@@ -174,16 +175,44 @@ fn wrongtype_target(test: &str, cell: Cell) {
         cell.children,
         cell.mode(),
         cell.extra(),
+        // Named after its key, so this test finds its own connections (M3R-21)
         &[
-            ctx.client_yaml("bad", &bad, ""),
+            ctx.client_yaml(&bad, &bad, ""),
             ctx.client_yaml("t0", &t0, ""),
         ],
     );
     let mut p = ctx.spawn(&cfg);
     ctx.wait_drained(&src, &[(&t0, n as usize)]);
+    // A server error keeps the link: one per thread, never made again
+    let links = connections_named(&mut ctx, &bad);
     p.stop(&ctx.pid_file());
     assert_all(cell, &[ctx.list(&t0)], n);
     assert!(p.stderr().contains("WRONGTYPE"), "{}", p.stderr());
+    assert_eq!(
+        links.len(),
+        link_holders(cell),
+        "links to the target: {:?}",
+        links
+    );
+    // A dropped link would have been made again, with its line
+    assert!(!p.stderr().contains("is back after"), "{}", p.stderr());
+}
+
+/// The program's connections to `target`: (id, age in seconds) from CLIENT LIST
+fn connections_named(ctx: &mut Ctx, target: &str) -> Vec<(String, u64)> {
+    let list: String = ctx.cmd(&["CLIENT", "LIST"]);
+    list.lines()
+        .filter(|l| l.contains(&format!("name=redismultiplexer:source:{}:", target)))
+        .map(|l| {
+            let field = |k: &str| {
+                l.split(' ')
+                    .find_map(|f| f.strip_prefix(k))
+                    .unwrap()
+                    .to_string()
+            };
+            (field("id="), field("age=").parse().unwrap())
+        })
+        .collect()
 }
 
 /// Stop under load with a target down the whole run: every package is delivered to the
@@ -391,12 +420,9 @@ fn one_line_while_down(test: &str, cell: Cell) {
 /// The program's connections to `target` (their names end in `:<target>:<role>`) killed
 /// on the server; how many there were
 fn kill_connections(ctx: &mut Ctx, target: &str) -> usize {
-    let list: String = ctx.cmd(&["CLIENT", "LIST"]);
-    let ids: Vec<String> = list
-        .lines()
-        .filter(|l| l.contains(&format!("name=redismultiplexer:source:{}:", target)))
-        .filter_map(|l| l.split(' ').find_map(|f| f.strip_prefix("id=")))
-        .map(|id| id.to_string())
+    let ids: Vec<String> = connections_named(ctx, target)
+        .into_iter()
+        .map(|(id, _)| id)
         .collect();
     for id in &ids {
         let _: i64 = ctx.cmd(&["CLIENT", "KILL", "ID", id]);
@@ -456,7 +482,149 @@ fn killed_connections_recover(test: &str, cell: Cell) {
     }
 }
 
+/// A target that takes an RPUSH and then closes, or never answers: the program cannot know
+/// whether it applied the push. Spreader tries the next target, as 1.0.8 always did
+/// (M3R-20 = R20a): such a package can be on two targets, never lost. Replicant never sends
+/// a package twice to one target.
+fn ambiguous_push(test: &str, cell: Cell, after: AfterPush) {
+    let amb = SlowTarget::ambiguous(after);
+    let mut ctx = Ctx::new(test);
+    let src = ctx.key("src");
+    let t0 = ctx.key("t0");
+    let clients = [
+        ctx.client_yaml_at("amb", "rmtest:amb", amb.port) + SHORT_TIMEOUTS,
+        ctx.client_yaml("t0", &t0, ""),
+    ];
+    let cfg = ctx.config(&src, cell.children, cell.mode(), cell.extra(), &clients);
+    let mut p = ctx.spawn(&cfg);
+    let n = 2500;
+    feed(&ctx, &src, n).join().unwrap();
+    ctx.wait_for("the source drained", |c| c.llen(&src) == 0);
+    let want = if cell.spreader {
+        None
+    } else {
+        Some(n as usize)
+    };
+    if let Some(w) = want {
+        ctx.wait_for("every package at t0", |c| c.llen(&t0) == w);
+    }
+    p.stop(&ctx.pid_file());
+    let recorded = amb.pushed();
+    let at_t0 = ctx.list(&t0);
+    let (mut r, mut t) = (recorded.clone(), at_t0.clone());
+    r.sort();
+    r.dedup();
+    t.sort();
+    t.dedup();
+    assert_eq!(
+        r.len(),
+        recorded.len(),
+        "a package twice on the ambiguous target"
+    );
+    assert_eq!(t.len(), at_t0.len(), "a package twice on t0");
+    assert!(!recorded.is_empty(), "the ambiguous target took nothing");
+    let all: Vec<String> = (0..n).map(seq_pkg).collect();
+    if cell.spreader {
+        // Every package on t0, the ambiguous ones included: never lost, at worst twice
+        let mut want = all;
+        want.sort();
+        assert_eq!(t, want, "spreader: a package is missing from t0");
+    } else {
+        let mut want = all;
+        want.sort();
+        assert_eq!(t, want, "replicant: t0 misses packages");
+    }
+}
+
+fn ambiguous_close(test: &str, cell: Cell) {
+    ambiguous_push(test, cell, AfterPush::Close);
+}
+
+fn ambiguous_silent(test: &str, cell: Cell) {
+    ambiguous_push(test, cell, AfterPush::Silent);
+}
+
+/// "is back after X s (M failed connects)": X and M of the `nth` such line
+fn back_line(stderr: &str, nth: usize) -> Option<(f64, u32)> {
+    let line = stderr
+        .lines()
+        .filter(|l| l.contains("is back after"))
+        .nth(nth)?;
+    let after = &line[line.find("is back after ")? + 14..];
+    let secs: f64 = after.split(' ').next()?.parse().ok()?;
+    let m: u32 = after[after.find('(')? + 1..]
+        .split(' ')
+        .next()?
+        .parse()
+        .ok()?;
+    Some((secs, m))
+}
+
+/// The backoff between connects doubles from 1 s up to 5 s while a target stays down, and
+/// starts again from 1 s once a command succeeds (M3R-21). The target refuses for 6.5 s:
+/// attempts at 0, 1, 3 and 7 s, so it is back after about 7 s with 3 failed connects (a
+/// backoff that never grew makes 6 or 7). Then it goes down again for 2.5 s: with the
+/// backoff reset it is back within about 3 s (one that stayed at 5 s takes 5 s or more).
+/// The backoff is per link, the same code in a worker and in the sender: one child, with
+/// ordering (the sender delivers) and without (the worker does), replicant.
+fn backoff_grows_and_resets(test: &str, ordering: bool) {
+    let port = closed_port();
+    let mut ctx = Ctx::new(test);
+    let src = ctx.key("src");
+    let client = ctx.client_yaml_at("flap", "rmtest:flap", port);
+    let extra = if ordering { ORDERING_1S } else { "" };
+    let cfg = ctx.config(&src, 1, "replicant", extra, &[client]);
+    let p = ctx.spawn(&cfg);
+    let feeder = feed(&ctx, &src, 16_000);
+    thread::sleep(Duration::from_millis(6500));
+    let target = SlowTarget::start_on(port, Duration::ZERO, OnClient::Ok, AfterPush::Answer);
+    ctx.wait_for("the target back", |_| back_line(&p.stderr(), 0).is_some());
+    let (first, attempts) = back_line(&p.stderr(), 0).unwrap();
+    assert!(
+        (6.0..9.0).contains(&first) && attempts <= 4,
+        "back after {} s with {} failed connects: {}",
+        first,
+        attempts,
+        p.stderr()
+    );
+    // Deliveries succeed (the backoff resets), then down again
+    let before = target.count();
+    ctx.wait_for("deliveries to the target", |_| {
+        target.count() > before + 100
+    });
+    target.close();
+    thread::sleep(Duration::from_millis(2500));
+    let again = SlowTarget::start_on(port, Duration::ZERO, OnClient::Ok, AfterPush::Answer);
+    ctx.wait_for("the target back again", |_| {
+        back_line(&p.stderr(), 1).is_some()
+    });
+    let (second, _) = back_line(&p.stderr(), 1).unwrap();
+    assert!(
+        second < 4.0,
+        "back after {} s the second time: {}",
+        second,
+        p.stderr()
+    );
+    let _ = again.count();
+    let mut p = p;
+    p.signal("INT");
+    let _ = p.wait_exit();
+    drop(feeder);
+}
+
+#[test]
+fn backoff_grows_and_resets_worker() {
+    backoff_grows_and_resets("backoff_worker", false);
+}
+
+#[test]
+fn backoff_grows_and_resets_sender() {
+    backoff_grows_and_resets("backoff_sender", true);
+}
+
 matrix!(target_closes, target_closes_mid_run, 2);
+matrix!(ambiguous_closes, ambiguous_close, 2);
+matrix!(ambiguous_silent_push, ambiguous_silent, 2);
 matrix!(down_one_line, one_line_while_down, 2);
 matrix!(killed_recover, killed_connections_recover, 2);
 matrix!(blackhole_no_stall, blackhole_does_not_stall, 2);
