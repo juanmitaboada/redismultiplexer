@@ -628,6 +628,7 @@ pub struct SlowTarget {
 #[derive(Default)]
 struct SlowState {
     pushed: Vec<String>,
+    client_delay: Duration,
     closed: bool,
     streams: Vec<TcpStream>,
     on_client: OnClient,
@@ -664,6 +665,14 @@ impl SlowTarget {
 
     pub fn start_with(delay: Duration, on_client: OnClient) -> SlowTarget {
         SlowTarget::start_on(0, delay, on_client, AfterPush::Answer)
+    }
+
+    /// A healthy target that answers late at start: CLIENT SETNAME, the first command of a
+    /// connection, waits `late` before its reply (M3R-23)
+    pub fn late(late: Duration) -> SlowTarget {
+        let t = SlowTarget::start(Duration::ZERO);
+        t.shared.lock().unwrap().client_delay = late;
+        t
     }
 
     /// A target that records each RPUSH and then closes or stays silent (M3R-20)
@@ -806,6 +815,10 @@ fn slow_target_serve(stream: TcpStream, delay: Duration, st: Arc<Mutex<SlowState
             .unwrap_or_default();
         if cmd == "RPUSH" {
             thread::sleep(delay);
+        }
+        if cmd == "CLIENT" {
+            let late = st.lock().unwrap().client_delay;
+            thread::sleep(late);
         }
         // Recorded and answered under the lock, so close() falls before or after a request
         let mut g = st.lock().unwrap();

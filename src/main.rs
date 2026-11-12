@@ -191,6 +191,7 @@ struct RedisLink {
     connecting: Option<Connecting>,  // an attempt running outside this thread (X1c)
     down_since: Option<Instant>,     // when it was last seen working, while it is down
     attempts: u32,                   // failed connects since it went down (S4-4)
+    skip_noted: bool,                // the "not connected yet" line was printed (M3R-23)
 }
 
 /// The result of a connect attempt that runs in its own short-lived thread, so a target
@@ -1359,6 +1360,11 @@ impl OrderBuffer {
         self.state.lock().unwrap().heap.len()
     }
 
+    /// finish() was called
+    fn finished(&self) -> bool {
+        self.state.lock().unwrap().finish
+    }
+
     /// No child will push again: the sender releases everything left, in order, and ends
     fn finish(&self) {
         self.state.lock().unwrap().finish = true;
@@ -1428,7 +1434,8 @@ fn sender(
 ) {
     // One link per target, kept for the whole run: a target that cannot be reached is
     // retried at most once a second while the others keep receiving (M3R-12, L3b)
-    let mut clients = new_targets(id, &config, &filters);
+    // Nothing to deliver before the workers pop; at the stop finish() ends the wait
+    let mut clients = new_targets(id, &config, &filters, || buffer.finished());
     let mut cursor: usize = 0;
     send_ordered(buffer, hold, |batch| {
         let (mut outgoing, mut dropped, mut deleted) = (0, 0, 0);
@@ -1458,7 +1465,12 @@ fn sender(
 
 /// One link per target, in configuration order, each with its compiled filter; every
 /// target gets a first connect attempt now
-fn new_targets(id: u16, config: &Config, filters: &Filters) -> Vec<RedisLink> {
+fn new_targets(
+    id: u16,
+    config: &Config,
+    filters: &Filters,
+    stop: impl Fn() -> bool,
+) -> Vec<RedisLink> {
     let mut clients: Vec<RedisLink> = config
         .clients
         .iter()
@@ -1481,29 +1493,54 @@ fn new_targets(id: u16, config: &Config, filters: &Filters) -> Vec<RedisLink> {
             connecting: None,
             down_since: None,
             attempts: 0,
+            skip_noted: false,
         })
         .collect();
-    // Every first attempt at once, then wait for them up to START_GRACE: a reachable
-    // target is connected before the first package, one that does not answer does not
-    // hold the start (its attempt goes on in the background, X1c)
+    // Every first attempt at once, then wait for each up to its own bound before the
+    // first pop (M3R-23 = R23a): a target that answers late at start loses nothing, as in
+    // 1.0.8, and one that never answers holds the start once, by a bounded time, while the
+    // packages stay in the source. A stop ends the wait at once.
     for client in clients.iter_mut() {
         client.connecting = Some(connect_in_background(id, &client.endpoint));
     }
-    let deadline = Instant::now() + START_GRACE;
+    let start = Instant::now();
     for client in clients.iter_mut() {
+        let deadline = start + start_bound(&client.endpoint);
         if let Some(rx) = client.connecting.take() {
-            match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
-                Ok(result) => {
-                    connected(client, result);
-                }
-                Err(mpsc::RecvTimeoutError::Timeout) => client.connecting = Some(rx),
-                Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    connected(client, Err("connect thread ended".to_string()));
+            loop {
+                let left = deadline.saturating_duration_since(Instant::now());
+                match rx.recv_timeout(cmp::min(left, START_POLL)) {
+                    Ok(result) => {
+                        connected(client, result);
+                        break;
+                    }
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        // Past its bound or stopping: the attempt goes on in the background
+                        if left <= START_POLL || stop() {
+                            client.connecting = Some(rx);
+                            break;
+                        }
+                    }
+                    Err(mpsc::RecvTimeoutError::Disconnected) => {
+                        connected(client, Err("connect thread ended".to_string()));
+                        break;
+                    }
                 }
             }
         }
     }
     clients
+}
+
+/// How long a thread waits at its start for a target's first connect (M3R-23 = R23a): its
+/// connect timeout plus its command timeout (CLIENT SETNAME), 7 s by default. With either
+/// at 0 (no limit) the attempt has no bound, so the wait takes the defaults' 7 s (L4c-7 =
+/// a) and the attempt goes on in the background after it.
+fn start_bound(endpoint: &Endpoint) -> Duration {
+    match (endpoint.connect_timeout, endpoint.command_timeout) {
+        (Some(connect), Some(command)) => connect + command,
+        _ => DEFAULT_CONNECT_TIMEOUT + DEFAULT_COMMAND_TIMEOUT,
+    }
 }
 
 /// The role in a connection's name: `w<k>` for worker k, `sender` for the sender (its id
@@ -1535,6 +1572,7 @@ fn connected(client: &mut RedisLink, result: Result<redis::Connection, String>) 
         Ok(link) => {
             client.link = Some(link);
             client.retry_at = None;
+            client.skip_noted = false;
             if let Some(since) = client.down_since.take() {
                 print_debug!(
                     PROGRAM_NAME,
@@ -1604,6 +1642,25 @@ fn ensure_link(id: u16, client: &mut RedisLink) -> bool {
     }
 }
 
+/// One line per thread and target when packages start to be skipped for a target that has
+/// not connected yet and has not failed either (M3R-23): its first attempt outlasted the
+/// start's wait. A target that failed has its "Error while connecting" line already.
+fn note_skip(id: u16, client: &mut RedisLink) {
+    if client.down_since.is_none() && !client.skip_noted {
+        client.skip_noted = true;
+        print_debug!(
+            PROGRAM_NAME,
+            stderr(),
+            COLOR_YELLOW,
+            0,
+            "{} - {} :: {} not connected yet: its packages are skipped until it connects",
+            id,
+            client.config.name,
+            client.config.channel
+        );
+    }
+}
+
 /// No link until the backoff has passed; the next failure waits twice as long, up to
 /// TARGET_BACKOFF_MAX (plan 2.2). A command that succeeds resets it.
 fn mark_down(client: &mut RedisLink) {
@@ -1662,7 +1719,7 @@ fn child(
 
     // The targets live as long as the worker: a source error reconnects the source only,
     // and a target that cannot be reached does not keep the worker from the others (L3b)
-    let mut clients = new_targets(id, &config, &filters);
+    let mut clients = new_targets(id, &config, &filters, || stop.load(Ordering::Relaxed));
     // `-`: a source connection has no target
     let source_endpoint =
         Endpoint::source(&config).named(connection_name(&config.name, "-", &format!("src{}", id)));
@@ -2472,6 +2529,7 @@ fn deliver(
     };
     let mut attempt = |client: &mut RedisLink, bdata: &[u8]| {
         if !ensure_link(id, client) {
+            note_skip(id, client);
             return false;
         }
         match send(id, client, bdata, deleted) {

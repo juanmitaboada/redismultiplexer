@@ -622,11 +622,127 @@ fn backoff_grows_and_resets_sender() {
     backoff_grows_and_resets("backoff_sender", true);
 }
 
-/// A target that does not answer does not hold a thread's start: the first connects run
-/// at once and a thread waits for them at most 1 s, so the healthy targets get the first
-/// packages long before the silent one's 5 s command timeout (X1c). Before, every thread
-/// waited for each first connect, CLIENT SETNAME included.
-fn silent_target_does_not_hold_the_start(test: &str, cell: Cell) {
+/// A target that does not answer holds a thread's start at most its bound, its connect
+/// timeout plus its command timeout (M3R-23 = R23a; here 0.2 s + 0.5 s), then the healthy
+/// targets get every package that waited in the source. `kind` is a silent target (CLIENT
+/// SETNAME never answered) or a blackholed one (the connect never completes).
+fn unanswering_target_holds_the_start_at_most_its_bound(test: &str, cell: Cell, kind: &str) {
+    let (mute, hole);
+    let port = if kind == "silent" {
+        mute = SilentTarget::start();
+        mute.port
+    } else {
+        hole = blackhole();
+        hole.port
+    };
+    let mut ctx = Ctx::new(test);
+    let src = ctx.key("src");
+    let real: Vec<String> = (0..cell.targets())
+        .map(|i| ctx.key(&format!("t{}", i)))
+        .collect();
+    let mut clients: Vec<String> = real
+        .iter()
+        .enumerate()
+        .map(|(i, k)| ctx.client_yaml(&format!("t{}", i), k, ""))
+        .collect();
+    clients.insert(
+        0,
+        format!(
+            "{}{}",
+            ctx.client_yaml_at("mute", &format!("rmtest:{}:mute", test), port),
+            SHORT_TIMEOUTS
+        ),
+    );
+    let input: Vec<String> = (0..300).map(seq_pkg).collect();
+    ctx.push(&src, &input);
+    let cfg = ctx.config(&src, cell.children, cell.mode(), cell.extra(), &clients);
+    let start = Instant::now();
+    let mut p = ctx.spawn(&cfg);
+    ctx.wait_for("the first package at a healthy target", |c| {
+        real.iter().map(|k| c.llen(k)).sum::<usize>() > 0
+    });
+    let first = start.elapsed();
+    let want = if cell.spreader { 300 } else { 300 * real.len() };
+    ctx.wait_for("every package at the healthy targets", |c| {
+        c.llen(&src) == 0 && real.iter().map(|k| c.llen(k)).sum::<usize>() == want
+    });
+    p.stop(&ctx.pid_file());
+    // 0.7 s of bound, 1 s of ordering hold, margin for a loaded machine
+    assert!(
+        first < Duration::from_millis(3700),
+        "first delivery after {:?}",
+        first
+    );
+}
+
+fn silent_start_bounded(test: &str, cell: Cell) {
+    unanswering_target_holds_the_start_at_most_its_bound(test, cell, "silent")
+}
+
+fn blackhole_start_bounded(test: &str, cell: Cell) {
+    unanswering_target_holds_the_start_at_most_its_bound(test, cell, "blackhole")
+}
+
+/// A healthy target that answers 2.5 s late at start loses nothing (M3R-23 = R23a): each
+/// thread waits for its first connect (up to 7 s by default) before the first pop, as 1.0.8
+/// did. On the 4a tip a thread waited 1 s and then skipped it: the review measured 64000 to
+/// 74000 of 200000 waiting packages lost, with no line.
+fn late_target_loses_nothing(test: &str, cell: Cell) {
+    let mut ctx = Ctx::new(test);
+    let src = ctx.key("src");
+    let targets: Vec<SlowTarget> = (0..cell.targets())
+        .map(|_| SlowTarget::late(Duration::from_millis(2500)))
+        .collect();
+    let clients: Vec<String> = targets
+        .iter()
+        .enumerate()
+        .map(|(i, t)| {
+            ctx.client_yaml_at(
+                &format!("t{}", i),
+                &format!("rmtest:{}:{}", test, i),
+                t.port,
+            )
+        })
+        .collect();
+    let input: Vec<String> = (0..2000).map(seq_pkg).collect();
+    ctx.push(&src, &input);
+    let cfg = ctx.config(&src, cell.children, cell.mode(), cell.extra(), &clients);
+    let mut p = ctx.spawn(&cfg);
+    let want = if cell.spreader {
+        2000
+    } else {
+        2000 * targets.len()
+    };
+    ctx.wait_for("every package at the late targets", |c| {
+        c.llen(&src) == 0 && targets.iter().map(|t| t.count()).sum::<usize>() >= want
+    });
+    p.stop(&ctx.pid_file());
+    let mut all: Vec<String> = targets.iter().flat_map(|t| t.pushed()).collect();
+    all.sort_by_key(|s| ts_in(s.as_bytes()));
+    let mut expect: Vec<String> = if cell.spreader {
+        input.clone()
+    } else {
+        input
+            .iter()
+            .flat_map(|s| vec![s.clone(); targets.len()])
+            .collect()
+    };
+    expect.sort_by_key(|s| ts_in(s.as_bytes()));
+    assert_eq!(
+        all.len(),
+        expect.len(),
+        "not every package at the late targets"
+    );
+    assert!(all == expect, "a package lost or twice");
+    assert!(
+        !p.stderr().contains("not connected yet"),
+        "a package was skipped"
+    );
+}
+
+/// A stop while the threads wait at their start for a target (a silent one, the default 7 s
+/// bound) ends the wait at once: a prompt exit, every package still in the source
+fn stop_during_the_start_wait(test: &str, cell: Cell) {
     let mute = SilentTarget::start();
     let mut ctx = Ctx::new(test);
     let src = ctx.key("src");
@@ -638,28 +754,83 @@ fn silent_target_does_not_hold_the_start(test: &str, cell: Cell) {
         .enumerate()
         .map(|(i, k)| ctx.client_yaml(&format!("t{}", i), k, ""))
         .collect();
-    // Default timeouts on purpose: the start must not wait for them
-    clients.insert(0, ctx.client_yaml_at("mute", "rmtest:mute", mute.port));
-    let input: Vec<String> = (0..20).map(seq_pkg).collect();
+    clients.insert(
+        0,
+        ctx.client_yaml_at("mute", &format!("rmtest:{}:mute", test), mute.port),
+    );
+    let input: Vec<String> = (0..100).map(seq_pkg).collect();
+    ctx.push(&src, &input);
+    let cfg = ctx.config(&src, cell.children, cell.mode(), cell.extra(), &clients);
+    let mut p = ctx.spawn(&cfg);
+    thread::sleep(Duration::from_millis(1500));
+    assert_eq!(
+        ctx.llen(&src),
+        100,
+        "a package popped during the start wait"
+    );
+    let at = Instant::now();
+    p.stop(&ctx.pid_file());
+    let took = at.elapsed();
+    assert!(took < Duration::from_secs(2), "the stop took {:?}", took);
+    assert_eq!(ctx.list(&src), input, "the source changed");
+    assert_eq!(real.iter().map(|k| ctx.llen(k)).sum::<usize>(), 0);
+}
+
+/// A target whose first attempt has no bound (`command_timeout: 0`, a silent peer): the
+/// start waits the default 7 s for it (L4c-7 = a), then the healthy targets get every
+/// package, and each thread that skips a package for it says so once ("not connected yet")
+fn unbounded_target_waited_seven_seconds(test: &str, cell: Cell) {
+    let mute = SilentTarget::start();
+    let mut ctx = Ctx::new(test);
+    let src = ctx.key("src");
+    let real: Vec<String> = (0..cell.targets())
+        .map(|i| ctx.key(&format!("t{}", i)))
+        .collect();
+    let mut clients: Vec<String> = real
+        .iter()
+        .enumerate()
+        .map(|(i, k)| ctx.client_yaml(&format!("t{}", i), k, ""))
+        .collect();
+    clients.insert(
+        0,
+        format!(
+            "{}    connect_timeout: 0.2\n    command_timeout: 0\n",
+            ctx.client_yaml_at("mute", &format!("rmtest:{}:mute", test), mute.port)
+        ),
+    );
+    let input: Vec<String> = (0..50).map(seq_pkg).collect();
     ctx.push(&src, &input);
     let cfg = ctx.config(&src, cell.children, cell.mode(), cell.extra(), &clients);
     let start = Instant::now();
     let mut p = ctx.spawn(&cfg);
-    ctx.wait_for("the first package at a healthy target", |c| {
-        real.iter().map(|k| c.llen(k)).sum::<usize>() > 0
+    let want = if cell.spreader { 50 } else { 50 * real.len() };
+    ctx.wait_for("every package at the healthy targets", |c| {
+        c.llen(&src) == 0 && real.iter().map(|k| c.llen(k)).sum::<usize>() == want
     });
-    let first = start.elapsed();
+    let took = start.elapsed();
     p.stop(&ctx.pid_file());
-    // 1 s of start grace, 1 s of ordering hold, margin for a loaded machine
     assert!(
-        first < Duration::from_secs(4),
-        "first delivery after {:?}",
-        first
+        took >= Duration::from_secs(7),
+        "the start did not wait: {:?}",
+        took
     );
+    let lines = p.stderr().matches("mute :: rmtest:").count();
+    let threads = cell.children as usize + usize::from(cell.ordering);
+    assert!(
+        (1..=threads).contains(&lines),
+        "{} \"not connected yet\" lines for {} threads",
+        lines,
+        threads
+    );
+    assert!(p.stderr().contains("not connected yet"));
 }
 
 matrix!(target_closes, target_closes_mid_run, 2);
-matrix!(silent_start, silent_target_does_not_hold_the_start, 2);
+matrix!(silent_start, silent_start_bounded, 2);
+matrix!(blackhole_start, blackhole_start_bounded, 2);
+matrix!(late_start, late_target_loses_nothing, 2);
+matrix!(stop_start, stop_during_the_start_wait, 2);
+matrix!(unbounded_start, unbounded_target_waited_seven_seconds, 2);
 matrix!(ambiguous_closes, ambiguous_close, 2);
 matrix!(ambiguous_silent_push, ambiguous_silent, 2);
 matrix!(down_one_line, one_line_while_down, 2);
