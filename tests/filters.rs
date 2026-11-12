@@ -148,3 +148,82 @@ fn replace_header_on_root_and_client() {
     assert_eq!(ctx.list(&plain), vec!["a=1", "b=2"]);
     assert_eq!(ctx.list(&tagged), vec!["B=2"]);
 }
+
+/// Root and client filters on every delivery path (project rule, M3R-12): through the
+/// worker and through the sender, one child and several, replicant and spreader. A third
+/// of the packages miss the root filter; t0 takes only `a:` packages and rewrites the
+/// prefix, t1 takes everything left.
+fn filters_on_every_path(test: &str, cell: Cell) {
+    let mut ctx = Ctx::new(test);
+    let src = ctx.key("src");
+    let t0 = ctx.key("t0");
+    let t1 = ctx.key("t1");
+    let n = 300u64;
+    let pkg = |i: u64| {
+        let prefix = ["z", "a", "b"][(i % 3) as usize];
+        format!("{}:{}", prefix, seq_pkg(i))
+    };
+    let input: Vec<String> = (0..n).map(pkg).collect();
+    ctx.push(&src, &input);
+    let extra = format!("filter: '^[ab]:'\n{}", cell.extra());
+    let clients = [
+        ctx.client_yaml("t0", &t0, "    filter: '^a:'\n    filter_replace: 'A='\n"),
+        ctx.client_yaml("t1", &t1, ""),
+    ];
+    let cfg = ctx.config(&src, cell.children, cell.mode(), &extra, &clients);
+    let mut p = ctx.spawn(&cfg);
+    let a: Vec<String> = input
+        .iter()
+        .filter(|s| s.starts_with("a:"))
+        .cloned()
+        .collect();
+    let ab: Vec<String> = input
+        .iter()
+        .filter(|s| !s.starts_with("z:"))
+        .cloned()
+        .collect();
+    let total = if cell.spreader {
+        ab.len()
+    } else {
+        a.len() + ab.len()
+    };
+    ctx.wait_for("every filtered package delivered", |c| {
+        c.llen(&src) == 0 && c.llen(&t0) + c.llen(&t1) == total
+    });
+    p.stop(&ctx.pid_file());
+    let (got0, got1) = (ctx.list_bytes(&t0), ctx.list_bytes(&t1));
+    if cell.in_order() {
+        assert_ts_increasing("t0", &got0);
+        assert_ts_increasing("t1", &got1);
+    }
+    let text = |l: Vec<Vec<u8>>| -> Vec<String> {
+        l.into_iter()
+            .map(|b| String::from_utf8(b).unwrap())
+            .collect()
+    };
+    let (got0, got1) = (text(got0), text(got1));
+    assert!(
+        got0.iter().all(|s| s.starts_with("A=")),
+        "t0 took a package its filter misses"
+    );
+    let mut back: Vec<String> = got0.iter().map(|s| format!("a:{}", &s[2..])).collect();
+    if cell.spreader {
+        back.extend(got1);
+        back.sort();
+        let mut want = ab;
+        want.sort();
+        assert_eq!(back, want, "spreader: not every root match exactly once");
+    } else {
+        back.sort();
+        let mut want = a;
+        want.sort();
+        assert_eq!(back, want, "t0: not every a: package once");
+        let mut got1 = got1;
+        got1.sort();
+        let mut want = ab;
+        want.sort();
+        assert_eq!(got1, want, "t1: not every root match once");
+    }
+}
+
+matrix!(filters_every_path, filters_on_every_path, 4);

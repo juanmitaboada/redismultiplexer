@@ -268,6 +268,16 @@ impl Ctx {
     fn spawn_cmd(&self, cmd: &mut Command) -> Proc {
         let out = self.dir.join("stdout.log");
         let err = self.dir.join("stderr.log");
+        // The program keeps an inherited SIG_IGN for SIGHUP (M3F-14), so a suite started
+        // under nohup would see every SIGHUP test fail (M3R-16): start it with the default
+        // disposition. spawn_hup_ignored sets the ignore again in its shell.
+        // SAFETY: signal() is async-signal-safe, the only call between fork and exec
+        unsafe {
+            std::os::unix::process::CommandExt::pre_exec(cmd, || {
+                libc::signal(libc::SIGHUP, libc::SIG_DFL);
+                Ok(())
+            });
+        }
         let child = cmd
             .stdin(Stdio::null())
             .stdout(fs::File::create(&out).unwrap())
@@ -408,6 +418,32 @@ pub const ORDERING_1S: &str =
 /// Package number `seq` of a stop-under-load run; the number is also its timestamp.
 pub fn seq_pkg(seq: u64) -> String {
     format!("{{\"ts\": {}, \"v\": \"x\"}}", seq)
+}
+
+/// The `ts` of a package that holds `"ts": N` anywhere (seq_pkg, or one with a prefix)
+pub fn ts_in(p: &[u8]) -> u64 {
+    let at = p
+        .windows(6)
+        .position(|w| w == b"\"ts\": ")
+        .expect("package without ts")
+        + 6;
+    let digits: Vec<u8> = p[at..]
+        .iter()
+        .take_while(|b| b.is_ascii_digit())
+        .copied()
+        .collect();
+    String::from_utf8(digits).unwrap().parse().unwrap()
+}
+
+/// Panics unless the packages of one target are in increasing `ts` order
+pub fn assert_ts_increasing(what: &str, list: &[Vec<u8>]) {
+    let ts: Vec<u64> = list.iter().map(|p| ts_in(p)).collect();
+    assert!(
+        ts.windows(2).all(|w| w[0] < w[1]),
+        "{}: out of order: {:?}",
+        what,
+        ts
+    );
 }
 
 fn seq_of(p: &str) -> u64 {

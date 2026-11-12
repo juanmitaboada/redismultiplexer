@@ -465,6 +465,28 @@ class RunOnceTests(unittest.TestCase):
             for sig, handler in saved.items():
                 signal.signal(sig, handler)
 
+    def test_main_installs_the_handlers_before_the_command(self) -> None:
+        # M3R-18 b: the function alone is tested above; this pins that `main` calls it
+        saved = {s: signal.getsignal(s) for s in (signal.SIGTERM, signal.SIGHUP)}
+        seen: dict[int, object] = {}
+
+        def command(_args: argparse.Namespace) -> int:
+            seen.update({s: signal.getsignal(s) for s in saved})
+            return 0
+
+        fake = mock.Mock()
+        fake.return_value.parse_args.return_value = argparse.Namespace(func=command)
+        try:
+            for sig in saved:
+                signal.signal(sig, signal.SIG_DFL)
+            with mock.patch.object(rmbench, "parser", fake):
+                self.assertEqual(rmbench.main([]), 0)
+            for sig in saved:
+                self.assertIs(seen[sig], signal.default_int_handler)
+        finally:
+            for sig, handler in saved.items():
+                signal.signal(sig, handler)
+
 
 class CommandTests(unittest.TestCase):
     """`run` and `compare` end to end, with the fake Redis of RunOnceTests (M3R-5)."""

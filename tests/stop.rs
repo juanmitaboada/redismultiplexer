@@ -126,28 +126,35 @@ fn sighup_is_ignored_when_started_under_nohup() {
     p.stop(&ctx.pid_file());
 }
 
-#[test]
-fn stop_is_prompt() {
-    // No fixed sleeps on the way out: an idle program (each child in a BLPOP of at most
-    // 1 s) stops within 2 s of the signal. 1.0.8 slept 2 s in main and 1.5 s per child.
-    let mut ctx = Ctx::new("stop_prompt");
+/// No fixed sleeps on the way out: an idle program (each child in a BLPOP of at most 1 s)
+/// stops within 2 s of the signal, on every delivery path. 1.0.8 slept 2 s in main and
+/// 1.5 s per child.
+fn stop_is_prompt(test: &str, cell: Cell) {
+    let mut ctx = Ctx::new(test);
     let src = ctx.key("src");
-    let t0 = ctx.key("t0");
-    let cfg = ctx.config(
-        &src,
-        4,
-        "replicant",
-        ORDERING_1S,
-        &[ctx.client_yaml("t0", &t0, "")],
-    );
+    let keys: Vec<String> = (0..cell.targets())
+        .map(|i| ctx.key(&format!("t{}", i)))
+        .collect();
+    let clients: Vec<String> = keys
+        .iter()
+        .enumerate()
+        .map(|(i, k)| ctx.client_yaml(&format!("t{}", i), k, ""))
+        .collect();
+    let cfg = ctx.config(&src, cell.children, cell.mode(), cell.extra(), &clients);
     let mut p = ctx.spawn(&cfg);
     ctx.push(&src, &[seq_pkg(1)]);
-    ctx.wait_drained(&src, &[(&t0, 1)]);
+    ctx.wait_for("the package delivered", |c| {
+        c.llen(&src) == 0
+            && keys.iter().map(|k| c.llen(k)).sum::<usize>()
+                == if cell.spreader { 1 } else { keys.len() }
+    });
     let start = Instant::now();
     p.stop(&ctx.pid_file());
     let took = start.elapsed();
     assert!(took < Duration::from_secs(2), "stop took {:?}", took);
 }
+
+matrix!(stop_prompt, stop_is_prompt, 4);
 
 #[test]
 fn stop_takes_little_after_the_signal() {

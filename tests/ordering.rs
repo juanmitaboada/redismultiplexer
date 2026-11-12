@@ -151,6 +151,63 @@ fn strict_order(test: &str, children: u16) {
     );
 }
 
+/// Spreader with ordering: one sender takes the turns, so with two targets each holds every
+/// other package in strict order, for any number of children. The targets answer slowly so
+/// several children are popping while the sender delivers.
+fn strict_order_spreader(test: &str, children: u16) {
+    let mut ctx = Ctx::new(test);
+    let src = ctx.key("src");
+    let targets = [
+        SlowTarget::start(Duration::from_millis(2)),
+        SlowTarget::start(Duration::from_millis(2)),
+    ];
+    let n: u64 = 2000;
+    let clients = [
+        ctx.client_yaml_at("t0", "rmtest:slow0", targets[0].port),
+        ctx.client_yaml_at("t1", "rmtest:slow1", targets[1].port),
+    ];
+    let cfg = ctx.config(&src, children, "spreader", ORDERING_1S, &clients);
+    let mut p = ctx.spawn(&cfg);
+    for start in (0..n).step_by(50) {
+        let batch: Vec<String> = (start..start + 50).map(seq_pkg).collect();
+        ctx.push(&src, &batch);
+        thread::sleep(Duration::from_millis(50));
+    }
+    ctx.wait_for("every package at a slow target", |c| {
+        c.llen(&src) == 0 && targets[0].count() + targets[1].count() == n as usize
+    });
+    p.stop(&ctx.pid_file());
+    for (i, t) in targets.iter().enumerate() {
+        let want: Vec<String> = (0..n).skip(i).step_by(2).map(seq_pkg).collect();
+        let got = t.pushed();
+        let first = got.iter().zip(&want).position(|(a, b)| a != b);
+        assert_eq!(
+            got.len(),
+            want.len(),
+            "{} children: target t{}",
+            children,
+            i
+        );
+        assert!(
+            first.is_none(),
+            "{} children: target t{} out of turn or order from position {:?}",
+            children,
+            i,
+            first
+        );
+    }
+}
+
+#[test]
+fn ordering_strict_order_spreader_two_children() {
+    strict_order_spreader("ordering_strict_spr_2", 2);
+}
+
+#[test]
+fn ordering_strict_order_spreader_eight_children() {
+    strict_order_spreader("ordering_strict_spr_8", 8);
+}
+
 #[test]
 fn ordering_strict_order_two_children() {
     strict_order("ordering_strict_2", 2);
