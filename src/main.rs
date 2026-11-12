@@ -1137,6 +1137,11 @@ fn verify_config(config: Config) -> Result<Config, String> {
                 return Err(format!("Client '{}' is using limits, so you must set all limits: timelimit, checklimit, softlimit and hardlimit to be bigger than 0", client.name));
             }
 
+            // An endless LTRIM loop while the target is over hardlimit (M3F-4)
+            if client.deleteblock == Some(0) {
+                return Err(format!("Client '{}' has deleteblock: 0, set a number of elements bigger than 0 or remove the key", client.name));
+            }
+
             // === FILTERS ===
 
             // Filter
@@ -2282,14 +2287,14 @@ fn can_send(id: u16, client: &mut RedisLink, deleted: &mut u64) -> Result<bool, 
             Some(v) => client.packages = v,
         }
 
-        // Let's check the queue
-        let result: redis::RedisResult<i32> = link(&mut client.link)?.llen(&client.config.channel);
+        // Let's check the queue (lengths as 64 bits: i32 misread lists above 2^31, M3F-5)
+        let result: redis::RedisResult<u64> = link(&mut client.link)?.llen(&client.config.channel);
         match result {
             Ok(len) => {
                 if client.config.hardlimit != None {
                     if client.stuck_since.is_none() {
                         // The client is not sleeping
-                        if (len as u64) >= client.config.hardlimit.unwrap() {
+                        if len >= client.config.hardlimit.unwrap() {
                             if client.config.deleteblock == None {
                                 // We lock the client
                                 client.stuck_since = Some(Instant::now());
@@ -2305,18 +2310,22 @@ fn can_send(id: u16, client: &mut RedisLink, deleted: &mut u64) -> Result<bool, 
                                     len
                                 );
                             } else {
-                                // Deleteblock in action
-                                let mut actual_len: u64 = len as u64;
+                                // Deleteblock in action: drop the oldest `deleteblock`
+                                // elements, to the end of the list (1.0.8 kept at most
+                                // 100000000 after them, M3F-5)
+                                let block = client.config.deleteblock.unwrap();
+                                let start = isize::try_from(block).unwrap_or(isize::MAX);
+                                let mut actual_len: u64 = len;
                                 while actual_len >= client.config.hardlimit.unwrap() {
                                     // Trim elements from the queue
-                                    let result: redis::RedisResult<redis::Value> =
-                                        link(&mut client.link)?.ltrim(
-                                            &client.config.channel,
-                                            client.config.deleteblock.unwrap() as isize,
-                                            MAX_QUEUE_SIZE,
-                                        );
+                                    let result: redis::RedisResult<redis::Value> = link(
+                                        &mut client.link,
+                                    )?
+                                    .ltrim(&client.config.channel, start, -1);
                                     match result {
-                                        Ok(_) => *deleted += client.config.deleteblock.unwrap(),
+                                        // What it removed, not the block size when the list
+                                        // held fewer (L4c-4)
+                                        Ok(_) => *deleted += cmp::min(block, actual_len),
                                         Err(e) => {
                                             link_broken(client, &e);
                                             return Err(format!("error in deleteblock while deleting block with {} elements: {}", client.config.deleteblock.unwrap(), e));
@@ -2324,10 +2333,10 @@ fn can_send(id: u16, client: &mut RedisLink, deleted: &mut u64) -> Result<bool, 
                                     }
 
                                     // Read len again
-                                    let result: redis::RedisResult<i32> =
+                                    let result: redis::RedisResult<u64> =
                                         link(&mut client.link)?.llen(&client.config.channel);
                                     match result {
-                                        Ok(len) => actual_len = len as u64,
+                                        Ok(len) => actual_len = len,
                                         Err(e) => {
                                             link_broken(client, &e);
                                             return Err(format!("error in deleteblock while requesting the length to the channel: {}", e));
@@ -2338,7 +2347,7 @@ fn can_send(id: u16, client: &mut RedisLink, deleted: &mut u64) -> Result<bool, 
                         }
                     } else {
                         // The client is sleeping (stuck)
-                        if (len as u64) < client.config.softlimit.unwrap() {
+                        if len < client.config.softlimit.unwrap() {
                             // We lock the client
                             client.stuck_since = None;
                             print_debug!(

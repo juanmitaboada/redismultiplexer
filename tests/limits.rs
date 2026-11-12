@@ -177,3 +177,48 @@ fn zero_limits_are_no_limits() {
         "a target without limits got stuck"
     );
 }
+
+/// `deleted` counts what deleteblock removed (L4c-4): a list of 5 over a hardlimit of 3,
+/// with `deleteblock: 100`, loses 5 elements and counts 5 (before: 100). One thread (one
+/// child, ordering off): threads that read the length before another trimmed each count
+/// their block (L2a, M4), so only one thread gives an exact figure.
+#[test]
+fn deleteblock_counts_what_it_removed() {
+    let mut ctx = Ctx::new("deleted_count");
+    let src = ctx.key("src");
+    let t0 = ctx.key("t0");
+    ctx.push(&t0, &packages("old", 5));
+    let limits = "    timelimit: 1\n    checklimit: 1\n    softlimit: 2\n    hardlimit: 3\n    deleteblock: 100\n";
+    let cfg = ctx.config(
+        &src,
+        1,
+        "replicant",
+        "",
+        &[ctx.client_yaml("t0", &t0, limits)],
+    );
+    let mut p = ctx.spawn(&cfg);
+    ctx.wait_for("the list trimmed", |c| c.llen(&t0) == 0);
+    // The periodic write after 10 s, then the last one after the stop (as delivery.rs)
+    let status = ctx.dir.join("rm.status");
+    let mut json = String::new();
+    ctx.wait_for("a complete status file", |_| {
+        json = std::fs::read_to_string(&status).unwrap_or_default();
+        json.trim_end().ends_with('}') && json.contains("\"total_deleted\":")
+    });
+    let first = total_deleted(&json);
+    p.stop(&ctx.pid_file());
+    let last = total_deleted(&std::fs::read_to_string(&status).unwrap());
+    assert_eq!(first + last, 5, "deleted: {} + {}", first, last);
+}
+
+fn total_deleted(json: &str) -> u64 {
+    let key = "\"total_deleted\":";
+    let at = json.find(key).expect("total_deleted") + key.len();
+    json[at..]
+        .trim_start()
+        .split(|c: char| !c.is_ascii_digit())
+        .next()
+        .unwrap()
+        .parse()
+        .unwrap()
+}

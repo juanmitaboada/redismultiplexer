@@ -1027,6 +1027,18 @@ fn zero_limits_read_as_absent() {
 
 // --- verify_config ---
 
+#[test]
+fn verify_rejects_deleteblock_zero() {
+    // M3F-4: with the target over hardlimit, LTRIM 0 removes nothing and the loop never ends
+    let mut c = config();
+    c.clients[0].timelimit = Some(1);
+    c.clients[0].checklimit = Some(1);
+    c.clients[0].softlimit = Some(5);
+    c.clients[0].hardlimit = Some(10);
+    c.clients[0].deleteblock = Some(0);
+    assert!(err(c).contains("deleteblock: 0"));
+}
+
 fn err(c: Config) -> String {
     verify_config(c).expect_err("config should be rejected")
 }
