@@ -9,6 +9,8 @@ fn client(name: &str, channel: &str) -> ClientConfig {
         hostname: "127.0.0.1".to_string(),
         port: 6379,
         password: String::new(),
+        username: None,
+        database: None,
         channel: channel.to_string(),
         timelimit: None,
         checklimit: None,
@@ -31,6 +33,8 @@ fn config() -> Config {
         hostname: "127.0.0.1".to_string(),
         port: 6379,
         password: String::new(),
+        username: None,
+        database: None,
         channel: "src".to_string(),
         children: 1,
         mode: "replicant".to_string(),
@@ -1262,4 +1266,144 @@ fn rpush_is_packed_byte_for_byte_as_the_crate_packs_it() {
     pack_rpush(&mut buf, b"k", b"v");
     assert_eq!(buf, b"*3\r\n$5\r\nRPUSH\r\n$1\r\nk\r\n$1\r\nv\r\n");
     assert_eq!(cases, 36);
+}
+
+/// The URL the program built before M3-i: `<scheme>://:<password>@<host>:<port>`
+fn url_info(
+    ssl: bool,
+    host: &str,
+    port: u16,
+    password: &str,
+) -> redis::RedisResult<redis::ConnectionInfo> {
+    use redis::IntoConnectionInfo;
+    let scheme = if ssl { "rediss" } else { "redis" };
+    format!("{}://:{}@{}:{}", scheme, password, host, port).into_connection_info()
+}
+
+fn same_info(a: &redis::ConnectionInfo, b: &redis::ConnectionInfo) -> bool {
+    a.addr == b.addr
+        && a.redis.db == b.redis.db
+        && a.redis.username == b.redis.username
+        && a.redis.password == b.redis.password
+        && a.redis.protocol == b.redis.protocol
+}
+
+#[test]
+fn endpoint_reads_as_the_url_did_where_the_url_worked() {
+    // Differential (M3-i): every host, port, TLS and password the URL path of 1.0.8 read as
+    // written gives the same connection description; where the URL changed the password
+    // (a percent sequence) or failed (a reserved character), the structured path keeps it
+    // as written
+    let hosts = [
+        "127.0.0.1",
+        "localhost",
+        "redis.example.org",
+        "10.0.0.7",
+        "my-host_1",
+    ];
+    let passwords = [
+        "",
+        "secret",
+        "p@ss",
+        "with space",
+        "a:b",
+        "x;y",
+        "semi,colon",
+        "dollar$",
+        "tilde~",
+        "plus+",
+        "eq=",
+        "amp&",
+        "excl!",
+        "quote'",
+        "star*",
+        "paren()",
+        "brack[]",
+        "%41",
+        "%2F",
+        "100%",
+        "#hash",
+        "slash/",
+        "ques?",
+        "tab\t",
+        "uni\u{e9}",
+        "back\\",
+    ];
+    let mut same = 0;
+    let mut differ = Vec::new();
+    for ssl in [false, true] {
+        for host in hosts {
+            for port in [6379u16, 6390, 1, 65535] {
+                for password in passwords {
+                    let ep = Endpoint::new(Some(ssl), host, port, &None, password, None);
+                    match url_info(ssl, host, port, password) {
+                        Ok(url) if url.redis.password.as_deref().unwrap_or("") == password => {
+                            assert!(
+                                same_info(&ep.info(), &url),
+                                "differs: ssl={} host={} port={} password={:?}: {:?} against {:?}",
+                                ssl,
+                                host,
+                                port,
+                                password,
+                                ep.info(),
+                                url
+                            );
+                            same += 1;
+                        }
+                        other => {
+                            // The structured path passes the password through untouched
+                            assert_eq!(ep.info().redis.password.as_deref(), Some(password));
+                            differ.push((password, other.is_ok()));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert!(same >= 800, "only {} cases compared", same);
+    let mut changed: Vec<&str> = differ.iter().map(|(p, _)| *p).collect();
+    changed.sort();
+    changed.dedup();
+    // The passwords 1.0.8 could not use as written (M1F-7)
+    assert_eq!(
+        changed,
+        vec!["#hash", "%2F", "%41", "ques?", "slash/", "tab\t"]
+    );
+}
+
+#[test]
+fn endpoint_database_and_username() {
+    let ep = Endpoint::new(None, "h", 1, &Some("app".to_string()), "pw", Some(3));
+    let info = ep.info();
+    assert_eq!(info.redis.db, 3);
+    assert_eq!(info.redis.username.as_deref(), Some("app"));
+    assert_eq!(info.redis.password.as_deref(), Some("pw"));
+    // Empty user and password mean none, as the URL path read them: no AUTH
+    let ep = Endpoint::new(None, "h", 1, &Some(String::new()), "", None);
+    assert_eq!(
+        (ep.info().redis.username, ep.info().redis.password),
+        (None, None)
+    );
+    assert_eq!(ep.info().redis.db, 0);
+}
+
+#[test]
+fn yaml_database_and_username_are_optional() {
+    let base = "name: s\nhostname: h\nport: 1\npassword: ''\nchannel: c\nchildren: 1\nmode: replicant\nclients:\n  - name: t\n    hostname: h\n    port: 1\n    password: ''\n    channel: d\n";
+    let c = parse_yaml(base).unwrap();
+    assert_eq!((c.username.clone(), c.database), (None, None));
+    assert_eq!(
+        (c.clients[0].username.clone(), c.clients[0].database),
+        (None, None)
+    );
+    let with = base.replace("channel: c\n", "channel: c\nusername: u\ndatabase: 2\n")
+        + "    username: v\n    database: 5\n";
+    let c = parse_yaml(&with).unwrap();
+    assert_eq!((c.username.as_deref(), c.database), (Some("u"), Some(2)));
+    assert_eq!(
+        (c.clients[0].username.as_deref(), c.clients[0].database),
+        (Some("v"), Some(5))
+    );
+    // A database below 0 is not a database
+    assert!(parse_yaml(&base.replace("channel: c\n", "channel: c\ndatabase: -1\n")).is_err());
 }

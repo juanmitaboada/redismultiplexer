@@ -71,6 +71,8 @@ struct ClientConfig {
     hostname: String,
     port: u16,
     password: String,
+    username: Option<String>, // Redis 6 ACL user (M3-i)
+    database: Option<u32>,    // SELECT on connect, 0 when absent (M1F-10)
     channel: String,
     timelimit: Option<u64>,
     checklimit: Option<u64>,
@@ -93,6 +95,8 @@ impl Clone for ClientConfig {
             hostname: self.hostname.clone(),
             port: self.port,
             password: self.password.clone(),
+            username: self.username.clone(),
+            database: self.database,
             channel: self.channel.clone(),
             timelimit: self.timelimit,
             checklimit: self.checklimit,
@@ -116,6 +120,8 @@ struct Config {
     hostname: String,
     port: u16,
     password: String,
+    username: Option<String>, // Redis 6 ACL user (M3-i)
+    database: Option<u32>,    // SELECT on connect, 0 when absent (M1F-10)
     channel: String,
     children: u16,
     mode: String,
@@ -141,6 +147,8 @@ impl Clone for Config {
             hostname: self.hostname.clone(),
             port: self.port,
             password: self.password.clone(),
+            username: self.username.clone(),
+            database: self.database,
             channel: self.channel.clone(),
             children: self.children,
             mode: self.mode.clone(),
@@ -171,6 +179,84 @@ struct RedisLink {
     lastcheck: u64,                  // When was the last check of queue's size (time limit)
     filter: Option<Filter>,          // Client filter, compiled at start
     request: Vec<u8>,                // RPUSH request buffer, reused for every package
+}
+
+/// Where and how to connect (M3-i): built from the configuration and handed to the crate as
+/// is, never formatted into a URL, so a password reaches AUTH exactly as written (M1F-7)
+/// and the database is selected (M1F-10)
+#[derive(Clone, Debug, PartialEq)]
+struct Endpoint {
+    ssl: bool,
+    host: String,
+    port: u16,
+    username: Option<String>,
+    password: Option<String>,
+    database: u32,
+}
+
+impl Endpoint {
+    fn new(
+        ssl: Option<bool>,
+        host: &str,
+        port: u16,
+        username: &Option<String>,
+        password: &str,
+        database: Option<u32>,
+    ) -> Endpoint {
+        Endpoint {
+            ssl: ssl.unwrap_or(false),
+            host: host.to_string(),
+            port,
+            // Empty means none, as the URL path read an empty user or password: no AUTH
+            username: username.clone().filter(|u| !u.is_empty()),
+            password: Some(password.to_string()).filter(|p| !p.is_empty()),
+            database: database.unwrap_or(0),
+        }
+    }
+
+    fn source(config: &Config) -> Endpoint {
+        Endpoint::new(
+            config.ssl,
+            &config.hostname,
+            config.port,
+            &config.username,
+            &config.password,
+            config.database,
+        )
+    }
+
+    fn target(config: &ClientConfig) -> Endpoint {
+        Endpoint::new(
+            config.ssl,
+            &config.hostname,
+            config.port,
+            &config.username,
+            &config.password,
+            config.database,
+        )
+    }
+
+    fn info(&self) -> redis::ConnectionInfo {
+        let addr = if self.ssl {
+            redis::ConnectionAddr::TcpTls {
+                host: self.host.clone(),
+                port: self.port,
+                insecure: false,
+                tls_params: None,
+            }
+        } else {
+            redis::ConnectionAddr::Tcp(self.host.clone(), self.port)
+        };
+        redis::ConnectionInfo {
+            addr,
+            redis: redis::RedisConnectionInfo {
+                db: i64::from(self.database),
+                username: self.username.clone(),
+                password: self.password.clone(),
+                ..Default::default()
+            },
+        }
+    }
 }
 
 /// A compiled filter: a regex matched against the header of a package (its first `limit`
@@ -1328,14 +1414,7 @@ fn ensure_link(id: u16, client: &mut RedisLink) -> bool {
     if client.retry_at.is_some_and(|at| now < at) {
         return false;
     }
-    match redis_connect(
-        id,
-        client.config.ssl,
-        client.config.hostname.clone(),
-        client.config.port,
-        client.config.password.clone(),
-        true,
-    ) {
+    match redis_connect(id, &Endpoint::target(&client.config), true) {
         Ok(link) => {
             client.link = Some(link);
             client.retry_at = None;
@@ -1417,6 +1496,7 @@ fn child(
     // The targets live as long as the worker: a source error reconnects the source only,
     // and a target that cannot be reached does not keep the worker from the others (L3b)
     let mut clients = new_targets(id, &config, &filters);
+    let source_endpoint = Endpoint::source(&config);
 
     // Prepare the retention data
     while keepworking {
@@ -1428,14 +1508,7 @@ fn child(
         // Connect to source
         let mut source: redis::Connection;
         let mut error = false;
-        match redis_connect(
-            id,
-            config.ssl,
-            config.hostname.clone(),
-            config.port,
-            config.password.clone(),
-            false,
-        ) {
+        match redis_connect(id, &source_endpoint, false) {
             Ok(link) => {
                 source = link;
 
@@ -1802,57 +1875,27 @@ fn report(
 
 fn redis_connect(
     _id: u16,
-    ssl: Option<bool>,
-    hostname: String,
-    port: u16,
-    password: String,
+    endpoint: &Endpoint,
     is_client: bool,
 ) -> Result<redis::Connection, String> {
-    // If Redis server needs secure connection
-    let mut uri_scheme = "redis";
-    if let Some(inssl) = ssl {
-        if inssl {
-            uri_scheme = "rediss";
-        }
-    }
-
-    // Prepare URL
-    let redis_conn_url = format!("{}://:{}@{}:{}", uri_scheme, password, hostname, port);
-
     #[cfg(feature = "debug")]
-    {
-        let password_debug: String;
-        if password.len() > 3 {
-            password_debug = format!("{}***", &password[..3]);
-        } else {
-            password_debug = String::from("***");
-        }
-        let redis_conn_url_debug =
-            format!("{}://:{}@{}:{}", uri_scheme, password_debug, hostname, port);
-        if is_client {
-            print_debug!(
-                PROGRAM_NAME,
-                stdout(),
-                COLOR_CYAN,
-                0,
-                "Child {}: Connecting to client: {}",
-                _id,
-                redis_conn_url_debug
-            );
-        } else {
-            print_debug!(
-                PROGRAM_NAME,
-                stdout(),
-                COLOR_BLUE,
-                0,
-                "Child {}: Connecting: {}",
-                _id,
-                redis_conn_url_debug
-            );
-        }
-    }
+    print_debug!(
+        PROGRAM_NAME,
+        stdout(),
+        if is_client { COLOR_CYAN } else { COLOR_BLUE },
+        0,
+        "Child {}: Connecting to {} {}:{} (tls={}, db={}, user={:?})",
+        _id,
+        if is_client { "client" } else { "source" },
+        endpoint.host,
+        endpoint.port,
+        endpoint.ssl,
+        endpoint.database,
+        endpoint.username
+    );
 
-    let client = redis::Client::open(redis_conn_url).expect("Invalid connection URL");
+    let client = redis::Client::open(endpoint.info())
+        .map_err(|e| format!("Invalid connection settings: {}", e))?;
     if !is_client {
         return client
             .get_connection()

@@ -34,11 +34,45 @@ pub struct Endpoint {
     pub url: String,
     pub host: String,
     pub port: u16,
+    pub username: String,
     pub password: String,
+    pub database: u32,
     pub ssl: bool,
 }
 
+/// `%XX` sequences of a URL part decoded, as the crate does for the test's own connection
+fn percent_decoded(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() {
+            if let Ok(v) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
+                out.push(v);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    String::from_utf8(out).expect("URL part is not UTF-8 once decoded")
+}
+
 impl Endpoint {
+    /// The `username` and `database` lines, only when the test URL sets them, so the
+    /// files stay as 1.0.8 wrote them otherwise
+    pub fn access(&self, indent: &str) -> String {
+        let mut out = String::new();
+        if !self.username.is_empty() {
+            out += &format!("{}username: {}\n", indent, q(&self.username));
+        }
+        if self.database != 0 {
+            out += &format!("{}database: {}\n", indent, self.database);
+        }
+        out
+    }
+
     pub fn from_env() -> Endpoint {
         let url = std::env::var(ENV_URL).unwrap_or_else(|_| DEFAULT_URL.to_string());
         let (ssl, rest) = if let Some(r) = url.strip_prefix("rediss://") {
@@ -55,27 +89,22 @@ impl Endpoint {
             Some((a, p)) => (a, p),
             None => (rest, ""),
         };
-        // The program always uses database 0 (it builds its URL without a path).
-        assert!(
-            path.is_empty() || path == "0",
-            "{}: only database 0 is supported by redismultiplexer, got '/{}'",
-            ENV_URL,
-            path
-        );
+        // The configuration selects the database and passes user and password as written
+        // (M3-i): the test URL's percent-encoded parts are decoded for the YAML
+        let database = match path {
+            "" => 0,
+            p => p
+                .parse()
+                .unwrap_or_else(|_| panic!("{}: bad database '/{}'", ENV_URL, p)),
+        };
         let (userinfo, hostport) = match authority.rsplit_once('@') {
             Some((u, h)) => (u, h),
             None => ("", authority),
         };
-        let password = match userinfo.split_once(':') {
-            Some((_, p)) => p.to_string(),
-            None => String::new(),
+        let (username, password) = match userinfo.split_once(':') {
+            Some((u, p)) => (percent_decoded(u), percent_decoded(p)),
+            None => (percent_decoded(userinfo), String::new()),
         };
-        // The program puts the password into a URL without percent-encoding it.
-        assert!(
-            !password.contains(['%', '@', '/', '#', '?', ':']),
-            "{}: passwords with URL special characters are not supported by redismultiplexer",
-            ENV_URL
-        );
         let (host, port) = match hostport.rsplit_once(':') {
             Some((h, p)) => (
                 h.to_string(),
@@ -88,7 +117,9 @@ impl Endpoint {
             url,
             host,
             port,
+            username,
             password,
+            database,
             ssl,
         }
     }
@@ -199,12 +230,13 @@ impl Ctx {
     /// option lines such as "    filter: 'x'\n".
     pub fn client_yaml(&self, name: &str, key: &str, extra: &str) -> String {
         format!(
-            "  - name: {}\n    ssl: {}\n    hostname: {}\n    port: {}\n    password: {}\n    channel: {}\n{}",
+            "  - name: {}\n    ssl: {}\n    hostname: {}\n    port: {}\n    password: {}\n{}    channel: {}\n{}",
             q(name),
             self.ep.ssl,
             q(&self.ep.host),
             self.ep.port,
             q(&self.ep.password),
+            self.ep.access("    "),
             q(key),
             extra
         )
@@ -232,11 +264,12 @@ impl Ctx {
         clients: &[String],
     ) -> PathBuf {
         let yaml = format!(
-            "name: 'source'\nssl: {}\nhostname: {}\nport: {}\npassword: {}\nchannel: {}\nchildren: {}\nmode: {}\npid: {}\nstatus: {}\n{}clients:\n{}",
+            "name: 'source'\nssl: {}\nhostname: {}\nport: {}\npassword: {}\n{}channel: {}\nchildren: {}\nmode: {}\npid: {}\nstatus: {}\n{}clients:\n{}",
             self.ep.ssl,
             q(&self.ep.host),
             self.ep.port,
             q(&self.ep.password),
+            self.ep.access(""),
             q(src),
             children,
             q(mode),
@@ -256,6 +289,11 @@ impl Ctx {
 
     pub fn spawn(&self, config: &Path) -> Proc {
         self.spawn_cmd(Command::new(bin()).arg(config))
+    }
+
+    /// As spawn, with one more environment variable (a CA for a TLS target)
+    pub fn spawn_env(&self, config: &Path, key: &str, value: &str) -> Proc {
+        self.spawn_cmd(Command::new(bin()).arg(config).env(key, value))
     }
 
     /// As spawn, but with SIGHUP ignored when the program starts, as nohup leaves it.
