@@ -121,6 +121,39 @@ fn command_timeout_zero_waits_as_1_0_8() {
     assert_eq!(t, None, "gave up although the key asks to wait");
 }
 
+/// A silent source with the default timeouts: a worker waits in its BLPOP at most 1 s
+/// (BLPOP's own wait) plus the 5 s command timeout, then sees the stop. The bound of a stop
+/// with a source that does not answer (C4a-4: a late reply cannot be read after a timeout,
+/// so the timeout stays the stop's bound)
+#[test]
+fn silent_source_default_bounds_the_stop() {
+    let mute = SilentTarget::start();
+    let mut ctx = Ctx::new("silent_source_default");
+    let t0 = ctx.key("t0");
+    let cfg = ctx.config(
+        "rmtest:mute_src",
+        1,
+        "replicant",
+        "",
+        &[ctx.client_yaml("t0", &t0, "")],
+    );
+    let yaml = std::fs::read_to_string(&cfg).unwrap();
+    let root = format!(
+        "hostname: {}\nport: {}\npassword: {}\n",
+        q(&ctx.ep.host),
+        ctx.ep.port,
+        q(&ctx.ep.password)
+    );
+    let mute_root = format!("hostname: '127.0.0.1'\nport: {}\npassword: ''\n", mute.port);
+    std::fs::write(&cfg, yaml.replacen(&root, &mute_root, 1)).unwrap();
+    let mut p = ctx.spawn(&cfg);
+    thread::sleep(Duration::from_millis(300));
+    let start = Instant::now();
+    p.stop(&ctx.pid_file());
+    let took = start.elapsed();
+    assert!(took < Duration::from_secs(8), "stop took {:?}", took);
+}
+
 #[test]
 fn silent_source_does_not_hold_the_stop() {
     // S4-2: a source that accepts and never answers. 1.0.8 waited in BLPOP for ever and

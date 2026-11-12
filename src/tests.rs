@@ -1298,12 +1298,16 @@ fn endpoint_reads_as_the_url_did_where_the_url_worked() {
     // written gives the same connection description; where the URL changed the password
     // (a percent sequence) or failed (a reserved character), the structured path keeps it
     // as written
+    // Upper case too: the URL path kept a host as written (an opaque host of a scheme the
+    // url crate does not know), and so does the structured path
     let hosts = [
         "127.0.0.1",
         "localhost",
         "redis.example.org",
         "10.0.0.7",
         "my-host_1",
+        "LocalHost",
+        "REDIS.Example.ORG",
     ];
     let passwords = [
         "",
@@ -1365,7 +1369,7 @@ fn endpoint_reads_as_the_url_did_where_the_url_worked() {
             }
         }
     }
-    assert!(same >= 800, "only {} cases compared", same);
+    assert!(same >= 1120, "only {} cases compared", same);
     let mut changed: Vec<&str> = differ.iter().map(|(p, _)| *p).collect();
     changed.sort();
     changed.dedup();

@@ -53,24 +53,27 @@ impl Drop for OtherDb {
     }
 }
 
-#[test]
-fn database_selection() {
-    // M1F-10: source and target in database 1; 1.0.8 always used database 0
-    let mut ctx = Ctx::new("database");
+/// M1F-10: source and target in database 1; 1.0.8 always used database 0. With ordering
+/// the sender delivers, through its own connections: both cells, so a sender that built
+/// its description apart (database 0) fails the second.
+fn database_selection(test: &str, ordering: bool) {
+    let mut ctx = Ctx::new(test);
     if ctx.ep.database != 0 {
         return; // the test URL selects a database already: the configuration sets it
     }
     let mut db1 = OtherDb::open(&ctx, 1);
     let src = db1.key(&ctx, "src");
     let t0 = db1.key(&ctx, "t0");
-    let all = packages("db", 20);
+    // seq_pkg: with ordering they carry a timestamp and go through the sender
+    let all: Vec<String> = (0..20).map(seq_pkg).collect();
     let _: i64 = redis::cmd("RPUSH")
         .arg(&src)
         .arg(&all)
         .query(&mut db1.con)
         .unwrap();
     let client = ctx.client_yaml("t0", &t0, "    database: 1\n");
-    let cfg = ctx.config(&src, 2, "replicant", "database: 1\n", &[client]);
+    let extra = format!("database: 1\n{}", if ordering { ORDERING_1S } else { "" });
+    let cfg = ctx.config(&src, 2, "replicant", &extra, &[client]);
     let mut p = ctx.spawn(&cfg);
     ctx.wait_for("the packages in database 1", |_| {
         db1.llen(&src) == 0 && db1.llen(&t0) == all.len()
@@ -78,8 +81,20 @@ fn database_selection() {
     p.stop(&ctx.pid_file());
     let mut got = db1.list(&t0);
     got.sort();
-    assert_eq!(got, all);
+    let mut want = all;
+    want.sort();
+    assert_eq!(got, want);
     assert_eq!(ctx.llen(&t0), 0, "a package went to database 0");
+}
+
+#[test]
+fn database_selection_workers() {
+    database_selection("database_off", false);
+}
+
+#[test]
+fn database_selection_sender() {
+    database_selection("database_on", true);
 }
 
 /// An ACL user created for one test and deleted with it
@@ -108,15 +123,15 @@ fn indented(text: &str) -> String {
     out
 }
 
-#[test]
-fn username_and_special_password() {
-    // M1F-7 and M3-i: a Redis 6 user whose password holds every character the URL of 1.0.8
-    // broke on ('#', '/', '?' panicked, '%41' was read as 'A', a tab did not connect)
-    let mut ctx = Ctx::new("acl");
+/// M1F-7 and M3-i: a Redis 6 user whose password holds every character the URL of 1.0.8
+/// broke on ('#', '/', '?' panicked, '%41' was read as 'A', a tab did not connect). Both
+/// cells of ordering, as database_selection.
+fn username_and_special_password(test: &str, ordering: bool) {
+    let mut ctx = Ctx::new(test);
     let src = ctx.key("src");
     let t0 = ctx.key("t0");
     let password = "p@ss:w/rd#?%41\tx y";
-    let user = format!("rmtest_{}", std::process::id());
+    let user = format!("rmtest_{}_{}", std::process::id(), test);
     let mut con = redis::Client::open(ctx.ep.url.as_str())
         .unwrap()
         .get_connection()
@@ -136,7 +151,7 @@ fn username_and_special_password() {
         con,
         name: user.clone(),
     };
-    let all = packages("acl", 20);
+    let all: Vec<String> = (0..20).map(seq_pkg).collect();
     ctx.push(&src, &all);
     let access = format!("username: {}\npassword: {}\n", q(&user), q(password));
     let client = format!(
@@ -148,7 +163,8 @@ fn username_and_special_password() {
         q(&t0)
     );
     // The root block's own `password:` line is the test URL's: replaced by the user's
-    let cfg = ctx.config(&src, 2, "replicant", "", &[client]);
+    let extra = if ordering { ORDERING_1S } else { "" };
+    let cfg = ctx.config(&src, 2, "replicant", extra, &[client]);
     let yaml = std::fs::read_to_string(&cfg).unwrap();
     let root_password = format!("password: {}\n", q(&ctx.ep.password));
     let yaml = yaml.replacen(&root_password, &access, 1);
@@ -158,8 +174,20 @@ fn username_and_special_password() {
     p.stop(&ctx.pid_file());
     let mut got = ctx.list(&t0);
     got.sort();
-    assert_eq!(got, all);
+    let mut want = all;
+    want.sort();
+    assert_eq!(got, want);
     assert!(!p.stderr().contains("Couldn't connect"), "{}", p.stderr());
+}
+
+#[test]
+fn username_and_special_password_workers() {
+    username_and_special_password("acl_off", false);
+}
+
+#[test]
+fn username_and_special_password_sender() {
+    username_and_special_password("acl_on", true);
 }
 
 #[test]
@@ -274,4 +302,29 @@ fn setname_refused_is_ignored() {
 #[test]
 fn setname_closing_peer_gets_a_connection_without_it() {
     setname_is_optional("setname_closed", OnClient::Close);
+}
+
+#[test]
+fn host_in_upper_case_connects() {
+    // The host goes to the resolver as written: a name in upper case resolves as the lower
+    // case one does (the differential run pins that the description keeps the case)
+    let mut ctx = Ctx::new("upper_host");
+    if !["127.0.0.1", "localhost"].contains(&ctx.ep.host.as_str()) || ctx.ep.ssl {
+        return; // the test Redis is not local: no name in upper case to give it
+    }
+    let src = ctx.key("src");
+    let t0 = ctx.key("t0");
+    let all = packages("up", 10);
+    ctx.push(&src, &all);
+    let client = ctx.client_yaml("t0", &t0, "").replacen(
+        &format!("hostname: {}", q(&ctx.ep.host)),
+        "hostname: 'LOCALHOST'",
+        1,
+    );
+    assert!(client.contains("LOCALHOST"), "{}", client);
+    let cfg = ctx.config(&src, 1, "replicant", "", &[client]);
+    let mut p = ctx.spawn(&cfg);
+    ctx.wait_drained(&src, &[(&t0, all.len())]);
+    p.stop(&ctx.pid_file());
+    assert_eq!(ctx.list(&t0), all);
 }
