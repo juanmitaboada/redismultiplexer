@@ -80,7 +80,7 @@ filter_replace: "ELL"
 - `softlimit`: the software will `continue` sending packages to the destination after a `hardlimit` was detected and the queue is freed until being under `softlimit`
 - `deleteblock`: when `hardlimit` is reached the software will delete n-oldests-packages from the queue as many times until the size of the queue is under `hardlimit`
 
-`hardlimit` turns the limits on; the other keys need it. Without them: `softlimit` is 80 % of `hardlimit` (at least 1), `timelimit` is 1 and `checklimit` is 10000, and the queue is checked at whichever comes first. A key set to 0 is not set; `deleteblock: 0` too (a warning at start says so).
+`hardlimit` turns the limits on; the other keys need it. Without them: `softlimit` is 80 % of `hardlimit` (at least 1), `timelimit` is 1 and `checklimit` is 10000, and the queue is checked at whichever comes first. A key set to 0 is not set; `deleteblock: 0` too (a warning at start says so). Each worker checks the queue on its own, so between two checks the queue can pass `hardlimit` by up to `children` x `checklimit` packages (with ordering, one x `checklimit`: only the sender delivers); for a small `hardlimit`, set `checklimit` too.
 
 ### Ordering is optional:
 
