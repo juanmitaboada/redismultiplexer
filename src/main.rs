@@ -516,8 +516,22 @@ fn stuck_clients(stats: &[WorkerStats], clients: usize) -> Vec<usize> {
         .collect()
 }
 
+/// Exit status (M3-h = ha): 0 after a stop by signal, `--version` and `--help`; 2 for a
+/// usage or configuration error
+const EXIT_OK: i32 = 0;
+const EXIT_CONFIG: i32 = 2;
+
 /// Main module will manage the basics from this program
 fn main() {
+    let code = run();
+    // process::exit runs no destructors: everything was dropped inside run() (the pid file
+    // removed); only stdout may hold a partial line
+    let _ = stdout().flush();
+    process::exit(code);
+}
+
+/// The program; its exit status
+fn run() -> i32 {
     // Get args
     let args: Vec<String> = std::env::args().collect();
 
@@ -527,6 +541,7 @@ fn main() {
         if (args[1] == "version") || (args[1] == "--version") {
             // Answer with our version
             println!("{} v{}", PROGRAM_NAME, VERSION);
+            EXIT_OK
         } else if (args[1] == "help") || (args[1] == "--help") || (args[1] == "-h") {
             // Welcome
             print_debug!(
@@ -560,6 +575,7 @@ fn main() {
 
             // Answer with out version
             println!("");
+            EXIT_OK
         } else {
             // Welcome
             print_debug!(
@@ -585,6 +601,9 @@ fn main() {
             } else {
                 final_path = args[1].clone();
             }
+
+            // A configuration that cannot be used ends the program with EXIT_CONFIG
+            let mut code = EXIT_CONFIG;
 
             // Read config
             let mut config: Option<Config> = None;
@@ -650,33 +669,11 @@ fn main() {
                     // Compile filters once (verify_config already checked that they compile)
                     let filters = build_filters(&inconfig).expect("filters checked at start");
 
-                    // Render main ordering regex
-                    let ordering_regex: Option<Regex>;
-                    let regex_str: &str;
-                    if let Some(r) = inconfig.ordering.clone() {
-                        regex_str = &r;
-                        let filter_temp = Regex::new(&regex_str);
-                        match filter_temp {
-                            Ok(f) => {
-                                ordering_regex = Some(f);
-                            }
-                            Err(e) => {
-                                print_debug!(
-                                    PROGRAM_NAME,
-                                    stderr(),
-                                    COLOR_RED,
-                                    0,
-                                    "Ordering Regex '{}' doesn't compile: {}",
-                                    r,
-                                    e
-                                );
-                                ordering_regex = None;
-                                error = true;
-                            }
-                        }
-                    } else {
-                        ordering_regex = None;
-                    }
+                    // Main ordering regex (verify_config already checked that it compiles)
+                    let ordering_regex: Option<Regex> = inconfig
+                        .ordering
+                        .as_ref()
+                        .map(|r| Regex::new(r).expect("ordering regex checked at start"));
 
                     if !error {
                         // Stop order, read by every child after each package. SIGINT, SIGTERM
@@ -879,6 +876,7 @@ fn main() {
                         );
 
                         print_debug!(PROGRAM_NAME, stdout(), COLOR_GREEN, 0, "Program finished!");
+                        code = EXIT_OK;
                     }
 
                     // Remove pid
@@ -897,6 +895,7 @@ fn main() {
                     }
                 }
             }
+            code
         }
     } else {
         // Welcome
@@ -944,6 +943,7 @@ fn main() {
             "    pid configuration entry will be set as /run/redismultiplexer/<config_prefix>.pid"
         );
         print_debug!(PROGRAM_NAME, stderr(), COLOR_WHITE, COLOR_NOHEAD, "    status configuration entry will be set as /run/redismultiplexer/<config_prefix>.status");
+        EXIT_CONFIG
     }
 }
 
@@ -1002,15 +1002,18 @@ fn verify_config(config: Config) -> Result<Config, String> {
     // Filter
     match &source.filter {
         None => {
-            if (source.filter_until != None)
-                || (source.filter_until_included != None)
-                || (source.filter_limit != None)
-                || (source.filter_replace != None)
-                || (source.filter_replace_header != None)
-            {
+            let keys = filter_options_set(
+                &source.filter_until,
+                source.filter_until_included,
+                source.filter_limit,
+                &source.filter_replace,
+                &source.filter_replace_header,
+            );
+            if !keys.is_empty() {
                 return Err(format!(
-                    "Source '{}' is using some filtering option but filter is not defined",
-                    source.name
+                    "Source '{}' sets {} without filter: the filtering options need a filter",
+                    source.name,
+                    keys.join(", ")
                 ));
             }
         }
@@ -1032,45 +1035,23 @@ fn verify_config(config: Config) -> Result<Config, String> {
 
     // === ORDERING ===
 
-    // If some config is set, all must be set
-    let mut configured = 0;
-
-    // Ordering Regex
-    match &source.ordering {
-        None => (),
-        Some(v) => configured += (v.len() > 0) as i8,
-    }
-
-    // Ordering Buffer Time
-    match source.ordering_buffer_time {
-        None => (),
-        Some(v) => configured += (v > 0) as i8,
-    }
-
-    // Ordering Limit
-    match source.ordering_limit {
-        None => (),
-        Some(v) => configured += (v > 0) as i8,
-    }
-
-    // Show error if any
-    if (configured > 0) && (configured < 2) {
-        return Err(format!("Source '{}' is using ordering, so you must set all ordering configuration: ordering (not empty), ordering_buffer_time (bigger than 0) and ordering_limit (bigger than 0)", source.name));
+    // No combination of the three keys is an error (M3-m = ma, M1F-5, D4d-2 = a): the odd
+    // ones get a warning at start (config_warnings). The regex must compile (main checked
+    // it before, after the pid file was written).
+    if let Some(r) = &source.ordering {
+        if let Err(e) = Regex::new(r) {
+            return Err(format!(
+                "Source '{}' has an ordering Regex '{}' that doesn't compile: {}",
+                source.name, r, e
+            ));
+        }
     }
 
     // Verify there are clients
     if config.clients.len() > 0 {
         // Verify all clients
         for client in &config.clients {
-            // Verify that name is not empty
-            if client.hostname.len() == 0 {
-                return Err(format!(
-                    "Client '{}' has an empty hostname [hostname=\"{}\", port={}, channel=\"{}\"]",
-                    client.name, client.hostname, client.port, client.channel
-                ));
-            }
-
-            // Verify that hostname is not empty
+            // Verify that hostname is not empty (an empty name only gets a warning, M1F-6)
             if client.hostname.len() == 0 {
                 return Err(format!(
                     "Client '{}' has an empty hostname [hostname=\"{}\", port={}, channel=\"{}\"]",
@@ -1115,25 +1096,23 @@ fn verify_config(config: Config) -> Result<Config, String> {
                 }
             }
 
-            // An endless LTRIM loop while the target is over hardlimit (M3F-4)
-            if client.deleteblock == Some(0) {
-                return Err(format!("Client '{}' has deleteblock: 0, set a number of elements bigger than 0 or remove the key", client.name));
-            }
-
             // === FILTERS ===
 
             // Filter
             match &client.filter {
                 None => {
-                    if (client.filter_until != None)
-                        || (client.filter_until_included != None)
-                        || (client.filter_limit != None)
-                        || (client.filter_replace != None)
-                        || (client.filter_replace_header != None)
-                    {
+                    let keys = filter_options_set(
+                        &client.filter_until,
+                        client.filter_until_included,
+                        client.filter_limit,
+                        &client.filter_replace,
+                        &client.filter_replace_header,
+                    );
+                    if !keys.is_empty() {
                         return Err(format!(
-                            "Client '{}' is using some filtering option but filter is not defined",
-                            client.name
+                            "Client '{}' sets {} without filter: the filtering options need a filter",
+                            client.name,
+                            keys.join(", ")
                         ));
                     }
                 }
@@ -1165,9 +1144,204 @@ fn verify_config(config: Config) -> Result<Config, String> {
     let mut config = config;
     for client in config.clients.iter_mut() {
         zero_limits_are_absent(client);
+        // `deleteblock: 0` is not set either (C4c-1 = a): the target is stuck at hardlimit
+        // instead of the endless LTRIM loop of 1.0.8 (M3F-4); a warning says so
+        if client.deleteblock == Some(0) {
+            client.deleteblock = None;
+        }
         limits_defaults(client);
     }
     return Ok(config);
+}
+
+/// The filtering options set, by key name, for the error when `filter` is missing (M3R-10)
+fn filter_options_set(
+    until: &Option<String>,
+    until_included: Option<bool>,
+    limit: Option<usize>,
+    replace: &Option<String>,
+    replace_header: &Option<String>,
+) -> Vec<&'static str> {
+    [
+        ("filter_until", until.is_some()),
+        ("filter_until_included", until_included.is_some()),
+        ("filter_limit", limit.is_some()),
+        ("filter_replace", replace.is_some()),
+        ("filter_replace_header", replace_header.is_some()),
+    ]
+    .into_iter()
+    .filter(|(_, set)| *set)
+    .map(|(key, _)| key)
+    .collect()
+}
+
+/// Odd but working settings: the program starts and says so (M3-m = ma). Read on the
+/// configuration as parsed, before verify_config reads 0 as not set.
+fn config_warnings(config: &Config) -> Vec<String> {
+    let mut warnings = Vec::new();
+    let source = format!("Source '{}'", config.name);
+    // Ordering (D4d-2 = a): every combination starts
+    let ordering_keys: Vec<&str> = [
+        (
+            "ordering_buffer_time",
+            config.ordering_buffer_time.is_some(),
+        ),
+        ("ordering_limit", config.ordering_limit.is_some()),
+    ]
+    .into_iter()
+    .filter(|(_, set)| *set)
+    .map(|(key, _)| key)
+    .collect();
+    match config.ordering.as_deref() {
+        None => {
+            if !ordering_keys.is_empty() {
+                warnings.push(format!(
+                    "{} sets {} without ordering: ignored",
+                    source,
+                    ordering_keys.join(", ")
+                ));
+            }
+        }
+        Some("") => warnings.push(format!(
+            "{} has an empty ordering: every package is delivered at once, without ordering information",
+            source
+        )),
+        Some(_) => {
+            if config.ordering_buffer_time.unwrap_or(0) == 0 {
+                warnings.push(format!(
+                    "{} uses ordering without ordering_buffer_time: packages are released at once, still in order",
+                    source
+                ));
+            }
+        }
+    }
+    let mut names: Vec<&str> = Vec::new();
+    for client in &config.clients {
+        let target = format!("Client '{}'", client.name);
+        // An empty name works, it only makes the log harder to read (M1F-6)
+        if client.name.is_empty() {
+            warnings.push(format!(
+                "A client has an empty name [hostname=\"{}\", port={}, channel=\"{}\"]",
+                client.hostname, client.port, client.channel
+            ));
+        } else if names.contains(&client.name.as_str()) {
+            warnings.push(format!(
+                "{} is the name of more than one client: the log and the status file cannot tell them apart",
+                target
+            ));
+        } else {
+            names.push(&client.name);
+        }
+        if let (Some(soft), Some(hard)) = (client.softlimit, client.hardlimit) {
+            if soft > 0 && hard > 0 && soft >= hard {
+                warnings.push(format!(
+                    "{} has softlimit {} at or above hardlimit {}: the target is freed at the check right after it gets stuck",
+                    target, soft, hard
+                ));
+            }
+        }
+        if client.deleteblock == Some(0) {
+            warnings.push(format!(
+                "{} has deleteblock: 0, read as not set: the target is stuck at hardlimit instead of trimmed",
+                target
+            ));
+        }
+    }
+    warnings
+}
+
+/// The keys a configuration file may have, at the root and in a client
+const ROOT_KEYS: &[&str] = &[
+    "name",
+    "ssl",
+    "hostname",
+    "port",
+    "password",
+    "username",
+    "database",
+    "connect_timeout",
+    "command_timeout",
+    "channel",
+    "children",
+    "mode",
+    "pid",
+    "status",
+    "filter",
+    "filter_until",
+    "filter_until_included",
+    "filter_limit",
+    "filter_replace",
+    "filter_replace_header",
+    "ordering",
+    "ordering_buffer_time",
+    "ordering_limit",
+    "clients",
+];
+const CLIENT_KEYS: &[&str] = &[
+    "name",
+    "ssl",
+    "hostname",
+    "port",
+    "password",
+    "username",
+    "database",
+    "connect_timeout",
+    "command_timeout",
+    "channel",
+    "timelimit",
+    "checklimit",
+    "softlimit",
+    "hardlimit",
+    "deleteblock",
+    "filter",
+    "filter_until",
+    "filter_until_included",
+    "filter_limit",
+    "filter_replace",
+    "filter_replace_header",
+];
+
+/// Keys the program does not know (a typo such as `filter_untill` is silently no filter),
+/// from a second, untyped read of the text. Not through `#[serde(flatten)]` on the typed
+/// read: that buffers the values, and an unquoted number on a text key (`password: 1234`,
+/// which 1.0.8 reads) would then fail to read as text. If the untyped read fails, no
+/// warnings: the typed read already decided whether the file is used.
+fn unknown_keys(data: &str) -> Vec<String> {
+    let Ok(serde_norway::Value::Mapping(root)) = serde_norway::from_str(data) else {
+        return Vec::new();
+    };
+    let unknown = |map: &serde_norway::Mapping, known: &[&str]| -> Vec<String> {
+        map.keys()
+            .map(|k| match k {
+                serde_norway::Value::String(s) => s.clone(),
+                other => format!("{:?}", other),
+            })
+            .filter(|k| !known.contains(&k.as_str()))
+            .collect()
+    };
+    let mut warnings: Vec<String> = unknown(&root, ROOT_KEYS)
+        .into_iter()
+        .map(|k| {
+            format!(
+                "Unknown key '{}' at the root of the configuration: ignored",
+                k
+            )
+        })
+        .collect();
+    if let Some(serde_norway::Value::Sequence(clients)) = root.get("clients") {
+        for (n, client) in clients.iter().enumerate() {
+            if let serde_norway::Value::Mapping(map) = client {
+                let name = match map.get("name") {
+                    Some(serde_norway::Value::String(s)) => s.clone(),
+                    _ => format!("#{}", n + 1),
+                };
+                for k in unknown(map, CLIENT_KEYS) {
+                    warnings.push(format!("Unknown key '{}' in client '{}': ignored", k, name));
+                }
+            }
+        }
+    }
+    warnings
 }
 
 /// A target with a hardlimit and some of the other limit keys absent (M3-f = fa): softlimit
@@ -1232,9 +1406,23 @@ fn get_config(path_to_config: String) -> Result<Config, String> {
 
             match parse_yaml(&data) {
                 Ok(v) => {
+                    let mut warnings = config_warnings(&v);
+                    warnings.extend(unknown_keys(&data));
                     // Do basic verifications on configuration
                     match verify_config(v) {
-                        Ok(vv) => return Ok(vv),
+                        Ok(vv) => {
+                            for w in warnings {
+                                print_debug!(
+                                    PROGRAM_NAME,
+                                    stderr(),
+                                    COLOR_YELLOW,
+                                    0,
+                                    "Warning: {}",
+                                    w
+                                );
+                            }
+                            return Ok(vv);
+                        }
                         Err(e) => {
                             return Err(format!("There is an error in your configuration: {}", e))
                         }

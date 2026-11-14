@@ -36,13 +36,24 @@ fn worker_lines(stderr: &str, word: &str, children: u16) -> usize {
 /// spreader: the healthy target takes them) and takes packages again once it is under
 /// its softlimit
 fn stall_and_release(tag: &str, cell: Cell) {
+    stall_and_release_with(tag, cell, LIMITS)
+}
+
+/// `deleteblock: 0` is read as not set (C4c-1 = a): the target is stuck at hardlimit and
+/// freed under softlimit, as without the key (1.0.8 looped for ever on LTRIM; 4c refused it)
+fn deleteblock_zero_stalls(tag: &str, cell: Cell) {
+    let limits = format!("{}    deleteblock: 0\n", LIMITS);
+    stall_and_release_with(tag, cell, &limits)
+}
+
+fn stall_and_release_with(tag: &str, cell: Cell, limits: &str) {
     let mut ctx = Ctx::new(tag);
     let src = ctx.key("src");
     let t0 = ctx.key("t0");
     let t1 = ctx.key("t1");
     let filler = packages("old", 10);
     ctx.push(&t0, &filler);
-    let mut clients = vec![ctx.client_yaml("t0", &t0, LIMITS)];
+    let mut clients = vec![ctx.client_yaml("t0", &t0, limits)];
     if cell.spreader {
         clients.push(ctx.client_yaml("t1", &t1, ""));
     }
@@ -149,6 +160,7 @@ fn deleteblock_trims(tag: &str, cell: Cell) {
 
 matrix!(stall, stall_and_release, 4);
 matrix!(deleteblock, deleteblock_trims, 4);
+matrix!(deleteblock_zero, deleteblock_zero_stalls, 4);
 
 /// Every limit at 0 is a target without limits (L4c-1, M3F-17): before, the start
 /// accepted it as such but the delivery read `hardlimit: 0` as a limit, so the target

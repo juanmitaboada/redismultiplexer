@@ -87,15 +87,15 @@ fn bad_client_regex_is_refused_at_start() {
 }
 
 #[test]
-fn invalid_config_exits_zero_current_behaviour() {
-    // M1F-3: a configuration error is printed but the exit status is 0.
+fn invalid_config_exits_two() {
+    // M3-h = ha (M1F-3): a configuration error exits 2 (1.0.8: 0)
     let mut ctx = Ctx::new("invalid_config");
     let src = ctx.key("src");
     let t0 = ctx.key("t0");
     let cfg = ctx.config(&src, 1, "foo", "", &[ctx.client_yaml("t0", &t0, "")]);
     let mut p = ctx.spawn(&cfg);
     let st = p.wait_exit();
-    assert!(st.success(), "exit status: {:?}", st);
+    assert_eq!(st.code(), Some(2), "exit status: {:?}", st);
     assert!(
         p.stderr().contains("Mode 'foo' is unknown"),
         "{}",
@@ -116,4 +116,87 @@ fn sigint_with_nonempty_source() {
         .copied()
         .eq(0..run.delivered.len() as u64));
     assert!(!run.left.is_empty());
+}
+
+#[test]
+fn usage_errors_exit_two() {
+    // No argument, a file that is not there, a file that is not YAML: 2 (M3-h = ha)
+    let out = Command::new(bin()).output().unwrap();
+    assert_eq!(out.status.code(), Some(2), "{:?}", out);
+    let out = Command::new(bin())
+        .arg("/nonexistent/redismultiplexer.yaml")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2), "{:?}", out);
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("not found"),
+        "{:?}",
+        out
+    );
+    let dir = std::env::temp_dir().join(format!("rmtest-usage-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let bad = dir.join("bad.yaml");
+    std::fs::write(&bad, "name: [unclosed\n").unwrap();
+    let out = Command::new(bin()).arg(&bad).output().unwrap();
+    assert_eq!(out.status.code(), Some(2), "{:?}", out);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn unwritable_pid_file_exits_two() {
+    let mut ctx = Ctx::new("pid_unwritable");
+    let src = ctx.key("src");
+    let t0 = ctx.key("t0");
+    ctx.push(&src, &packages("p", 2));
+    let cfg = ctx.config(&src, 1, "replicant", "", &[ctx.client_yaml("t0", &t0, "")]);
+    // The pid line of the configuration points into a directory that does not exist
+    let text = std::fs::read_to_string(&cfg).unwrap();
+    let pid = ctx.pid_file().to_string_lossy().to_string();
+    let text = text.replace(&pid, "/nonexistent/rmtest.pid");
+    assert_ne!(
+        text,
+        std::fs::read_to_string(&cfg).unwrap(),
+        "no pid line to replace"
+    );
+    std::fs::write(&cfg, text).unwrap();
+    let mut p = ctx.spawn(&cfg);
+    let st = p.wait_exit();
+    assert_eq!(st.code(), Some(2), "exit status: {:?}", st);
+    assert!(p.stderr().contains("Unable to write PID"), "{}", p.stderr());
+    assert_eq!(ctx.llen(&src), 2, "it popped packages");
+}
+
+#[test]
+fn odd_settings_warn_and_start() {
+    // M3-m = ma: a typo in a key, an empty client name, two clients with one name, ordering
+    // keys without ordering, softlimit above hardlimit: one warning each, and it delivers
+    let mut ctx = Ctx::new("odd_settings");
+    let src = ctx.key("src");
+    let t0 = ctx.key("t0");
+    let t1 = ctx.key("t1");
+    ctx.push(&src, &packages("p", 3));
+    let c0 = ctx.client_yaml(
+        "",
+        &t0,
+        "    filter_untill: '#'\n    softlimit: 50\n    hardlimit: 40\n",
+    );
+    let c1 = ctx.client_yaml("twin", &t1, "");
+    let t2 = ctx.key("t2");
+    let c2 = ctx.client_yaml("twin", &t2, "");
+    let extra = "ordering_limit: 64\ncolour: blue\n";
+    let cfg = ctx.config(&src, 1, "replicant", extra, &[c0, c1, c2]);
+    let mut p = ctx.spawn(&cfg);
+    ctx.wait_drained(&src, &[(&t0, 3), (&t1, 3)]);
+    p.stop(&ctx.pid_file());
+    let err = p.stderr();
+    for w in [
+        "Warning: Unknown key 'filter_untill' in client '': ignored",
+        "Warning: Unknown key 'colour' at the root of the configuration: ignored",
+        "Warning: A client has an empty name",
+        "Warning: Client 'twin' is the name of more than one client",
+        "sets ordering_limit without ordering: ignored",
+        "has softlimit 50 at or above hardlimit 40",
+    ] {
+        assert!(err.contains(w), "no {:?} in {}", w, err);
+    }
 }

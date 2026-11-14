@@ -471,10 +471,10 @@ fn filter_until_included_edges() {
 fn verify_rejects_until_included_without_filter() {
     let mut c = config();
     c.clients[0].filter_until_included = Some(true);
-    assert!(err(c).contains("filtering option but filter is not defined"));
+    assert!(err(c).contains("Client 't1' sets filter_until_included without filter"));
     let mut c = config();
     c.filter_until_included = Some(false);
-    assert!(err(c).contains("filtering option but filter is not defined"));
+    assert!(err(c).contains("Source 'source' sets filter_until_included without filter"));
 }
 
 #[test]
@@ -529,10 +529,10 @@ fn verify_rejects_both_replacements() {
 fn verify_rejects_replace_header_without_filter() {
     let mut c = config();
     c.clients[0].filter_replace_header = Some("x".into());
-    assert!(err(c).contains("filtering option but filter is not defined"));
+    assert!(err(c).contains("Client 't1' sets filter_replace_header without filter"));
     let mut c = config();
     c.filter_replace_header = Some("x".into());
-    assert!(err(c).contains("filtering option but filter is not defined"));
+    assert!(err(c).contains("Source 'source' sets filter_replace_header without filter"));
 }
 
 #[test]
@@ -1053,15 +1053,26 @@ fn zero_limits_read_as_absent() {
 // --- verify_config ---
 
 #[test]
-fn verify_rejects_deleteblock_zero() {
-    // M3F-4: with the target over hardlimit, LTRIM 0 removes nothing and the loop never ends
+fn verify_reads_deleteblock_zero_as_not_set() {
+    // C4c-1 = a: a 1.0.8 file with it started; read as not set, the target is stuck at
+    // hardlimit instead of the endless LTRIM loop (M3F-4), and a warning says so
     let mut c = config();
     c.clients[0].timelimit = Some(1);
     c.clients[0].checklimit = Some(1);
     c.clients[0].softlimit = Some(5);
     c.clients[0].hardlimit = Some(10);
     c.clients[0].deleteblock = Some(0);
-    assert!(err(c).contains("deleteblock: 0"));
+    let warnings = config_warnings(&c);
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.contains("deleteblock: 0, read as not set")),
+        "{:?}",
+        warnings
+    );
+    let c = verify_config(c).expect("deleteblock 0 starts");
+    assert_eq!(c.clients[0].deleteblock, None);
+    assert_eq!(c.clients[0].hardlimit, Some(10));
 }
 
 fn err(c: Config) -> String {
@@ -1109,12 +1120,14 @@ fn verify_rejects_empty_source_fields() {
 
 #[test]
 fn verify_rejects_filter_options_without_filter() {
+    // M3R-10: the error names the keys found
     let mut c = config();
     c.filter_until = Some("#".into());
-    assert!(err(c).contains("filter is not defined"));
+    c.filter_limit = Some(4);
+    assert!(err(c).contains("Source 'source' sets filter_until, filter_limit without filter"));
     let mut c = config();
     c.clients[0].filter_replace = Some("x".into());
-    assert!(err(c).contains("filter is not defined"));
+    assert!(err(c).contains("Client 't1' sets filter_replace without filter"));
 }
 
 #[test]
@@ -1134,19 +1147,53 @@ fn verify_accepts_complete_ordering() {
 }
 
 #[test]
-fn verify_rejects_single_ordering_option() {
-    let mut c = config();
-    c.ordering_buffer_time = Some(1);
-    assert!(err(c).contains("ordering"));
+fn verify_accepts_every_ordering_combination() {
+    // D4d-2 = a: no combination of the three keys is an error; the odd ones warn
+    let regex = Some("(?P<ts>\\d+)".to_string());
+    for o in [None, Some(String::new()), regex.clone()] {
+        for b in [None, Some(0), Some(1)] {
+            for l in [None, Some(0), Some(64)] {
+                let mut c = config();
+                (c.ordering, c.ordering_buffer_time, c.ordering_limit) = (o.clone(), b, l);
+                let warned = |text: &str| config_warnings(&c).iter().any(|w| w.contains(text));
+                let without = warned("without ordering: ignored");
+                let empty = warned("has an empty ordering");
+                let no_time = warned("without ordering_buffer_time");
+                assert_eq!(
+                    without,
+                    o.is_none() && (b.is_some() || l.is_some()),
+                    "{:?}",
+                    (&o, b, l)
+                );
+                assert_eq!(empty, o.as_deref() == Some(""), "{:?}", (&o, b, l));
+                assert_eq!(
+                    no_time,
+                    o == regex && b.unwrap_or(0) == 0,
+                    "{:?}",
+                    (&o, b, l)
+                );
+                assert!(verify_config(c).is_ok(), "{:?}", (&o, b, l));
+            }
+        }
+    }
 }
 
 #[test]
-fn verify_accepts_two_of_three_ordering_options_current_behaviour() {
-    // M1F-5: the check is `configured < 2`, so two of the three options pass.
+fn verify_ordering_limit_is_optional() {
+    // M1F-5: ordering and ordering_buffer_time are enough, with no warning
     let mut c = config();
     c.ordering = Some("(?P<ts>\\d+)".into());
     c.ordering_buffer_time = Some(1);
+    assert!(config_warnings(&c).is_empty());
     assert!(verify_config(c).is_ok());
+}
+
+#[test]
+fn verify_rejects_an_ordering_regex_that_does_not_compile() {
+    let mut c = config();
+    c.ordering = Some("(".into());
+    c.ordering_buffer_time = Some(1);
+    assert!(err(c).contains("has an ordering Regex '(' that doesn't compile"));
 }
 
 #[test]
@@ -1217,7 +1264,6 @@ fn limits_keys_accepted_set_over_the_grid() {
                         // Without a hardlimit no other limit key may be set (0 is not set)
                         let starts = set(h).is_some()
                             || (set(t).is_none() && set(k).is_none() && set(s).is_none());
-                        let starts = starts && d != Some(0);
                         let case = (t, k, s, h, d);
                         assert_eq!(result.is_ok(), starts, "{:?}", case);
                         if let Ok(c) = result {
@@ -1242,14 +1288,15 @@ fn limits_keys_accepted_set_over_the_grid() {
                                 "{:?}",
                                 case
                             );
-                            assert_eq!(r.deleteblock, d, "{:?}", case);
+                            // deleteblock 0 is not set either (C4c-1 = a)
+                            assert_eq!(r.deleteblock, d.filter(|&x| x > 0), "{:?}", case);
                         }
                     }
                 }
             }
         }
     }
-    assert_eq!(accepted, 5193);
+    assert_eq!(accepted, 6924);
 }
 
 #[test]
@@ -1297,10 +1344,13 @@ fn verify_rejects_empty_client_channel() {
 }
 
 #[test]
-fn verify_accepts_empty_client_name_current_behaviour() {
-    // M1F-6: the client hostname is checked twice and the name never.
+fn verify_warns_on_empty_client_name() {
+    // M1F-6: an empty name works; a warning says so
     let mut c = config();
     c.clients[0].name = String::new();
+    assert!(config_warnings(&c)
+        .iter()
+        .any(|w| w.contains("A client has an empty name")));
     assert!(verify_config(c).is_ok());
 }
 
@@ -1710,4 +1760,92 @@ fn yaml_timeouts_accept_integers_and_decimals() {
         (c.clients[0].connect_timeout, c.clients[0].command_timeout),
         (Some(0.2), Some(1.5))
     );
+}
+
+#[test]
+fn config_warnings_for_duplicate_names_and_soft_above_hard() {
+    let mut c = config();
+    c.clients.push(client("t1", "dst2"));
+    c.clients[0].hardlimit = Some(10);
+    c.clients[0].softlimit = Some(10);
+    let w = config_warnings(&c);
+    assert!(
+        w.iter()
+            .any(|w| w.contains("Client 't1' is the name of more than one client")),
+        "{:?}",
+        w
+    );
+    assert!(
+        w.iter()
+            .any(|w| w.contains("softlimit 10 at or above hardlimit 10")),
+        "{:?}",
+        w
+    );
+    assert!(config_warnings(&config()).is_empty());
+}
+
+#[test]
+fn unknown_keys_are_named() {
+    let yaml = "name: s
+hostname: h
+port: 1
+password: ''
+channel: c
+children: 1
+mode: replicant
+colour: blue
+clients:
+  - name: t0
+    hostname: h
+    port: 1
+    password: ''
+    channel: d
+    filter_untill: '#'
+  - name: 7
+    hostname: h
+    port: 1
+    password: ''
+    channel: e
+    x: 1
+";
+    assert!(parse_yaml(yaml).is_ok());
+    assert_eq!(
+        unknown_keys(yaml),
+        vec![
+            "Unknown key 'colour' at the root of the configuration: ignored".to_string(),
+            "Unknown key 'filter_untill' in client 't0': ignored".to_string(),
+            "Unknown key 'x' in client '#2': ignored".to_string(),
+        ]
+    );
+    // An unquoted number on a text key reads as text (as 1.0.8) and is not a warning
+    let yaml = yaml.replace("password: ''\nchannel: c", "password: 1234\nchannel: c");
+    assert_eq!(parse_yaml(&yaml).unwrap().password, "1234");
+    assert_eq!(unknown_keys(&yaml).len(), 3);
+    // Text the untyped read cannot take: no warnings, nothing else
+    assert!(unknown_keys("[1, 2").is_empty());
+}
+
+#[test]
+fn known_keys_are_the_configuration_fields() {
+    // Every field of Config and ClientConfig, and nothing else, as the key lists say
+    let mut c = config();
+    c.ssl = Some(true);
+    let fields = |v: serde_norway::Value| -> Vec<String> {
+        match v {
+            serde_norway::Value::Mapping(m) => {
+                m.keys().map(|k| k.as_str().unwrap().to_string()).collect()
+            }
+            _ => panic!("not a mapping"),
+        }
+    };
+    let mut root = fields(serde_norway::to_value(&c).unwrap());
+    let mut client = fields(serde_norway::to_value(&c.clients[0]).unwrap());
+    root.sort();
+    client.sort();
+    let mut want_root: Vec<String> = ROOT_KEYS.iter().map(|k| k.to_string()).collect();
+    let mut want_client: Vec<String> = CLIENT_KEYS.iter().map(|k| k.to_string()).collect();
+    want_root.sort();
+    want_client.sort();
+    assert_eq!(root, want_root);
+    assert_eq!(client, want_client);
 }
