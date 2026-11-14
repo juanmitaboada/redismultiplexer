@@ -869,7 +869,62 @@ fn restarted_while_idle(test: &str, cell: Cell) {
     p.stop(&ctx.pid_file());
 }
 
+/// A target whose user may not run PING (M3R-29 = R29a): the error reply to the idle PING
+/// proves the link alive, so no line and no reconnect while the source is idle (4c printed
+/// one line per idle second, thread and target); a restart while idle is still found (the
+/// closed connection is an I/O error, not a reply) and loses nothing
+fn ping_refused(test: &str, cell: Cell) {
+    let mut ctx = Ctx::new(test);
+    let src = ctx.key("src");
+    let mut targets: Vec<SlowTarget> = (0..cell.targets())
+        .map(|_| SlowTarget::refusing_ping())
+        .collect();
+    let clients: Vec<String> = targets
+        .iter()
+        .enumerate()
+        .map(|(i, t)| {
+            ctx.client_yaml_at(
+                &format!("t{}", i),
+                &format!("rmtest:{}:{}", test, i),
+                t.port,
+            )
+        })
+        .collect();
+    let cfg = ctx.config(&src, cell.children, cell.mode(), cell.extra(), &clients);
+    let mut p = ctx.spawn(&cfg);
+    // Past the start, then idle for three turns of the idle path
+    thread::sleep(Duration::from_millis(1500));
+    let before: Vec<usize> = targets.iter().map(|t| t.connections()).collect();
+    thread::sleep(Duration::from_millis(3000));
+    let after: Vec<usize> = targets.iter().map(|t| t.connections()).collect();
+    assert_eq!(
+        before,
+        after,
+        "links reconnected while idle: {}",
+        p.stderr()
+    );
+    assert!(!p.stderr().contains("error on PING"), "{}", p.stderr());
+    for t in targets.iter_mut() {
+        *t = t.restart();
+    }
+    thread::sleep(Duration::from_millis(3000));
+    let all: Vec<String> = (0..20).map(seq_pkg).collect();
+    ctx.push(&src, &all);
+    let want = if cell.spreader {
+        20
+    } else {
+        20 * targets.len()
+    };
+    ctx.wait_for("every package at the restarted targets", |_| {
+        targets.iter().map(|t| t.count()).sum::<usize>() == want
+    });
+    p.stop(&ctx.pid_file());
+    // The restart's closed links have their line; the refusals none
+    assert!(!p.stderr().contains("NOPERM"), "{}", p.stderr());
+}
+
 matrix!(target_closes, target_closes_mid_run, 2);
+matrix!(ping_refused_alive, ping_refused, 2);
 matrix!(restarted_idle, restarted_while_idle, 2);
 matrix!(silent_start, silent_start_bounded, 2);
 matrix!(blackhole_start, blackhole_start_bounded, 2);

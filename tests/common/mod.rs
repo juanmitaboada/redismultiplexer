@@ -634,6 +634,8 @@ struct SlowState {
     streams: Vec<TcpStream>,
     on_client: OnClient,
     after_push: AfterPush,
+    refuse_ping: bool,
+    connections: usize,
 }
 
 /// What a SlowTarget does after it records an RPUSH (M3R-20: a push the target may have
@@ -681,6 +683,18 @@ impl SlowTarget {
         SlowTarget::start_on(0, Duration::ZERO, OnClient::Ok, after_push)
     }
 
+    /// A target whose user may not run PING: an error reply to it (M3R-29)
+    pub fn refusing_ping() -> SlowTarget {
+        let t = SlowTarget::start(Duration::ZERO);
+        t.shared.lock().unwrap().refuse_ping = true;
+        t
+    }
+
+    /// Connections accepted so far
+    pub fn connections(&self) -> usize {
+        self.shared.lock().unwrap().connections
+    }
+
     /// On a given port (0: any), to bring a target up where one was refusing
     pub fn start_on(
         port: u16,
@@ -705,6 +719,7 @@ impl SlowTarget {
                     return;
                 }
                 g.streams.push(stream.try_clone().unwrap());
+                g.connections += 1;
                 drop(g);
                 let st = st.clone();
                 thread::spawn(move || slow_target_serve(stream, delay, st));
@@ -749,7 +764,10 @@ impl SlowTarget {
             assert!(Instant::now() < deadline, "port {} still bound", self.port);
             thread::sleep(Duration::from_millis(10));
         }
-        SlowTarget::start_on(self.port, Duration::ZERO, OnClient::Ok, AfterPush::Answer)
+        let refuse_ping = self.shared.lock().unwrap().refuse_ping;
+        let t = SlowTarget::start_on(self.port, Duration::ZERO, OnClient::Ok, AfterPush::Answer);
+        t.shared.lock().unwrap().refuse_ping = refuse_ping;
+        t
     }
 }
 
@@ -874,6 +892,9 @@ fn slow_target_serve(stream: TcpStream, delay: Duration, st: Arc<Mutex<SlowState
                 // A clone of the socket is kept for close(): shut it down for real
                 let _ = w.shutdown(std::net::Shutdown::Both);
                 return;
+            }
+            "PING" if g.refuse_ping => {
+                "-NOPERM User rmtest has no permissions to run the 'ping' command\r\n".to_string()
             }
             "CLIENT" if g.on_client == OnClient::Error => {
                 "-NOPERM this user has no permissions to run the 'client' command\r\n".to_string()

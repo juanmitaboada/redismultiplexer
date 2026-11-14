@@ -2817,13 +2817,22 @@ fn refresh(id: u16, clients: &mut [RedisLink], deleted: &mut u64) {
     }
 }
 
-/// A PING on a target's link; an error that broke the link drops it
+/// A PING on a target's link; an error that broke the link drops it. An error reply
+/// (a user without the right to PING, a server LOADING) came over a working link: alive,
+/// nothing to say (M3R-29 = R29a; 4c printed a line for it every idle second)
 fn ping(client: &mut RedisLink) -> Result<(), String> {
     let result: redis::RedisResult<String> = redis::cmd("PING").query(link(&mut client.link)?);
-    result.map(|_| ()).map_err(|e| {
-        link_broken(client, &e);
-        format!("error on PING: {}", e)
-    })
+    match result {
+        Ok(_) => Ok(()),
+        Err(e) => {
+            link_broken(client, &e);
+            if client.link.is_some() {
+                Ok(())
+            } else {
+                Err(format!("error on PING: {}", e))
+            }
+        }
+    }
 }
 
 #[cfg(test)]
