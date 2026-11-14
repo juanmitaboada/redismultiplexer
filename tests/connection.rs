@@ -5,6 +5,7 @@
 mod common;
 
 use common::*;
+use std::time::Duration;
 
 /// A key of database `db` on the test server, deleted when dropped
 struct OtherDb {
@@ -190,26 +191,58 @@ fn username_and_special_password_sender() {
     username_and_special_password("acl_on", true);
 }
 
-#[test]
-fn tls_target() {
-    // M3R-4 (PKG): a target over TLS, the server's certificate signed by a CA the program
-    // is told to trust. Runs only where a TLS Redis is given: RM_TEST_REDIS_TLS_URL
-    // (rediss://host:port, no password) and RM_TEST_REDIS_TLS_CA (the CA file).
+/// The TLS Redis of the environment, if given: RM_TEST_REDIS_TLS_URL (rediss://host:port,
+/// no password) and RM_TEST_REDIS_TLS_CA (the CA file): (host, port, CA)
+fn tls_redis(test: &str) -> Option<(String, String, String)> {
     let (Ok(url), Ok(ca)) = (
         std::env::var("RM_TEST_REDIS_TLS_URL"),
         std::env::var("RM_TEST_REDIS_TLS_CA"),
     ) else {
-        eprintln!("tls_target: skipped, RM_TEST_REDIS_TLS_URL or RM_TEST_REDIS_TLS_CA not set");
-        return;
+        eprintln!(
+            "{}: skipped, RM_TEST_REDIS_TLS_URL or RM_TEST_REDIS_TLS_CA not set",
+            test
+        );
+        return None;
     };
     let hostport = url
         .strip_prefix("rediss://")
         .expect("RM_TEST_REDIS_TLS_URL starts with rediss://");
     let (host, port) = hostport.trim_end_matches('/').rsplit_once(':').unwrap();
-    let mut ctx = Ctx::new("tls");
+    Some((host.to_string(), port.to_string(), ca))
+}
+
+/// redis-cli against the TLS Redis
+fn tls_cli(host: &str, port: &str, ca: &str, args: &[&str]) -> String {
+    let out = std::process::Command::new("redis-cli")
+        .args(["--tls", "--cacert", ca, "-h", host, "-p", port])
+        .args(args)
+        .output()
+        .expect("redis-cli for the TLS Redis");
+    String::from_utf8(out.stdout).unwrap()
+}
+
+#[test]
+fn tls_target() {
+    tls_target_cell("tls_target", false);
+}
+
+#[test]
+fn tls_target_sender() {
+    // M3R-25: with ordering the sender delivers, through its own connections
+    tls_target_cell("tls_target_sender", true);
+}
+
+/// M3R-4 (PKG): a target over TLS, the server's certificate signed by a CA the program is
+/// told to trust. Runs only where a TLS Redis is given.
+fn tls_target_cell(test: &str, ordering: bool) {
+    let Some((host, port, ca)) = tls_redis(test) else {
+        return;
+    };
+    let (host, port) = (host.as_str(), port.as_str());
+    let mut ctx = Ctx::new(test);
     let src = ctx.key("src");
     let t0 = ctx.key("t0");
-    let all = packages("tls", 20);
+    let all: Vec<String> = (0..20).map(seq_pkg).collect();
     ctx.push(&src, &all);
     let client = format!(
         "  - name: 't0'\n    ssl: true\n    hostname: {}\n    port: {}\n    password: ''\n    channel: {}\n",
@@ -217,27 +250,71 @@ fn tls_target() {
         port,
         q(&t0)
     );
-    let cfg = ctx.config(&src, 2, "replicant", "", &[client]);
+    let extra = if ordering { ORDERING_1S } else { "" };
+    let cfg = ctx.config(&src, 2, "replicant", extra, &[client]);
     let mut p = ctx.spawn_env(&cfg, "SSL_CERT_FILE", &ca);
     ctx.wait_for("the source drained", |c| c.llen(&src) == 0);
+    // Read back over TLS with the same CA (with ordering after the buffer time)
+    let start = std::time::Instant::now();
+    let mut got: Vec<String> = Vec::new();
+    while start.elapsed() < Duration::from_secs(10) {
+        got = tls_cli(host, port, &ca, &["LRANGE", &t0, "0", "-1"])
+            .lines()
+            .map(|l| l.to_string())
+            .collect();
+        if got.len() >= all.len() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
     p.stop(&ctx.pid_file());
-    // Read back over TLS with the same CA
-    let out = std::process::Command::new("redis-cli")
-        .args([
-            "--tls", "--cacert", &ca, "-h", host, "-p", port, "LRANGE", &t0, "0", "-1",
-        ])
-        .output()
-        .expect("redis-cli to read the TLS target");
-    let mut got: Vec<String> = String::from_utf8(out.stdout)
-        .unwrap()
-        .lines()
-        .map(|l| l.to_string())
-        .collect();
-    let _ = std::process::Command::new("redis-cli")
-        .args(["--tls", "--cacert", &ca, "-h", host, "-p", port, "DEL", &t0])
-        .output();
+    tls_cli(host, port, &ca, &["DEL", &t0]);
     got.sort();
-    assert_eq!(got, all, "{}", p.stderr());
+    let mut want = all;
+    want.sort();
+    assert_eq!(got, want, "{}", p.stderr());
+}
+
+#[test]
+fn tls_source() {
+    // M3R-25: a source over TLS (the TLS Redis), a plain target
+    let Some((host, port, ca)) = tls_redis("tls_source") else {
+        return;
+    };
+    let mut ctx = Ctx::new("tls_source");
+    let src = format!("rmtest:tls_source:{}:src", std::process::id());
+    let t0 = ctx.key("t0");
+    let all: Vec<String> = (0..20).map(seq_pkg).collect();
+    let mut push: Vec<&str> = vec!["RPUSH", &src];
+    push.extend(all.iter().map(|p| p.as_str()));
+    tls_cli(&host, &port, &ca, &push);
+    let cfg = ctx.config(&src, 2, "replicant", "", &[ctx.client_yaml("t0", &t0, "")]);
+    let yaml = std::fs::read_to_string(&cfg).unwrap();
+    let root = format!(
+        "ssl: {}\nhostname: {}\nport: {}\npassword: {}\n",
+        ctx.ep.ssl,
+        q(&ctx.ep.host),
+        ctx.ep.port,
+        q(&ctx.ep.password)
+    );
+    assert!(yaml.contains(&root), "{}", yaml);
+    let tls_root = format!(
+        "ssl: true\nhostname: {}\nport: {}\npassword: ''\n",
+        q(&host),
+        port
+    );
+    std::fs::write(&cfg, yaml.replacen(&root, &tls_root, 1)).unwrap();
+    let mut p = ctx.spawn_env(&cfg, "SSL_CERT_FILE", &ca);
+    ctx.wait_for("every package at the target", |c| c.llen(&t0) == all.len());
+    p.stop(&ctx.pid_file());
+    let left = tls_cli(&host, &port, &ca, &["LLEN", &src]);
+    tls_cli(&host, &port, &ca, &["DEL", &src]);
+    assert_eq!(left.trim(), "0");
+    let mut got = ctx.list(&t0);
+    got.sort();
+    let mut want = all;
+    want.sort();
+    assert_eq!(got, want, "{}", p.stderr());
 }
 
 #[test]

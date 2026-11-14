@@ -32,6 +32,11 @@ fn worker_lines(stderr: &str, word: &str, children: u16) -> usize {
         .count()
 }
 
+/// Messages of the sender (its id is `children`), counted as worker_lines counts
+fn sender_lines(stderr: &str, word: &str, children: u16) -> usize {
+    worker_lines(stderr, word, children + 1) - worker_lines(stderr, word, children)
+}
+
 /// A target at its hardlimit takes nothing while it is stuck (replicant: dropped;
 /// spreader: the healthy target takes them) and takes packages again once it is under
 /// its softlimit
@@ -77,7 +82,7 @@ fn stall_and_release_with(tag: &str, cell: Cell, limits: &str) {
 
     // Under softlimit; wait until every worker that found it stuck found it freed on
     // its idle path (with ordering the workers hold the packages and the sender checks:
-    // no worker line). The sender has no idle path: its next check frees it (timelimit)
+    // no worker line; the sender's idle turn or its next check frees it)
     ctx.ltrim(&t0, 8, -1);
     let children = cell.children;
     ctx.wait_for("every stuck worker freed", |_| {
@@ -284,7 +289,7 @@ fn no_llen_without_limits(tag: &str, cell: Cell) {
 /// A stuck target is re-checked once a second while the source is idle, whatever its
 /// timelimit and checklimit say (L4c-3): here they would wait an hour or 1000 packages,
 /// and the parent's idle path ran the timelimit and countdown check, so it stayed stuck.
-/// Workers only: the sender has no idle path, its next check frees it.
+/// With ordering the sender too: its idle turn re-checks the target (M3R-31).
 fn stuck_freed_while_idle(tag: &str, cell: Cell) {
     let mut ctx = Ctx::new(tag);
     let src = ctx.key("src");
@@ -305,12 +310,20 @@ fn stuck_freed_while_idle(tag: &str, cell: Cell) {
     ctx.wait_for("the source drained and a worker found it stuck", |c| {
         c.llen(&src) == 0 && worker_lines(&p.stderr(), "stuck!", children) > 0
     });
+    if cell.ordering {
+        // Packages with a ts go through the sender, which finds it stuck too
+        ctx.push(&src, &(0..5).map(seq_pkg).collect::<Vec<String>>());
+        ctx.wait_for("the sender found it stuck", |_| {
+            sender_lines(&p.stderr(), "stuck!", children) > 0
+        });
+    }
     thread::sleep(Duration::from_millis(300));
     let stuck = worker_lines(&p.stderr(), "stuck!", children);
     ctx.ltrim(&t0, 8, -1);
     let start = std::time::Instant::now();
     ctx.wait_for("every stuck worker freed it", |_| {
         worker_lines(&p.stderr(), "freed!", children) == stuck
+            && (!cell.ordering || sender_lines(&p.stderr(), "freed!", children) > 0)
     });
     let took = start.elapsed();
     p.stop(&ctx.pid_file());
@@ -318,6 +331,58 @@ fn stuck_freed_while_idle(tag: &str, cell: Cell) {
 }
 
 matrix!(no_llen, no_llen_without_limits, 4);
+
+/// One check trims until the target is under hardlimit, however many blocks that takes
+/// (M3R-31): 30 elements, hardlimit 10, deleteblock 4: six trims at the first package
+fn deleteblock_trims_in_one_check(tag: &str, cell: Cell) {
+    let mut ctx = Ctx::new(tag);
+    let src = ctx.key("src");
+    let t0 = ctx.key("t0");
+    ctx.push(&t0, &packages("old", 30));
+    let limits = "    timelimit: 3600\n    checklimit: 1000\n    softlimit: 5\n    hardlimit: 10\n    deleteblock: 4\n";
+    let clients = [ctx.client_yaml("t0", &t0, limits)];
+    let cfg = ctx.config(&src, cell.children, cell.mode(), cell.extra(), &clients);
+    let mut p = ctx.spawn(&cfg);
+    ctx.push(&src, &[seq_pkg(1)]);
+    ctx.wait_for("the package delivered", |c| {
+        c.llen(&src) == 0 && c.list(&t0).last() == Some(&seq_pkg(1))
+    });
+    p.stop(&ctx.pid_file());
+    let got = ctx.list(&t0);
+    assert_eq!(got.len(), 7, "{:?}", got);
+    assert_eq!(
+        &got[..6],
+        &packages("old", 30)[24..],
+        "not the oldest trimmed"
+    );
+}
+
+matrix!(deleteblock_loop, deleteblock_trims_in_one_check, 2);
+
+/// Lengths as 64 bits and LTRIM to the end of the list (M3F-5, M3R-31), with a stand-in:
+/// a target whose LLEN says 2^32 + 5 (read as 32 bits that is 5, under hardlimit, and no
+/// trim) is trimmed with `LTRIM <key> 4 -1` (1.0.8 kept at most 100000000 after the block)
+fn long_lists(tag: &str, cell: Cell) {
+    let mut ctx = Ctx::new(tag);
+    let src = ctx.key("src");
+    let target = SlowTarget::scripted_llen(&[(1u64 << 32) + 5, 3]);
+    let key = format!("rmtest:{}:t0", tag);
+    let limits = "    timelimit: 3600\n    checklimit: 1000\n    softlimit: 5\n    hardlimit: 10\n    deleteblock: 4\n";
+    let client = format!("{}{}", ctx.client_yaml_at("t0", &key, target.port), limits);
+    let cfg = ctx.config(&src, 1, cell.mode(), cell.extra(), &[client]);
+    let mut p = ctx.spawn(&cfg);
+    ctx.push(&src, &[seq_pkg(1)]);
+    ctx.wait_for("the package delivered", |_| target.count() == 1);
+    p.stop(&ctx.pid_file());
+    assert_eq!(
+        target.ltrims(),
+        vec![(key, "4".to_string(), "-1".to_string())],
+        "{}",
+        p.stderr()
+    );
+}
+
+matrix!(long_list, long_lists, 1);
 matrix!(idle_recheck, stuck_freed_while_idle, 4);
 
 /// A hardlimit alone turns the limits on (M3-f = fa): stuck at 10, freed under the default

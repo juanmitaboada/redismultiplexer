@@ -193,3 +193,105 @@ fn silent_source_does_not_hold_the_stop() {
         start.elapsed()
     );
 }
+
+/// The sender's connections take the timeout keys too (M3R-25): with ordering the sender
+/// waits at its start for a target that never answers up to that target's connect plus
+/// command timeout, so a healthy target's first ordered package comes after the short
+/// bound the keys give (0.3 + 0.4 s) plus the 1 s buffer, not after the 7 s of the defaults
+fn sender_honours_the_keys(test: &str, port: u16) {
+    let mut ctx = Ctx::new(test);
+    let src = ctx.key("src");
+    let t0 = ctx.key("t0");
+    let keys = "    connect_timeout: 0.3\n    command_timeout: 0.4\n";
+    let clients = [
+        ctx.client_yaml_at("mute", "rmtest:mute", port) + keys,
+        ctx.client_yaml("t0", &t0, ""),
+    ];
+    let cfg = ctx.config(&src, 1, "replicant", ORDERING_1S, &clients);
+    let start = Instant::now();
+    let mut p = ctx.spawn(&cfg);
+    ctx.push(&src, &[seq_pkg(1)]);
+    ctx.wait_for("the package at the healthy target", |c| c.llen(&t0) == 1);
+    let took = start.elapsed();
+    p.stop(&ctx.pid_file());
+    assert!(
+        took < Duration::from_secs(4),
+        "first ordered package after {:?}",
+        took
+    );
+}
+
+#[test]
+fn sender_connect_timeout_key() {
+    let hole = blackhole();
+    sender_honours_the_keys("sender_ct_key", hole.port);
+}
+
+#[test]
+fn sender_command_timeout_key() {
+    let mute = SilentTarget::start();
+    sender_honours_the_keys("sender_mt_key", mute.port);
+}
+
+/// The command timeout bounds a write too (M3R-26): a target that answers its handshake and
+/// the idle PING and reads nothing of an RPUSH; a package larger than the socket buffers blocks the RPUSH in the
+/// write, which gives up after the command timeout; the healthy target then gets it
+fn write_timeout(test: &str, ordering: bool) {
+    let mut ctx = Ctx::new(test);
+    let src = ctx.key("src");
+    let t0 = ctx.key("t0");
+    let deaf = DeafTarget::start();
+    let clients = [
+        ctx.client_yaml_at("deaf", "rmtest:deaf", deaf.port) + "    command_timeout: 0.5\n",
+        ctx.client_yaml("t0", &t0, ""),
+    ];
+    let extra = if ordering { ORDERING_1S } else { "" };
+    let cfg = ctx.config(&src, 1, "replicant", extra, &clients);
+    let mut p = ctx.spawn(&cfg);
+    // 64 MiB: far above what loopback buffers hold
+    let big = format!("{}{}", seq_pkg(1), "x".repeat(64 << 20));
+    ctx.push(&src, &[big]);
+    ctx.wait_for("the big package at the healthy target", |c| {
+        c.llen(&t0) == 1
+    });
+    p.stop(&ctx.pid_file());
+    assert!(p.stderr().contains("Error while sending"), "{}", p.stderr());
+}
+
+#[test]
+fn write_timeout_bounds_a_target_that_stops_reading() {
+    write_timeout("write_timeout_off", false);
+}
+
+#[test]
+fn write_timeout_bounds_a_target_that_stops_reading_sender() {
+    write_timeout("write_timeout_on", true);
+}
+
+/// The source read waits BLPOP's own second beyond the command timeout (M3R-26): with
+/// `command_timeout: 0.5` at the root an idle source is not a timeout (each BLPOP answers
+/// nil after 1 s), so no read error and no reconnect while idle
+#[test]
+fn source_read_waits_for_blpop() {
+    let mut ctx = Ctx::new("source_blpop_wait");
+    let src = ctx.key("src");
+    let t0 = ctx.key("t0");
+    let extra = "command_timeout: 0.5\n";
+    let cfg = ctx.config(
+        &src,
+        2,
+        "replicant",
+        extra,
+        &[ctx.client_yaml("t0", &t0, "")],
+    );
+    let mut p = ctx.spawn(&cfg);
+    thread::sleep(Duration::from_millis(3500));
+    ctx.push(&src, &[seq_pkg(1)]);
+    ctx.wait_drained(&src, &[(&t0, 1)]);
+    p.stop(&ctx.pid_file());
+    assert!(
+        !p.stderr().contains("Error while reading"),
+        "{}",
+        p.stderr()
+    );
+}

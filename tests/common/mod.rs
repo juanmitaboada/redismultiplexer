@@ -636,6 +636,10 @@ struct SlowState {
     after_push: AfterPush,
     refuse_ping: bool,
     connections: usize,
+    /// LLEN replies in turn (the last one repeats); empty: 0
+    llen_replies: Vec<u64>,
+    /// LTRIM arguments received (key, start, stop)
+    ltrims: Vec<(String, String, String)>,
 }
 
 /// What a SlowTarget does after it records an RPUSH (M3R-20: a push the target may have
@@ -688,6 +692,19 @@ impl SlowTarget {
         let t = SlowTarget::start(Duration::ZERO);
         t.shared.lock().unwrap().refuse_ping = true;
         t
+    }
+
+    /// A target whose LLEN answers `replies` in turn, the last one for good, and that records
+    /// the LTRIMs it gets (M3F-5: a length above 2^32 without such a list)
+    pub fn scripted_llen(replies: &[u64]) -> SlowTarget {
+        let t = SlowTarget::start(Duration::ZERO);
+        t.shared.lock().unwrap().llen_replies = replies.to_vec();
+        t
+    }
+
+    /// LTRIMs received so far: (key, start, stop)
+    pub fn ltrims(&self) -> Vec<(String, String, String)> {
+        self.shared.lock().unwrap().ltrims.clone()
     }
 
     /// Connections accepted so far
@@ -886,7 +903,17 @@ fn slow_target_serve(stream: TcpStream, delay: Duration, st: Arc<Mutex<SlowState
             }
             "LLEN" => {
                 g.llens += 1;
-                ":0\r\n".to_string()
+                let n = match g.llen_replies.len() {
+                    0 => 0,
+                    1 => g.llen_replies[0],
+                    _ => g.llen_replies.remove(0),
+                };
+                format!(":{}\r\n", n)
+            }
+            "LTRIM" => {
+                let a = |i: usize| String::from_utf8_lossy(&args[i]).into_owned();
+                g.ltrims.push((a(1), a(2), a(3)));
+                "+OK\r\n".to_string()
             }
             "CLIENT" if g.on_client == OnClient::Close => {
                 // A clone of the socket is kept for close(): shut it down for real
@@ -901,7 +928,67 @@ fn slow_target_serve(stream: TcpStream, delay: Duration, st: Arc<Mutex<SlowState
             }
             _ => "+OK\r\n".to_string(),
         };
+        drop(g);
         if w.write_all(reply.as_bytes()).is_err() {
+            return;
+        }
+    }
+}
+
+/// A stand-in target that answers +OK to every command (the handshake, the idle PING)
+/// until an RPUSH: from its command name on it reads nothing more, so a large package
+/// fills the socket buffers and blocks the writer (M3R-26)
+pub struct DeafTarget {
+    pub port: u16,
+}
+
+impl DeafTarget {
+    pub fn start() -> DeafTarget {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                thread::spawn(move || deaf_serve(stream));
+            }
+        });
+        DeafTarget { port }
+    }
+}
+
+fn deaf_serve(stream: TcpStream) {
+    let mut w = stream.try_clone().unwrap();
+    let mut r = BufReader::new(stream);
+    // One bulk string of a request: its "$len" line, then len bytes and CRLF
+    let bulk = |r: &mut BufReader<TcpStream>| -> Option<Vec<u8>> {
+        let mut line = String::new();
+        r.read_line(&mut line).ok()?;
+        let len: usize = line.trim_start_matches('$').trim().parse().ok()?;
+        let mut data = vec![0u8; len + 2];
+        std::io::Read::read_exact(r, &mut data).ok()?;
+        data.truncate(len);
+        Some(data)
+    };
+    loop {
+        let mut line = String::new();
+        if r.read_line(&mut line).unwrap_or(0) == 0 {
+            return;
+        }
+        let Ok(n) = line.trim_start_matches('*').trim().parse::<usize>() else {
+            return;
+        };
+        let Some(cmd) = bulk(&mut r) else { return };
+        if cmd.eq_ignore_ascii_case(b"RPUSH") {
+            // Keep the connection and read nothing more
+            loop {
+                thread::sleep(Duration::from_secs(3600));
+            }
+        }
+        for _ in 1..n {
+            if bulk(&mut r).is_none() {
+                return;
+            }
+        }
+        if w.write_all(b"+OK\r\n").is_err() {
             return;
         }
     }

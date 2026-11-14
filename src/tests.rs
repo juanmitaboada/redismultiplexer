@@ -2227,3 +2227,33 @@ fn status_file_written_in_place_when_it_cannot_be_replaced() {
     assert!(STATUS_IN_PLACE.load(Ordering::Relaxed));
     fs::remove_dir_all(&dir).unwrap();
 }
+
+#[test]
+fn a_reachable_target_connects_inline() {
+    // M3R-26: a target without a link whose retry is due gets a connect attempt that the
+    // delivering thread waits for up to CONNECT_GRACE, so a target that answers takes the
+    // package that found it down (without the grace, that package skipped it)
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    thread::spawn(move || {
+        // A stand-in that answers +OK to whatever comes (CLIENT SETNAME at the connect)
+        for mut stream in listener.incoming().flatten() {
+            thread::spawn(move || {
+                let mut buf = [0u8; 4096];
+                while let Ok(n) = stream.read(&mut buf) {
+                    if n == 0 || stream.write_all(b"+OK\r\n").is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+    });
+    let mut c = config();
+    c.clients[0].hostname = "127.0.0.1".into();
+    c.clients[0].port = port;
+    let mut target = new_link(0, &c, &c.clients[0], &None);
+    assert!(target.link.is_none());
+    assert!(ensure_link(0, &mut target), "not connected inline");
+    assert!(target.link.is_some());
+}
