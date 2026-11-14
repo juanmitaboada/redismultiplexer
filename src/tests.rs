@@ -1364,8 +1364,14 @@ fn each_worker_writes_only_its_own_stats_slot() {
         let stats = stats_slots(n, 2);
         for id in 0..n {
             let k = id as u64 + 1;
-            worker_slot(&stats, id).add(k, 10 * k, 100 * k, 1000 * k);
-            worker_slot(&stats, id).stuck[(id % 2) as usize].store(true, Ordering::Relaxed);
+            worker_slot(&stats, id).add(&Counts {
+                incoming: k,
+                outgoing: 10 * k,
+                dropped: 100 * k,
+                deleted: 1000 * k,
+                ..Counts::default()
+            });
+            worker_slot(&stats, id).stuck_targets[(id % 2) as usize].store(true, Ordering::Relaxed);
         }
         for (i, w) in stats.iter().enumerate() {
             let k = i as u64 + 1;
@@ -1376,8 +1382,12 @@ fn each_worker_writes_only_its_own_stats_slot() {
                 w.deleted.load(Ordering::Relaxed),
             );
             assert_eq!(got, (k, 10 * k, 100 * k, 1000 * k), "slot {}", i);
-            assert!(w.stuck[i % 2].load(Ordering::Relaxed), "slot {}", i);
-            assert!(!w.stuck[1 - i % 2].load(Ordering::Relaxed), "slot {}", i);
+            assert!(w.stuck_targets[i % 2].load(Ordering::Relaxed), "slot {}", i);
+            assert!(
+                !w.stuck_targets[1 - i % 2].load(Ordering::Relaxed),
+                "slot {}",
+                i
+            );
         }
     }
 }
@@ -1385,14 +1395,27 @@ fn each_worker_writes_only_its_own_stats_slot() {
 #[test]
 fn stats_are_summed_and_reset_per_interval() {
     let stats = stats_slots(3, 3);
-    stats[0].add(1, 2, 3, 4);
-    stats[2].add(10, 20, 30, 40);
-    stats[1].stuck[2].store(true, Ordering::Relaxed);
-    assert_eq!(take_counts(&stats), (11, 22, 33, 44));
-    assert_eq!(take_counts(&stats), (0, 0, 0, 0));
+    let c = |n: u64| Counts {
+        incoming: n,
+        outgoing: 2 * n,
+        dropped: 3 * n,
+        deleted: 4 * n,
+        filtered: 5 * n,
+        stuck: 6 * n,
+        failed: 7 * n,
+    };
+    stats[0].add(&c(1));
+    stats[2].add(&c(10));
+    stats[1].stuck_targets[2].store(true, Ordering::Relaxed);
+    stats[0].down_targets[1].store(true, Ordering::Relaxed);
+    assert_eq!(take_counts(&stats), c(11));
+    assert_eq!(take_counts(&stats), Counts::default());
     assert_eq!(stuck_clients(&stats, 3), vec![2]);
-    stats[1].stuck[2].store(false, Ordering::Relaxed);
+    assert_eq!(down_clients(&stats, 3), vec![1]);
+    stats[1].stuck_targets[2].store(false, Ordering::Relaxed);
+    stats[0].down_targets[1].store(false, Ordering::Relaxed);
     assert!(stuck_clients(&stats, 3).is_empty());
+    assert!(down_clients(&stats, 3).is_empty());
 }
 
 #[test]
@@ -2108,4 +2131,99 @@ fn supervise_a_sender_that_dies_holding_the_buffer() {
     assert!(ending.died);
     assert!(ending.abandoned >= 1);
     assert_eq!(buffer.len(), 0);
+}
+
+// --- the status file (M3-e = ea, D4d-4 = a) ---
+
+/// A directory of its own for one test
+fn scratch_dir(test: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("rmunit-{}-{}", test, std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+#[test]
+fn status_file_is_replaced_whole() {
+    use std::io::Read;
+    let dir = scratch_dir("status_whole");
+    let path = dir.join("rm.status");
+    write_status(&path, b"{\"first\":1}").unwrap();
+    // A reader that opened the file before the next write still reads the old text whole:
+    // the new text is another file renamed over this one, not written into it
+    let mut before = fs::File::open(&path).unwrap();
+    write_status(&path, b"{\"second\":2}").unwrap();
+    let mut old = String::new();
+    before.read_to_string(&mut old).unwrap();
+    assert_eq!(old, "{\"first\":1}");
+    assert_eq!(fs::read_to_string(&path).unwrap(), "{\"second\":2}");
+    assert!(!dir.join("rm.status.tmp").exists());
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn status_file_keeps_its_mode_and_group() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let dir = scratch_dir("status_mode");
+    let path = dir.join("rm.status");
+    fs::write(&path, "old").unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
+    // Another group of this user, if it has one (a group it may give the file)
+    let mut groups = vec![0 as libc::gid_t; 64];
+    // SAFETY: getgroups writes at most `len` ids into the buffer
+    let n = unsafe { libc::getgroups(groups.len() as i32, groups.as_mut_ptr()) };
+    let own = fs::metadata(&path).unwrap().gid();
+    let other = groups[..n.max(0) as usize]
+        .iter()
+        .copied()
+        .find(|&g| g != own);
+    if let Some(g) = other {
+        std::os::unix::fs::chown(&path, None, Some(g)).unwrap();
+    }
+    let want = fs::metadata(&path).unwrap();
+    write_status(&path, b"new").unwrap();
+    let got = fs::metadata(&path).unwrap();
+    assert_eq!(fs::read_to_string(&path).unwrap(), "new");
+    assert_eq!(got.mode() & 0o7777, 0o640);
+    assert_eq!((got.uid(), got.gid()), (want.uid(), want.gid()));
+    assert_ne!(got.ino(), want.ino(), "not replaced");
+    if other.is_none() {
+        eprintln!("status_file_keeps_its_mode_and_group: one group only, mode checked alone");
+    }
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn status_file_through_a_symbolic_link() {
+    let dir = scratch_dir("status_link");
+    fs::create_dir_all(dir.join("real")).unwrap();
+    let real = dir.join("real").join("rm.status");
+    fs::write(&real, "old").unwrap();
+    let link = dir.join("rm.status");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    write_status(&link, b"new").unwrap();
+    assert!(fs::symlink_metadata(&link)
+        .unwrap()
+        .file_type()
+        .is_symlink());
+    assert_eq!(fs::read_link(&link).unwrap(), real);
+    assert_eq!(fs::read_to_string(&real).unwrap(), "new");
+    // The temporary file went beside the target, and is gone
+    assert!(!dir.join("real").join("rm.status.tmp").exists());
+    assert!(!dir.join("rm.status.tmp").exists());
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn status_file_written_in_place_when_it_cannot_be_replaced() {
+    // Where the temporary file cannot be made (here a directory has its name; in use, a
+    // directory the user may not write), the file is written in place, as before
+    let dir = scratch_dir("status_in_place");
+    let path = dir.join("rm.status");
+    fs::write(&path, "old").unwrap();
+    fs::create_dir(dir.join("rm.status.tmp")).unwrap();
+    write_status(&path, b"new").unwrap();
+    assert_eq!(fs::read_to_string(&path).unwrap(), "new");
+    assert!(STATUS_IN_PLACE.load(Ordering::Relaxed));
+    fs::remove_dir_all(&dir).unwrap();
 }

@@ -42,14 +42,9 @@ fn status_counts(test: &str, cell: Cell) {
         c.llen(&src) == 0 && got == 1000
     });
     let status = ctx.dir.join("rm.status");
-    // Written every 10 s from the start. The write is not atomic (truncate, then write;
-    // atomic is stage 4, M3-e): wait for a complete one, not just for the file
-    let mut json = String::new();
-    ctx.wait_for("a complete status file", |_| {
-        json = std::fs::read_to_string(&status).unwrap_or_default();
-        json.trim_end().ends_with('}') && json.contains("\"total_drop\":")
-    });
-    let first = totals(&json);
+    // Written every 10 s from the start, whole (a file renamed over it, M3-e): read once
+    ctx.wait_for("the status file", |_| status.exists());
+    let first = totals(&std::fs::read_to_string(&status).unwrap());
     p.stop(&ctx.pid_file());
     let last = totals(&std::fs::read_to_string(&status).unwrap());
     let sum = [0, 1, 2].map(|i| first[i] + last[i]);
@@ -66,6 +61,88 @@ fn status_counts(test: &str, cell: Cell) {
 }
 
 matrix!(status_file_counts_every_package, status_counts, 2);
+
+/// The breakdown of `drop` (M3-e = ea, D4d-3 = a), over the matrix: packages the root
+/// filter refuses are `filtered`; those only a stuck target accepts are `stuck`; those only a
+/// target that is down accepts are `failed`; the rest delivered. The last write (after the
+/// stop) carries the counts since the start, the stuck and the down targets, the version.
+fn status_breakdown(test: &str, cell: Cell) {
+    let mut ctx = Ctx::new(test);
+    let src = ctx.key("src");
+    let healthy = ctx.key("t0");
+    let full = ctx.key("t1");
+    ctx.push(&full, &packages("old", 10));
+    let down = closed_port();
+    let limits = "    timelimit: 1\n    checklimit: 1\n    softlimit: 2\n    hardlimit: 5\n";
+    let clients = [
+        ctx.client_yaml("t0", &healthy, "    filter: '^k'\n"),
+        ctx.client_yaml("t1", &full, &format!("    filter: '^s'\n{}", limits)),
+        format!(
+            "  - name: 't2'\n    ssl: false\n    hostname: '127.0.0.1'\n    port: {}\n    password: ''\n    channel: 'rmtest:down'\n    filter: '^d'\n{}",
+            down, SHORT_TIMEOUTS
+        ),
+    ];
+    // k: delivered; s: only the stuck target; d: only the down one; x: the root filter
+    let mut input = Vec::new();
+    for (i, kind) in ["k", "s", "d", "x", "k", "k"]
+        .iter()
+        .cycle()
+        .take(600)
+        .enumerate()
+    {
+        input.push(format!("{}{}", kind, seq_pkg(i as u64)));
+    }
+    ctx.push(&src, &input);
+    let root = format!("filter: '^(k|s|d)'\n{}", cell.extra());
+    let cfg = ctx.config(&src, cell.children, cell.mode(), &root, &clients);
+    let mut p = ctx.spawn(&cfg);
+    ctx.wait_for("the source drained", |c| {
+        c.llen(&src) == 0 && c.llen(&healthy) == 300
+    });
+    p.stop(&ctx.pid_file());
+    let status: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(ctx.dir.join("rm.status")).unwrap()).unwrap();
+    let since = &status["since_start"];
+    let n = |k: &str| {
+        since[k]
+            .as_u64()
+            .unwrap_or_else(|| panic!("{} in {}", k, status))
+    };
+    assert_eq!(
+        [
+            n("in"),
+            n("out"),
+            n("drop"),
+            n("filtered"),
+            n("stuck"),
+            n("failed")
+        ],
+        [600, 300, 300, 100, 100, 100],
+        "{}",
+        status
+    );
+    assert_eq!(ctx.llen(&full), 10, "the stuck target took packages");
+    let names = |k: &str| -> Vec<String> {
+        status[k]
+            .as_array()
+            .unwrap_or_else(|| panic!("{} in {}", k, status))
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect()
+    };
+    assert_eq!(names("stuck_targets"), vec![format!("t1:{}", full)]);
+    assert_eq!(names("down_targets"), vec!["t2:rmtest:down".to_string()]);
+    assert_eq!(status["version"], env!("CARGO_PKG_VERSION"));
+    assert_eq!(status["queue"], 0);
+    // The last interval's breakdown sums to its drop, as every interval's does
+    let t = |k: &str| status[k].as_u64().unwrap();
+    assert_eq!(
+        t("total_filtered") + t("total_stuck") + t("total_failed"),
+        t("total_drop")
+    );
+}
+
+matrix!(status_drop_breakdown, status_breakdown, 2);
 
 /// Every target gets every package on every delivery path (project rule, M3R-12), in
 /// source order where the cell keeps it.

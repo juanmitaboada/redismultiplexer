@@ -40,7 +40,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::borrow::Cow;
 use std::cmp;
-use std::io::{stderr, stdout, Write};
+use std::io::{self, stderr, stdout, Write};
 use std::process;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
@@ -53,7 +53,7 @@ use std::{cmp::Reverse, collections::BinaryHeap};
 // use std::env;
 use redis::{Commands, ConnectionLike};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 mod constants;
 use constants::*;
@@ -471,6 +471,32 @@ fn build_filters(config: &Config) -> Result<Filters, String> {
     Ok(Filters { root, clients })
 }
 
+/// What a thread counts between two reports, and what main sums. `dropped` is the
+/// packages no target took; `filtered + stuck + failed` is the same packages by why
+/// (M3-e = ea, D4d-3 = a)
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct Counts {
+    incoming: u64,
+    outgoing: u64,
+    dropped: u64,
+    deleted: u64,
+    filtered: u64,
+    stuck: u64,
+    failed: u64,
+}
+
+impl Counts {
+    fn add(&mut self, other: &Counts) {
+        self.incoming += other.incoming;
+        self.outgoing += other.outgoing;
+        self.dropped += other.dropped;
+        self.deleted += other.deleted;
+        self.filtered += other.filtered;
+        self.stuck += other.stuck;
+        self.failed += other.failed;
+    }
+}
+
 /// Counters of one worker, written by that worker only and read by main. Relaxed atomics:
 /// every counter stands alone and main only needs a recent value. Aligned to a cache line,
 /// so two workers never write the same line.
@@ -480,7 +506,11 @@ struct WorkerStats {
     outgoing: AtomicU64,
     dropped: AtomicU64,
     deleted: AtomicU64,
-    stuck: Vec<AtomicBool>, // per client, in configuration order
+    filtered: AtomicU64,
+    stuck: AtomicU64,
+    failed: AtomicU64,
+    stuck_targets: Vec<AtomicBool>, // per client, in configuration order
+    down_targets: Vec<AtomicBool>,  // per client: no link at the last report
 }
 
 impl WorkerStats {
@@ -490,16 +520,23 @@ impl WorkerStats {
             outgoing: AtomicU64::new(0),
             dropped: AtomicU64::new(0),
             deleted: AtomicU64::new(0),
-            stuck: (0..clients).map(|_| AtomicBool::new(false)).collect(),
+            filtered: AtomicU64::new(0),
+            stuck: AtomicU64::new(0),
+            failed: AtomicU64::new(0),
+            stuck_targets: (0..clients).map(|_| AtomicBool::new(false)).collect(),
+            down_targets: (0..clients).map(|_| AtomicBool::new(false)).collect(),
         }
     }
 
     /// Add the counts a worker gathered since its last report
-    fn add(&self, incoming: u64, outgoing: u64, dropped: u64, deleted: u64) {
-        self.incoming.fetch_add(incoming, Ordering::Relaxed);
-        self.outgoing.fetch_add(outgoing, Ordering::Relaxed);
-        self.dropped.fetch_add(dropped, Ordering::Relaxed);
-        self.deleted.fetch_add(deleted, Ordering::Relaxed);
+    fn add(&self, c: &Counts) {
+        self.incoming.fetch_add(c.incoming, Ordering::Relaxed);
+        self.outgoing.fetch_add(c.outgoing, Ordering::Relaxed);
+        self.dropped.fetch_add(c.dropped, Ordering::Relaxed);
+        self.deleted.fetch_add(c.deleted, Ordering::Relaxed);
+        self.filtered.fetch_add(c.filtered, Ordering::Relaxed);
+        self.stuck.fetch_add(c.stuck, Ordering::Relaxed);
+        self.failed.fetch_add(c.failed, Ordering::Relaxed);
     }
 }
 
@@ -514,23 +551,42 @@ fn worker_slot(stats: &[WorkerStats], id: u16) -> &WorkerStats {
     &stats[id as usize]
 }
 
-/// Counts of every worker since the last call (each slot is reset): incoming, outgoing,
-/// dropped, deleted
-fn take_counts(stats: &[WorkerStats]) -> (u64, u64, u64, u64) {
-    stats.iter().fold((0, 0, 0, 0), |t, w| {
-        (
-            t.0 + w.incoming.swap(0, Ordering::Relaxed),
-            t.1 + w.outgoing.swap(0, Ordering::Relaxed),
-            t.2 + w.dropped.swap(0, Ordering::Relaxed),
-            t.3 + w.deleted.swap(0, Ordering::Relaxed),
-        )
-    })
+/// Counts of every worker since the last call (each slot is reset)
+fn take_counts(stats: &[WorkerStats]) -> Counts {
+    let mut t = Counts::default();
+    for w in stats {
+        t.add(&Counts {
+            incoming: w.incoming.swap(0, Ordering::Relaxed),
+            outgoing: w.outgoing.swap(0, Ordering::Relaxed),
+            dropped: w.dropped.swap(0, Ordering::Relaxed),
+            deleted: w.deleted.swap(0, Ordering::Relaxed),
+            filtered: w.filtered.swap(0, Ordering::Relaxed),
+            stuck: w.stuck.swap(0, Ordering::Relaxed),
+            failed: w.failed.swap(0, Ordering::Relaxed),
+        });
+    }
+    t
 }
 
 /// Indexes of the clients that some worker found stuck at its last report
 fn stuck_clients(stats: &[WorkerStats], clients: usize) -> Vec<usize> {
     (0..clients)
-        .filter(|&c| stats.iter().any(|w| w.stuck[c].load(Ordering::Relaxed)))
+        .filter(|&c| {
+            stats
+                .iter()
+                .any(|w| w.stuck_targets[c].load(Ordering::Relaxed))
+        })
+        .collect()
+}
+
+/// Indexes of the clients that some worker had without a link at its last report
+fn down_clients(stats: &[WorkerStats], clients: usize) -> Vec<usize> {
+    (0..clients)
+        .filter(|&c| {
+            stats
+                .iter()
+                .any(|w| w.down_targets[c].load(Ordering::Relaxed))
+        })
         .collect()
 }
 
@@ -884,6 +940,7 @@ fn run() -> i32 {
 
                         // Keep working until a signal, or until a thread ends on its own
                         let mut lasttime = get_current_time_with_ms();
+                        let mut since_start = Counts::default();
                         let sender = ordered.clone().zip(sender_handle);
                         let ending = supervise(&stop, &keepworking_rx, handles, sender, || {
                             // Check if we should show statistics
@@ -896,6 +953,7 @@ fn run() -> i32 {
                                     &stats,
                                     &statusfile,
                                     lasttime,
+                                    &mut since_start,
                                 );
                                 lasttime = get_current_time_with_ms();
                             }
@@ -904,7 +962,11 @@ fn run() -> i32 {
                         // What the buffer held when its sender died is lost: dropped, counted
                         // in the sender's slot so it reaches the status file (S4-5 = a)
                         if ending.abandoned > 0 {
-                            worker_slot(&stats, inconfig.children).add(0, 0, ending.abandoned, 0);
+                            worker_slot(&stats, inconfig.children).add(&Counts {
+                                dropped: ending.abandoned,
+                                failed: ending.abandoned,
+                                ..Counts::default()
+                            });
                         }
 
                         // What was counted since the last line, the flush and any drop at the
@@ -916,6 +978,7 @@ fn run() -> i32 {
                             &stats,
                             &statusfile,
                             lasttime,
+                            &mut since_start,
                         );
 
                         print_debug!(PROGRAM_NAME, stdout(), COLOR_GREEN, 0, "Program finished!");
@@ -1717,7 +1780,7 @@ fn sender(
     let mut clients = new_targets(id, &config, &filters, || buffer.finished());
     let mut cursor: usize = 0;
     send_ordered(buffer, hold, |turn| {
-        let (mut outgoing, mut dropped, mut deleted) = (0, 0, 0);
+        let mut counts = Counts::default();
         match turn {
             Some(batch) => {
                 for package in &batch {
@@ -1728,23 +1791,14 @@ fn sender(
                         &mut clients,
                         &mut cursor,
                         package,
-                        &mut outgoing,
-                        &mut dropped,
-                        &mut deleted,
+                        &mut counts,
                     );
                 }
             }
             // Nothing for a second: the idle path, as a worker's
-            None => refresh(id, &mut clients, &mut deleted),
+            None => refresh(id, &mut clients, &mut counts.deleted),
         }
-        report(
-            worker_slot(&stats, id),
-            &clients,
-            0,
-            outgoing,
-            dropped,
-            deleted,
-        );
+        report(worker_slot(&stats, id), &clients, &mut counts);
     });
 }
 
@@ -2030,10 +2084,7 @@ fn child(
 
                 {
                     // Keep working while allowed
-                    let mut incoming: u64 = 0;
-                    let mut outgoing: u64 = 0;
-                    let mut dropped: u64 = 0;
-                    let mut deleted: u64 = 0;
+                    let mut counts = Counts::default();
                     let mut cursor: usize = 0; // spreader: next target to try
                                                // The BLPOP request never changes: encoded once per connection (M3-o)
                     let blpop = blpop_cmd(&config.channel).get_packed_command();
@@ -2041,20 +2092,7 @@ fn child(
                     while keepworking {
                         // Check if we should save statistics
                         if (get_current_time() - 1) > lasttime {
-                            report(
-                                worker_slot(&stats, id),
-                                &clients,
-                                incoming,
-                                outgoing,
-                                dropped,
-                                deleted,
-                            );
-
-                            // Reset status
-                            incoming = 0;
-                            outgoing = 0;
-                            dropped = 0;
-                            deleted = 0;
+                            report(worker_slot(&stats, id), &clients, &mut counts);
                             lasttime = get_current_time();
                         }
 
@@ -2067,14 +2105,14 @@ fn child(
                             match item {
                                 Ok(redis::Value::Nil) => {
                                     // Nothing came: refresh the targets' limits state
-                                    refresh(id, &mut clients, &mut deleted);
+                                    refresh(id, &mut clients, &mut counts.deleted);
                                 }
                                 Ok(redis::Value::Array(data)) => {
                                     // This is the expected data
                                     // println!("Bulk(Vec<Value>)");
 
                                     // Send to all clients
-                                    incoming += 1;
+                                    counts.incoming += 1;
 
                                     // The package is the second element (key, value); taken by
                                     // value, so the payload bytes are moved, not copied
@@ -2114,9 +2152,7 @@ fn child(
                                                 &mut clients,
                                                 &mut cursor,
                                                 &package,
-                                                &mut outgoing,
-                                                &mut dropped,
-                                                &mut deleted,
+                                                &mut counts,
                                             );
                                         }
                                     }
@@ -2161,14 +2197,7 @@ fn child(
                     }
 
                     // Report what is left of this connection's counts
-                    report(
-                        worker_slot(&stats, id),
-                        &clients,
-                        incoming,
-                        outgoing,
-                        dropped,
-                        deleted,
-                    );
+                    report(worker_slot(&stats, id), &clients, &mut counts);
                 }
             }
             Err(e) => {
@@ -2236,9 +2265,20 @@ fn statistics(
     stats: &[WorkerStats],
     statusfile: &Option<String>,
     lasttime: u128,
+    since_start: &mut Counts,
 ) {
     // Counts of every child since the last report
-    let (incoming, outgoing, dropped, deleted) = take_counts(stats);
+    let counts = take_counts(stats);
+    since_start.add(&counts);
+    let Counts {
+        incoming,
+        outgoing,
+        dropped,
+        deleted,
+        filtered,
+        stuck,
+        failed,
+    } = counts;
 
     // Show statistics
     // The final call can come right after a periodic one: keep the rates finite
@@ -2343,22 +2383,48 @@ fn statistics(
         );
     }
 
-    // Write statistics
+    // Write statistics: every 1.0.8 key with its meaning, then the breakdown of `drop`,
+    // the targets stuck and down, the counts since the start (M3-e = ea)
     if let Some(status) = statusfile {
+        let names = |indexes: Vec<usize>| -> Vec<String> {
+            indexes
+                .into_iter()
+                .map(|c| format!("{}:{}", clients[c].name, clients[c].channel))
+                .collect()
+        };
+        let rate = |n: u64| (n as f64) / diff;
         let stat = json!({
             "date": get_current_time(),
-            "in": (incoming as f64) / diff,
-            "out": (outgoing as f64) / diff,
-            "drop": (dropped as f64) / diff,
-            "deleted": (deleted as f64) / diff,
+            "in": rate(incoming),
+            "out": rate(outgoing),
+            "drop": rate(dropped),
+            "deleted": rate(deleted),
             "total_in": incoming,
             "total_out": outgoing,
             "total_drop": dropped,
             "total_deleted": deleted,
+            "filtered": rate(filtered),
+            "stuck": rate(stuck),
+            "failed": rate(failed),
+            "total_filtered": filtered,
+            "total_stuck": stuck,
+            "total_failed": failed,
+            "queue": ordered.map_or(0, |b| b.len()),
+            "stuck_targets": stucks,
+            "down_targets": names(down_clients(stats, clients.len())),
+            "since_start": {
+                "in": since_start.incoming,
+                "out": since_start.outgoing,
+                "drop": since_start.dropped,
+                "deleted": since_start.deleted,
+                "filtered": since_start.filtered,
+                "stuck": since_start.stuck,
+                "failed": since_start.failed,
+            },
+            "version": VERSION,
         });
-        match fs::write(status, stat.to_string()) {
-            Ok(_) => (),
-            Err(e) => print_debug!(
+        if let Err(e) = write_status(Path::new(status), stat.to_string().as_bytes()) {
+            print_debug!(
                 PROGRAM_NAME,
                 stderr(),
                 COLOR_RED,
@@ -2366,7 +2432,7 @@ fn statistics(
                 "Unable to write STATUS at {}: {}",
                 status,
                 e
-            ),
+            );
         }
     }
 
@@ -2374,18 +2440,80 @@ fn statistics(
     print_debug!(PROGRAM_NAME, stdout(), COLOR_WHITE, COLOR_NOHEAD, "");
 }
 
-/// A worker's counts since its last report and the stuck state of its targets
-fn report(
-    slot: &WorkerStats,
-    clients: &[RedisLink],
-    incoming: u64,
-    outgoing: u64,
-    dropped: u64,
-    deleted: u64,
-) {
-    slot.add(incoming, outgoing, dropped, deleted);
-    for (flag, client) in slot.stuck.iter().zip(clients) {
-        flag.store(client.stuck_since.is_some(), Ordering::Relaxed);
+/// Set once the status file had to be written in place (one warning, D4d-4 = a)
+static STATUS_IN_PLACE: AtomicBool = AtomicBool::new(false);
+
+/// Writes the status file whole (M3-e = ea): the text goes to `<file>.tmp` beside the file
+/// and is renamed over it, so a reader never sees half of it (an in-place write truncates,
+/// then writes). What works today keeps working (D4d-4 = a, COORD 2026-11-14 20:53):
+/// - a status path that is a symbolic link stays a link: the file it points to is replaced;
+/// - an existing file keeps its mode, owner and group (set on the temporary file first);
+/// - where the temporary file cannot be made, given that owner and group, or renamed (a
+///   directory the user may not write, a file owned by another user), the file is written
+///   in place, as before, with one warning the first time.
+fn write_status(path: &Path, text: &[u8]) -> io::Result<()> {
+    match write_replacing(path, text) {
+        Ok(()) => Ok(()),
+        Err(why) => {
+            if !STATUS_IN_PLACE.swap(true, Ordering::Relaxed) {
+                print_debug!(
+                    PROGRAM_NAME,
+                    stderr(),
+                    COLOR_YELLOW,
+                    0,
+                    "Warning: the status file {} is written in place, not replaced whole: {}",
+                    path.display(),
+                    why
+                );
+            }
+            fs::write(path, text)
+        }
+    }
+}
+
+/// The atomic write of write_status; any error leaves the file as it was
+fn write_replacing(path: &Path, text: &[u8]) -> io::Result<()> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    // A link is followed to the file it points to (a dangling one is an error here)
+    let target = if fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) {
+        fs::canonicalize(path)?
+    } else {
+        path.to_path_buf()
+    };
+    let mut tmp = target.clone().into_os_string();
+    tmp.push(".tmp");
+    let tmp = PathBuf::from(tmp);
+    let old = fs::metadata(&target).ok();
+    let result = (|| {
+        fs::write(&tmp, text)?;
+        if let Some(old) = &old {
+            let new = fs::metadata(&tmp)?;
+            if (new.uid(), new.gid()) != (old.uid(), old.gid()) {
+                std::os::unix::fs::chown(&tmp, Some(old.uid()), Some(old.gid()))?;
+            }
+            fs::set_permissions(&tmp, fs::Permissions::from_mode(old.mode() & 0o7777))?;
+        }
+        fs::rename(&tmp, &target)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    result
+}
+
+/// A worker's counts since its last report (then reset) and the state of its targets:
+/// stuck, and without a link (down, or not connected yet)
+fn report(slot: &WorkerStats, clients: &[RedisLink], counts: &mut Counts) {
+    slot.add(counts);
+    *counts = Counts::default();
+    for ((stuck, down), client) in slot
+        .stuck_targets
+        .iter()
+        .zip(&slot.down_targets)
+        .zip(clients)
+    {
+        stuck.store(client.stuck_since.is_some(), Ordering::Relaxed);
+        down.store(client.link.is_none(), Ordering::Relaxed);
     }
 }
 
@@ -2460,7 +2588,7 @@ fn blpop_cmd(channel: &str) -> redis::Cmd {
     cmd
 }
 
-fn send_to_client(client: &mut RedisLink, data: &[u8]) -> Result<bool, String> {
+fn send_to_client(client: &mut RedisLink, data: &[u8]) -> Result<(), String> {
     // Borrowed: config and link are distinct fields
     let channel = &client.config.channel;
 
@@ -2484,7 +2612,7 @@ fn send_to_client(client: &mut RedisLink, data: &[u8]) -> Result<bool, String> {
     {
         Ok(_) => {
             client.backoff = TARGET_BACKOFF_MIN;
-            Ok(true)
+            Ok(())
         }
         Err(e) => {
             link_broken(client, &e);
@@ -2690,11 +2818,11 @@ fn send(
     client: &mut RedisLink,
     dirty_bdata: &[u8],
     deleted: &mut u64,
-) -> Result<bool, String> {
+) -> Result<Sent, String> {
     let bdata = match &client.filter {
         Some(f) => match f.apply(dirty_bdata) {
             Some(b) => b,
-            None => return Ok(false),
+            None => return Ok(Sent::Filtered),
         },
         None => Cow::Borrowed(dirty_bdata),
     };
@@ -2702,13 +2830,12 @@ fn send(
     match can_send(id, client, deleted) {
         // Allowed to send
         Ok(true) => match send_to_client(client, &bdata) {
-            Ok(true) => Ok(true),
-            Ok(false) => Ok(false),
+            Ok(_) => Ok(Sent::Taken),
             Err(e) => Err(format!("error while sending to the client: {}", e)),
         },
 
         // Not allowed to send
-        Ok(false) => Ok(false),
+        Ok(false) => Ok(Sent::Stuck),
 
         // There was an error
         Err(e) => Err(format!("error while checking queue: {}", e)),
@@ -2748,21 +2875,35 @@ fn deliver(
     clients: &mut [RedisLink],
     cursor: &mut usize,
     package: &[u8],
-    outgoing: &mut u64,
-    dropped: &mut u64,
-    deleted: &mut u64,
+    counts: &mut Counts,
 ) {
     let bdata = match root_filter {
         Some(f) => f.apply(package),
         None => Some(Cow::Borrowed(package)),
     };
+    // Why the targets tried did not take it: one that took it ends the matter
+    let mut why = Why::default();
+    let deleted = &mut counts.deleted;
     let mut attempt = |client: &mut RedisLink, bdata: &[u8]| {
         if !ensure_link(id, client) {
             note_skip(id, client);
+            // Failed only if its filter would have taken it (D4d-3 = a)
+            if client
+                .filter
+                .as_ref()
+                .is_none_or(|f| f.apply(bdata).is_some())
+            {
+                why.failed = true;
+            }
             return false;
         }
         match send(id, client, bdata, deleted) {
-            Ok(sent) => sent,
+            Ok(Sent::Taken) => true,
+            Ok(Sent::Filtered) => false,
+            Ok(Sent::Stuck) => {
+                why.stuck = true;
+                false
+            }
             Err(e) => {
                 print_debug!(
                     PROGRAM_NAME,
@@ -2776,6 +2917,7 @@ fn deliver(
                     e
                 );
                 target_failed(client);
+                why.failed = true;
                 false
             }
         }
@@ -2796,10 +2938,37 @@ fn deliver(
         }
     };
     if delivered {
-        *outgoing += 1;
+        counts.outgoing += 1;
     } else {
-        *dropped += 1;
+        // One reason per package (D4d-3 = a): filtered when no target accepted it, stuck
+        // when every target that accepted it was stuck, failed otherwise
+        counts.dropped += 1;
+        if why.failed {
+            counts.failed += 1;
+        } else if why.stuck {
+            counts.stuck += 1;
+        } else {
+            counts.filtered += 1;
+        }
     }
+}
+
+/// What the targets that did not take a package said: some was stuck, some failed (down,
+/// not connected yet, an error); neither means every filter missed
+#[derive(Default)]
+struct Why {
+    stuck: bool,
+    failed: bool,
+}
+
+/// What one target did with a package
+#[derive(Debug, PartialEq)]
+enum Sent {
+    Taken,
+    /// Its filter did not accept the package
+    Filtered,
+    /// Stuck at its limits
+    Stuck,
 }
 
 /// Spreader target selection: try the targets in turn from `cursor`, at most one full turn;
