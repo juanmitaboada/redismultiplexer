@@ -1188,6 +1188,70 @@ fn verify_limits_hardlimit_enables_defaults() {
     );
 }
 
+/// The limits keys over the grid of the differential run against 1.0.8 (harness
+/// `diff-limits`, outside the repository): which files start, and what the delivery reads
+#[test]
+fn limits_keys_accepted_set_over_the_grid() {
+    const VALUES: [Option<u64>; 7] = [
+        None,
+        Some(0),
+        Some(1),
+        Some(3),
+        Some(10),
+        Some(5000),
+        Some(u64::MAX),
+    ];
+    const BLOCKS: [Option<u64>; 4] = [None, Some(0), Some(1), Some(4)];
+    let set = |v: Option<u64>| v.filter(|&x| x > 0);
+    let mut accepted = 0;
+    for t in VALUES {
+        for k in VALUES {
+            for s in VALUES {
+                for h in VALUES {
+                    for d in BLOCKS {
+                        let mut c = config();
+                        let target = &mut c.clients[0];
+                        (target.timelimit, target.checklimit, target.softlimit) = (t, k, s);
+                        (target.hardlimit, target.deleteblock) = (h, d);
+                        let result = verify_config(c);
+                        // Without a hardlimit no other limit key may be set (0 is not set)
+                        let starts = set(h).is_some()
+                            || (set(t).is_none() && set(k).is_none() && set(s).is_none());
+                        let starts = starts && d != Some(0);
+                        let case = (t, k, s, h, d);
+                        assert_eq!(result.is_ok(), starts, "{:?}", case);
+                        if let Ok(c) = result {
+                            accepted += 1;
+                            let r = &c.clients[0];
+                            // 0 read as absent; with a hardlimit the defaults fill the rest
+                            let want = match set(h) {
+                                None => (set(t), set(k), set(s), None),
+                                Some(hard) => (
+                                    Some(set(t).unwrap_or(1)),
+                                    Some(set(k).unwrap_or(10000)),
+                                    Some(set(s).unwrap_or(std::cmp::max(
+                                        1,
+                                        hard / 5 * 4 + hard % 5 * 4 / 5,
+                                    ))),
+                                    Some(hard),
+                                ),
+                            };
+                            assert_eq!(
+                                (r.timelimit, r.checklimit, r.softlimit, r.hardlimit),
+                                want,
+                                "{:?}",
+                                case
+                            );
+                            assert_eq!(r.deleteblock, d, "{:?}", case);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert_eq!(accepted, 5193);
+}
+
 #[test]
 fn verify_limits_need_a_hardlimit() {
     for key in ["timelimit", "checklimit", "softlimit"] {
