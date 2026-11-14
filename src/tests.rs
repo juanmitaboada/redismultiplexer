@@ -1890,3 +1890,222 @@ fn ipv6_host_with_or_without_brackets() {
         other => panic!("{:?}", other),
     }
 }
+
+// --- supervise: a thread that dies (S4-5 = a, D4d-6 = a) ---
+
+/// `panic_after` of a test worker that panics when it sees the stop
+const PANIC_AT_STOP: u32 = u32::MAX;
+
+/// A worker for supervise's tests: pushes one package every millisecond until the stop,
+/// or panics after `panic_after` pushes (holding the buffer's lock when `holding`), or at
+/// the stop (PANIC_AT_STOP)
+fn test_worker(
+    stop: Arc<AtomicBool>,
+    buffer: Arc<OrderBuffer>,
+    pushed: Arc<AtomicU64>,
+    panic_after: Option<u32>,
+    holding: bool,
+) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        let mut n = 0u32;
+        while !stop.load(Ordering::Relaxed) {
+            if panic_after == Some(n) {
+                if holding {
+                    let _held = buffer.lock();
+                    panic!("test worker dies holding the lock");
+                }
+                panic!("test worker dies");
+            }
+            buffer.push(n as u128, n.to_be_bytes().to_vec(), Instant::now());
+            pushed.fetch_add(1, Ordering::Relaxed);
+            n += 1;
+            thread::sleep(Duration::from_millis(1));
+        }
+        if panic_after == Some(PANIC_AT_STOP) {
+            panic!("test worker dies at the stop");
+        }
+    })
+}
+
+/// A sender for supervise's tests: the real send_ordered, counting what it delivers;
+/// panics at its first batch when `dies`
+fn test_sender(
+    buffer: Arc<OrderBuffer>,
+    delivered: Arc<AtomicU64>,
+    dies: bool,
+) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        send_ordered(&buffer, Duration::ZERO, |turn| {
+            if let Some(batch) = turn {
+                if dies {
+                    panic!("test sender dies");
+                }
+                delivered.fetch_add(batch.len() as u64, Ordering::Relaxed);
+            }
+        })
+    })
+}
+
+/// Runs supervise over two workers and a sender; returns the ending, what was pushed and
+/// what was delivered. A signal is sent after `signal_after`, or after 6 s as a backstop:
+/// a thread that dies is seen within a second, so a run that ends by the backstop is a
+/// death not seen (died false), not a test that waits for ever.
+fn supervised(
+    panic_after: [Option<u32>; 2],
+    holding: bool,
+    sender_dies: bool,
+    signal_after: Option<Duration>,
+) -> (Ending, u64, u64) {
+    let stop = Arc::new(AtomicBool::new(false));
+    let buffer = Arc::new(OrderBuffer::new());
+    let delivered = Arc::new(AtomicU64::new(0));
+    let pushed = Arc::new(AtomicU64::new(0));
+    let (tx, rx) = mpsc::channel();
+    let workers: Vec<thread::JoinHandle<()>> = panic_after
+        .iter()
+        .map(|&p| test_worker(stop.clone(), buffer.clone(), pushed.clone(), p, holding))
+        .collect();
+    let sender = test_sender(buffer.clone(), delivered.clone(), sender_dies);
+    let after = signal_after.unwrap_or(Duration::from_secs(6));
+    thread::spawn(move || {
+        thread::sleep(after);
+        let _ = tx.send(false);
+    });
+    let start = Instant::now();
+    let ending = supervise(&stop, &rx, workers, Some((buffer.clone(), sender)), || {});
+    // A thread that dies on its own is seen within main's one-second wait, well before the
+    // backstop
+    let dies = sender_dies
+        || panic_after
+            .iter()
+            .any(|p| p.is_some_and(|n| n != PANIC_AT_STOP));
+    let bound = if dies { 4 } else { 10 };
+    assert!(
+        start.elapsed() < Duration::from_secs(bound),
+        "supervise took {:?}",
+        start.elapsed()
+    );
+    assert_eq!(buffer.len(), 0, "packages left in the buffer");
+    (
+        ending,
+        pushed.load(Ordering::Relaxed),
+        delivered.load(Ordering::Relaxed),
+    )
+}
+
+#[test]
+fn supervise_signal_is_a_clean_stop() {
+    let (ending, pushed, delivered) =
+        supervised([None, None], false, false, Some(Duration::from_millis(300)));
+    assert_eq!(
+        ending,
+        Ending {
+            died: false,
+            abandoned: 0
+        }
+    );
+    assert_eq!(delivered, pushed);
+}
+
+#[test]
+fn supervise_a_worker_that_dies_stops_the_program() {
+    // The other worker is told to stop, the sender flushes everything: nothing lost
+    let (ending, pushed, delivered) = supervised([Some(50), None], false, false, None);
+    assert_eq!(
+        ending,
+        Ending {
+            died: true,
+            abandoned: 0
+        }
+    );
+    assert!(delivered > 0);
+    assert_eq!(delivered, pushed);
+}
+
+#[test]
+fn supervise_a_worker_that_dies_at_the_stop() {
+    // A panic while the program stops is a death too: exit 1, nothing lost
+    let (ending, pushed, delivered) = supervised(
+        [Some(PANIC_AT_STOP), None],
+        false,
+        false,
+        Some(Duration::from_millis(300)),
+    );
+    assert_eq!(
+        ending,
+        Ending {
+            died: true,
+            abandoned: 0
+        }
+    );
+    assert_eq!(delivered, pushed);
+}
+
+#[test]
+fn supervise_a_worker_that_dies_holding_the_buffer() {
+    // The lock is poisoned: the other worker and the sender go on with it
+    let (ending, pushed, delivered) = supervised([Some(50), None], true, false, None);
+    assert_eq!(
+        ending,
+        Ending {
+            died: true,
+            abandoned: 0
+        }
+    );
+    assert_eq!(delivered, pushed);
+}
+
+#[test]
+fn supervise_a_sender_that_dies_leaves_the_buffer_counted() {
+    // The workers are stopped and joined; what the buffer holds is abandoned, counted.
+    // The batch the sender had taken when it died is lost with it (not in the buffer)
+    let (ending, pushed, delivered) = supervised([None, None], false, true, None);
+    assert!(ending.died);
+    assert_eq!(delivered, 0);
+    assert!(
+        ending.abandoned > 0 && ending.abandoned < pushed,
+        "{:?} of {}",
+        ending,
+        pushed
+    );
+}
+
+#[test]
+fn supervise_a_sender_that_dies_holding_the_buffer() {
+    // A thread that dies holding the lock, then the sender: nothing waits for ever
+    let stop = Arc::new(AtomicBool::new(false));
+    let buffer = Arc::new(OrderBuffer::new());
+    let b = buffer.clone();
+    let _ = thread::spawn(move || {
+        let _held = b.lock();
+        panic!("dies holding the lock");
+    })
+    .join();
+    buffer.push(1, vec![1], Instant::now());
+    assert_eq!(buffer.len(), 1);
+    let delivered = Arc::new(AtomicU64::new(0));
+    let sender = test_sender(buffer.clone(), delivered.clone(), true);
+    let worker = test_worker(
+        stop.clone(),
+        buffer.clone(),
+        Arc::new(AtomicU64::new(0)),
+        None,
+        false,
+    );
+    let (tx, rx) = mpsc::channel::<bool>();
+    // The backstop of supervised()
+    thread::spawn(move || {
+        thread::sleep(Duration::from_secs(6));
+        let _ = tx.send(false);
+    });
+    let ending = supervise(
+        &stop,
+        &rx,
+        vec![worker],
+        Some((buffer.clone(), sender)),
+        || {},
+    );
+    assert!(ending.died);
+    assert!(ending.abandoned >= 1);
+    assert_eq!(buffer.len(), 0);
+}

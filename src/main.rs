@@ -535,9 +535,101 @@ fn stuck_clients(stats: &[WorkerStats], clients: usize) -> Vec<usize> {
 }
 
 /// Exit status (M3-h = ha): 0 after a stop by signal, `--version` and `--help`; 2 for a
-/// usage or configuration error
+/// usage or configuration error; 1 when a thread ended on its own (S4-5 = a)
 const EXIT_OK: i32 = 0;
+const EXIT_FAILED: i32 = 1;
 const EXIT_CONFIG: i32 = 2;
+
+/// How a run ended
+#[derive(Debug, PartialEq)]
+struct Ending {
+    /// A worker or the sender ended on its own (a panic): the program stopped for it
+    died: bool,
+    /// Packages the ordering buffer still held when its sender was gone: lost
+    abandoned: u64,
+}
+
+/// Main's watch over the threads: waits for a signal, a second at a time (calling `tick`
+/// each time), or for a worker or the sender to end on its own (S4-5 = a). Then the stop:
+/// the workers are told and joined; the sender, if it is alive, flushes the buffer and is
+/// joined; if it died, what the buffer holds is counted as abandoned. A thread that
+/// panicked during the stop counts as died too. Never waits for a thread that is gone.
+fn supervise(
+    stop: &AtomicBool,
+    signals: &Receiver<bool>,
+    workers: Vec<thread::JoinHandle<()>>,
+    sender: Option<(Arc<OrderBuffer>, thread::JoinHandle<()>)>,
+    mut tick: impl FnMut(),
+) -> Ending {
+    let mut died = false;
+    loop {
+        // Wait up to a second for a signal (instead of sleeping, so a stop is seen at once)
+        if signals.recv_timeout(Duration::from_secs(1)).is_ok() {
+            break;
+        }
+        // A thread only ends when told to: one that ended on its own stops the program
+        if workers.iter().any(|h| h.is_finished()) {
+            print_debug!(
+                PROGRAM_NAME,
+                stdout(),
+                COLOR_YELLOW,
+                0,
+                "Some child closed abruptly, closing everything!"
+            );
+            died = true;
+            break;
+        }
+        if sender.as_ref().is_some_and(|(_, h)| h.is_finished()) {
+            print_debug!(
+                PROGRAM_NAME,
+                stdout(),
+                COLOR_YELLOW,
+                0,
+                "The ordered sender closed abruptly, closing everything!"
+            );
+            died = true;
+            break;
+        }
+        tick();
+    }
+
+    // Tell all children to finish their job
+    stop.store(true, Ordering::Relaxed);
+
+    // Wait for the children: each leaves after its current package (a BLPOP waits at most
+    // 1 s); say how many are left every second
+    print_debug!(PROGRAM_NAME, stdout(), COLOR_CYAN, 0, "Closing...");
+    let mut said = Instant::now();
+    while !workers.iter().all(|h| h.is_finished()) {
+        if said.elapsed() >= Duration::from_secs(1) {
+            print_debug!(
+                PROGRAM_NAME,
+                stdout(),
+                COLOR_YELLOW,
+                0,
+                "There are {} threads left!",
+                workers.iter().filter(|h| !h.is_finished()).count()
+            );
+            said = Instant::now();
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    for handle in workers {
+        died |= handle.join().is_err();
+    }
+
+    // Every child has left, so nothing more enters the ordering buffer: the sender flushes
+    // it in ts order and ends. A sender that is gone leaves what the buffer holds.
+    let mut abandoned = 0;
+    if let Some((buffer, handle)) = sender {
+        buffer.finish();
+        if handle.join().is_err() {
+            died = true;
+            abandoned = buffer.abandon();
+        }
+    }
+    Ending { died, abandoned }
+}
 
 /// Main module will manage the basics from this program
 fn main() {
@@ -790,96 +882,29 @@ fn run() -> i32 {
                             print_debug!(PROGRAM_NAME, stdout(), COLOR_CYAN, 0, "  - {}:{} @ {}  [timelimit={}, checklimit={}, softlimit={}, hardlimit={}]", client.hostname, client.port, client.channel, option2string!(client.timelimit), option2string!(client.checklimit), option2string!(client.softlimit), option2string!(client.hardlimit));
                         }
 
-                        // Keep working while all children keep working
+                        // Keep working until a signal, or until a thread ends on its own
                         let mut lasttime = get_current_time_with_ms();
-                        let mut keepworking = true;
-                        while keepworking {
-                            // Wait up to a second for a signal (instead of sleeping, so a
-                            // stop is seen at once)
-                            if keepworking_rx.recv_timeout(Duration::from_secs(1)).is_ok() {
-                                keepworking = false;
-                            }
-
-                            // If nothind changed with children
-                            if keepworking {
-                                // A child only ends when told to: one that ended on its own
-                                // (a panic) stops the program
-                                if handles.iter().any(|h| h.is_finished()) {
-                                    keepworking = false;
-                                }
-
-                                // Check if we can keep working
-                                if keepworking {
-                                    // Check if the sender has finished
-                                    if sender_handle.as_ref().is_some_and(|h| h.is_finished()) {
-                                        // Some child already died, show message and leave
-                                        print_debug!(
-                                            PROGRAM_NAME,
-                                            stdout(),
-                                            COLOR_YELLOW,
-                                            0,
-                                            "The ordered sender closed abruptly, closing everything!"
-                                        );
-                                        break;
-                                    }
-
-                                    // Check if we should show statistics
-                                    if (get_current_time_with_ms() - (STATISTICS_SECONDS * 1000))
-                                        > lasttime
-                                    {
-                                        statistics(
-                                            &inconfig.name,
-                                            ordered.as_deref(),
-                                            &inconfig.clients,
-                                            &stats,
-                                            &statusfile,
-                                            lasttime,
-                                        );
-                                        lasttime = get_current_time_with_ms();
-                                    }
-                                } else {
-                                    print_debug!(
-                                        PROGRAM_NAME,
-                                        stdout(),
-                                        COLOR_YELLOW,
-                                        0,
-                                        "Some child closed abruptly, closing everything!"
-                                    );
-                                }
-                            }
-                        }
-
-                        // Tell all children to finish their job
-                        stop.store(true, Ordering::Relaxed);
-
-                        // Wait for the children: each leaves after its current package (a
-                        // BLPOP waits at most 1 s); say how many are left every second
-                        print_debug!(PROGRAM_NAME, stdout(), COLOR_CYAN, 0, "Closing...");
-                        let mut said = Instant::now();
-                        while !handles.iter().all(|h| h.is_finished()) {
-                            if said.elapsed() >= Duration::from_secs(1) {
-                                print_debug!(
-                                    PROGRAM_NAME,
-                                    stdout(),
-                                    COLOR_YELLOW,
-                                    0,
-                                    "There are {} threads left!",
-                                    handles.iter().filter(|h| !h.is_finished()).count()
+                        let sender = ordered.clone().zip(sender_handle);
+                        let ending = supervise(&stop, &keepworking_rx, handles, sender, || {
+                            // Check if we should show statistics
+                            if (get_current_time_with_ms() - (STATISTICS_SECONDS * 1000)) > lasttime
+                            {
+                                statistics(
+                                    &inconfig.name,
+                                    ordered.as_deref(),
+                                    &inconfig.clients,
+                                    &stats,
+                                    &statusfile,
+                                    lasttime,
                                 );
-                                said = Instant::now();
+                                lasttime = get_current_time_with_ms();
                             }
-                            thread::sleep(Duration::from_millis(100));
-                        }
-                        for handle in handles {
-                            // A child that panicked was reported by the loop above
-                            let _ = handle.join();
-                        }
+                        });
 
-                        // Every child has left, so nothing more enters the ordering buffer:
-                        // the sender flushes it in ts order and ends
-                        if let (Some(buffer), Some(handle)) = (&ordered, sender_handle) {
-                            buffer.finish();
-                            handle.join().unwrap();
+                        // What the buffer held when its sender died is lost: dropped, counted
+                        // in the sender's slot so it reaches the status file (S4-5 = a)
+                        if ending.abandoned > 0 {
+                            worker_slot(&stats, inconfig.children).add(0, 0, ending.abandoned, 0);
                         }
 
                         // What was counted since the last line, the flush and any drop at the
@@ -894,7 +919,7 @@ fn run() -> i32 {
                         );
 
                         print_debug!(PROGRAM_NAME, stdout(), COLOR_GREEN, 0, "Program finished!");
-                        code = EXIT_OK;
+                        code = if ending.died { EXIT_FAILED } else { EXIT_OK };
                     }
 
                     // Remove pid
@@ -1560,10 +1585,24 @@ impl OrderBuffer {
         }
     }
 
+    /// The state, also after a thread panicked holding it (S4-5): the heap is changed
+    /// only by push and pop, which leave it whole, so the others go on with it
+    fn lock(&self) -> std::sync::MutexGuard<'_, OrderState> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Empties the buffer when its sender is gone: how many packages it held
+    fn abandon(&self) -> u64 {
+        let mut st = self.lock();
+        let n = st.heap.len() as u64;
+        st.heap.clear();
+        n
+    }
+
     /// Hold a package. The sender is woken only when the buffer was empty: otherwise it
     /// already waits for a head that arrived earlier, so this package cannot be due sooner.
     fn push(&self, ts: u128, data: Vec<u8>, arrival: Instant) {
-        let mut st = self.state.lock().unwrap();
+        let mut st = self.lock();
         let was_empty = st.heap.is_empty();
         let seq = st.seq;
         st.seq += 1;
@@ -1581,17 +1620,17 @@ impl OrderBuffer {
 
     /// Packages held now (statistics line)
     fn len(&self) -> usize {
-        self.state.lock().unwrap().heap.len()
+        self.lock().heap.len()
     }
 
     /// finish() was called
     fn finished(&self) -> bool {
-        self.state.lock().unwrap().finish
+        self.lock().finish
     }
 
     /// No child will push again: the sender releases everything left, in order, and ends
     fn finish(&self) {
-        self.state.lock().unwrap().finish = true;
+        self.lock().finish = true;
         self.wake.notify_all();
     }
 }
@@ -1627,7 +1666,7 @@ fn next_release(st: &OrderState, hold: Duration) -> Option<Instant> {
 /// L4c-6). Otherwise it sleeps until the head is due or a push into an empty buffer
 /// wakes it.
 fn send_ordered(buffer: &OrderBuffer, hold: Duration, mut turn: impl FnMut(Option<Vec<Vec<u8>>>)) {
-    let mut st = buffer.state.lock().unwrap();
+    let mut st = buffer.lock();
     let mut active = Instant::now();
     loop {
         let batch = release(&mut st, Instant::now(), hold);
@@ -1636,7 +1675,7 @@ fn send_ordered(buffer: &OrderBuffer, hold: Duration, mut turn: impl FnMut(Optio
             drop(st);
             turn(Some(batch));
             active = Instant::now();
-            st = buffer.state.lock().unwrap();
+            st = buffer.lock();
             continue;
         }
         if st.finish {
@@ -1647,7 +1686,7 @@ fn send_ordered(buffer: &OrderBuffer, hold: Duration, mut turn: impl FnMut(Optio
             drop(st);
             turn(None);
             active = Instant::now();
-            st = buffer.state.lock().unwrap();
+            st = buffer.lock();
             continue;
         }
         let until = match next_release(&st, hold) {
@@ -1655,7 +1694,11 @@ fn send_ordered(buffer: &OrderBuffer, hold: Duration, mut turn: impl FnMut(Optio
             None => tick,
         };
         let wait = until.saturating_duration_since(Instant::now());
-        st = buffer.wake.wait_timeout(st, wait).unwrap().0;
+        st = buffer
+            .wake
+            .wait_timeout(st, wait)
+            .unwrap_or_else(|e| e.into_inner())
+            .0;
     }
 }
 
