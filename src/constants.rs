@@ -12,6 +12,8 @@ pub const DEFAULT_CHECK: Duration = Duration::from_secs(1);
 // `command_timeout` keys, root (source) and per client (M3R-19)
 pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 pub const DEFAULT_COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
+// The smallest `connect_timeout` or `command_timeout` other than 0 (M3R-27)
+pub const MIN_TIMEOUT: Duration = Duration::from_millis(1);
 // How long a delivering thread waits for a connect attempt before it goes on without the
 // target (X1c): a reachable target connects within it and takes the package
 pub const CONNECT_GRACE: Duration = Duration::from_millis(100);

@@ -234,13 +234,23 @@ fn timeout_key(value: Option<f64>, default: Duration) -> Option<Duration> {
     }
 }
 
-/// Error text when a timeout key is not 0 or a positive number of seconds a Duration holds
+/// Error text when a timeout key is not 0 or a number of seconds a Duration holds, from
+/// MIN_TIMEOUT up: a smaller one (1e-10) became a zero Duration, which the socket refuses,
+/// and the program retried that for ever (M3R-27, D4d-5 = a)
 fn check_timeout(owner: &str, key: &str, value: Option<f64>) -> Result<(), String> {
     match value {
-        Some(v) if v != 0.0 && Duration::try_from_secs_f64(v).is_err() => Err(format!(
-            "{} has an invalid {} {}: use 0 (no limit) or a positive number of seconds",
-            owner, key, v
-        )),
+        Some(v)
+            if v != 0.0
+                && (Duration::try_from_secs_f64(v).is_err() || v < MIN_TIMEOUT.as_secs_f64()) =>
+        {
+            Err(format!(
+                "{} has an invalid {} {}: use 0 (no limit) or at least {} seconds",
+                owner,
+                key,
+                v,
+                MIN_TIMEOUT.as_secs_f64()
+            ))
+        }
         _ => Ok(()),
     }
 }

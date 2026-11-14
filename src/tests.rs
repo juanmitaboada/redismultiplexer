@@ -1743,6 +1743,23 @@ fn verify_rejects_timeouts_that_are_not_durations() {
 }
 
 #[test]
+fn verify_rejects_timeouts_below_a_millisecond() {
+    // M3R-27: 1e-10 became a zero Duration, refused by the socket at every attempt
+    for bad in [1e-10, 0.0001, 0.000999] {
+        let mut c = config();
+        c.clients[0].connect_timeout = Some(bad);
+        assert!(err(c).contains("at least 0.001 seconds"), "{}", bad);
+        let mut c = config();
+        c.command_timeout = Some(bad);
+        assert!(err(c).contains("invalid command_timeout"), "{}", bad);
+    }
+    let mut c = config();
+    c.connect_timeout = Some(0.001);
+    c.clients[0].command_timeout = Some(0.001);
+    assert!(verify_config(c).is_ok());
+}
+
+#[test]
 fn yaml_timeouts_accept_integers_and_decimals() {
     let base = "name: s\nhostname: h\nport: 1\npassword: ''\nchannel: c\nchildren: 1\nmode: replicant\nclients:\n  - name: t\n    hostname: h\n    port: 1\n    password: ''\n    channel: d\n";
     let c = parse_yaml(base).unwrap();
