@@ -852,6 +852,9 @@ fn run() -> i32 {
                         // ctrlc took SIGHUP too (M3F-14)
                         let hup_ignored = sighup_ignored();
                         ctrlc::set_handler(move || {
+                            // The flag first: from the line on, no child starts a new pop
+                            // (M3R-17)
+                            handler_stop.store(true, Ordering::Relaxed);
                             print_debug!(
                                 PROGRAM_NAME,
                                 stdout(),
@@ -859,7 +862,6 @@ fn run() -> i32 {
                                 0,
                                 "User requested to exit!"
                             );
-                            handler_stop.store(true, Ordering::Relaxed);
                             // Main may be past its loop already (a second signal)
                             let _ = keepworking_tx.send(false);
                         })

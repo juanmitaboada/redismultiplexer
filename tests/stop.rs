@@ -10,7 +10,6 @@ use std::time::{Duration, Instant};
 
 /// Packages that may leave the source after the stop signal (M3F-13): about 10 times what
 /// the session measured (19-310 in 8 runs, 8 children); 1.0.8 took 291-32060.
-const LIMIT: usize = 3_000;
 
 #[test]
 fn stop_under_load_two_children() {
@@ -156,14 +155,15 @@ fn stop_is_prompt(test: &str, cell: Cell) {
 
 matrix!(stop_prompt, stop_is_prompt, 4);
 
-#[test]
-fn stop_takes_little_after_the_signal() {
-    // M3F-13: with 8 children and ordering, 1.0.8 kept popping for up to a second after the
-    // signal (main noticed it on its next 1 s turn), enough to empty a busy source. Now the
-    // signal sets the stop flag the children read after each package: what leaves the
-    // source after the signal is the packages in flight plus what is popped while the
-    // signal is delivered.
-    let mut ctx = Ctx::new("stop_little");
+/// M3F-13: with 8 children and ordering, 1.0.8 kept popping for up to a second after the
+/// signal (main noticed it on its next 1 s turn), enough to empty a busy source. Now the
+/// signal sets the stop flag, which the children read after each package, and only then
+/// prints "User requested to exit": counted from that line, at most the BLPOPs already
+/// sent leave the source, one per child. Counted from the program's own line, not from
+/// the test's last LLEN before the signal, so the machine's load does not move it (M3R-17:
+/// that count included what the 8 children popped while the signal was on its way).
+fn stop_takes_little(test: &str, ordering: bool) {
+    let mut ctx = Ctx::new(test);
     let src = ctx.key("src");
     let t0 = ctx.key("t0");
     let n = 400_000u64;
@@ -171,24 +171,43 @@ fn stop_takes_little_after_the_signal() {
         let batch: Vec<String> = (start..start + 10_000).map(seq_pkg).collect();
         ctx.push(&src, &batch);
     }
+    let extra = if ordering { ORDERING_1S } else { "" };
+    let children = 8;
     let cfg = ctx.config(
         &src,
-        8,
+        children,
         "replicant",
-        ORDERING_1S,
+        extra,
         &[ctx.client_yaml("t0", &t0, "")],
     );
     let mut p = ctx.spawn(&cfg);
     ctx.wait_for("first package delivered", |c| c.llen(&t0) > 0);
     thread::sleep(Duration::from_millis(200));
-    let before = ctx.llen(&src);
-    p.stop(&ctx.pid_file());
+    p.signal("INT");
+    let start = Instant::now();
+    while !p.stdout().contains("User requested to exit") {
+        assert!(start.elapsed() < Duration::from_secs(10), "no exit line");
+        thread::sleep(Duration::from_millis(1));
+    }
+    let at_line = ctx.llen(&src);
+    let st = p.wait_exit();
+    assert!(st.success(), "exit status {:?}", st);
     let after = ctx.llen(&src);
-    assert!(before > 0, "the source drained before the signal");
-    let taken = before - after;
+    assert!(at_line > 0, "the source drained before the signal");
+    let taken = at_line - after;
     assert!(
-        taken <= LIMIT,
-        "{} packages left the source after the signal",
+        taken <= children as usize,
+        "{} packages left the source after the exit line",
         taken
     );
+}
+
+#[test]
+fn stop_takes_little_after_the_signal() {
+    stop_takes_little("stop_little_on", true);
+}
+
+#[test]
+fn stop_takes_little_after_the_signal_without_ordering() {
+    stop_takes_little("stop_little_off", false);
 }
