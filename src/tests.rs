@@ -1866,3 +1866,27 @@ fn known_keys_are_the_configuration_fields() {
     assert_eq!(root, want_root);
     assert_eq!(client, want_client);
 }
+
+#[test]
+fn ipv6_host_with_or_without_brackets() {
+    // M3R-28: both forms reach the resolver as the address
+    for host in ["[::1]", "::1"] {
+        let mut t = client("t", "c");
+        t.hostname = host.into();
+        match Endpoint::target(&t).info().addr {
+            redis::ConnectionAddr::Tcp(h, _) => assert_eq!(h, "::1", "{}", host),
+            other => panic!("{:?}", other),
+        }
+    }
+    // Only one pair, and only around the whole host
+    assert_eq!(unbracketed("[[::1]]"), "[::1]");
+    assert_eq!(unbracketed("[::1"), "[::1");
+    assert_eq!(unbracketed("redis.example.org"), "redis.example.org");
+    let mut c = config();
+    c.hostname = "[2001:db8::1]".into();
+    c.ssl = Some(true);
+    match Endpoint::source(&c).info().addr {
+        redis::ConnectionAddr::TcpTls { host, .. } => assert_eq!(host, "2001:db8::1"),
+        other => panic!("{:?}", other),
+    }
+}

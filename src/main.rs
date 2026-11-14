@@ -255,6 +255,14 @@ fn check_timeout(owner: &str, key: &str, value: Option<f64>) -> Result<(), Strin
     }
 }
 
+/// An IPv6 address as written in a URL, `[::1]`, is the address `::1` for the resolver
+/// (M3R-28: until 4a the URL parser took the brackets off; std's resolver refuses them)
+fn unbracketed(host: &str) -> &str {
+    host.strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host)
+}
+
 impl Endpoint {
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -269,7 +277,7 @@ impl Endpoint {
     ) -> Endpoint {
         Endpoint {
             ssl: ssl.unwrap_or(false),
-            host: host.to_string(),
+            host: unbracketed(host).to_string(),
             port,
             // Empty means none, as the URL path read an empty user or password: no AUTH
             username: username.clone().filter(|u| !u.is_empty()),

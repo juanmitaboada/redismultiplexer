@@ -328,3 +328,53 @@ fn host_in_upper_case_connects() {
     p.stop(&ctx.pid_file());
     assert_eq!(ctx.list(&t0), all);
 }
+
+#[test]
+fn ipv6_target_with_and_without_brackets() {
+    // M3R-28: `::1` and `[::1]` both connect. Runs only where a Redis listens on the IPv6
+    // loopback without a password: RM_TEST_REDIS_IPV6_PORT (its port)
+    let Ok(port) = std::env::var("RM_TEST_REDIS_IPV6_PORT") else {
+        eprintln!(
+            "ipv6_target_with_and_without_brackets: skipped, RM_TEST_REDIS_IPV6_PORT not set"
+        );
+        return;
+    };
+    let mut ctx = Ctx::new("ipv6");
+    let src = ctx.key("src");
+    let t0 = ctx.key("t0");
+    let t1 = ctx.key("t1");
+    let all = packages("v6", 10);
+    ctx.push(&src, &all);
+    let client = |name: &str, host: &str, key: &str| {
+        format!(
+            "  - name: '{}'\n    ssl: false\n    hostname: '{}'\n    port: {}\n    password: ''\n    channel: {}\n",
+            name,
+            host,
+            port,
+            q(key)
+        )
+    };
+    let clients = [
+        client("plain", "::1", &t0),
+        client("bracketed", "[::1]", &t1),
+    ];
+    let cfg = ctx.config(&src, 1, "replicant", "", &clients);
+    let mut p = ctx.spawn(&cfg);
+    ctx.wait_for("the source drained", |c| c.llen(&src) == 0);
+    p.stop(&ctx.pid_file());
+    for key in [&t0, &t1] {
+        let out = std::process::Command::new("redis-cli")
+            .args(["-h", "::1", "-p", &port, "LRANGE", key, "0", "-1"])
+            .output()
+            .expect("redis-cli to read the IPv6 target");
+        let _ = std::process::Command::new("redis-cli")
+            .args(["-h", "::1", "-p", &port, "DEL", key])
+            .output();
+        let got: Vec<String> = String::from_utf8(out.stdout)
+            .unwrap()
+            .lines()
+            .map(|l| l.to_string())
+            .collect();
+        assert_eq!(got, all, "{}: {}", key, p.stderr());
+    }
+}
