@@ -70,7 +70,7 @@ def render(spec: dict[str, Any]) -> str | None:
     lines.append("clients:")
     for c in spec["clients"]:
         lines.append(f"  - name: {q(c['name'])}")
-        lines += connection(redis, "    ")
+        lines += connection(c.get("redis") or redis, "    ")
         lines.append(f"    channel: {q(c['key'])}")
         limits = c.get("limits")
         if limits:

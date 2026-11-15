@@ -19,11 +19,14 @@ import json
 import math
 import os
 import resource
+import selectors
 import shlex
 import signal
+import socket
 import statistics
 import subprocess
 import sys
+import threading
 import time
 import tomllib
 from dataclasses import dataclass, field
@@ -84,6 +87,8 @@ class Run:
     instances: list[dict[str, Any]]
     mixed: bool = False
     duration: float = 0.0  # > 0: time-boxed run of this many seconds; 0: drain the source
+    target_delay_ms: float | None = None  # set: the targets are reached through a DelayProxy (plan 9.6)
+    feed_rate: float | None = None  # set: the source is fed at this many packages/s while it runs
 
 
 def _fmt(v: Any) -> str:
@@ -104,6 +109,16 @@ def expand(doc: dict[str, Any], scale: float = 1.0) -> list[Run]:
         duration = float(base.get("duration", 0))
         if duration < 0:
             raise BenchError(f"{sc['name']}: duration must be 0 or positive")
+        delay = base.get("target_delay_ms")
+        if delay is not None:
+            delay = float(delay)
+            if delay < 0:
+                raise BenchError(f"{sc['name']}: target_delay_ms must be 0 or positive")
+        feed = base.get("feed_rate")
+        if feed is not None:
+            feed = float(feed)
+            if feed <= 0:
+                raise BenchError(f"{sc['name']}: feed_rate must be positive")
         axes = [k for k in AXES if isinstance(base.get(k), list)]
         for combo in itertools.product(*(base[k] for k in axes)):
             params = dict(base)
@@ -114,9 +129,11 @@ def expand(doc: dict[str, Any], scale: float = 1.0) -> list[Run]:
             seen.add(name)
             if "instances" in sc:
                 insts = [_scaled({**params, **inst}, scale) for inst in sc["instances"]]
-                runs.append(Run(name, list(sc.get("tags", [])), insts, mixed=True, duration=duration))
+                runs.append(Run(name, list(sc.get("tags", [])), insts, mixed=True, duration=duration,
+                                target_delay_ms=delay, feed_rate=feed))
             else:
-                runs.append(Run(name, list(sc.get("tags", [])), [_scaled(params, scale)], duration=duration))
+                runs.append(Run(name, list(sc.get("tags", [])), [_scaled(params, scale)], duration=duration,
+                                target_delay_ms=delay, feed_rate=feed))
     return runs
 
 
@@ -220,23 +237,29 @@ def limits_for(inst: dict[str, Any]) -> dict[str, int] | None:
     return None
 
 
-def make_spec(run: Run, idx: int, inst: dict[str, Any], redis_url: str, run_dir: Path, run_id: str) -> dict[str, Any]:
+def make_spec(run: Run, idx: int, inst: dict[str, Any], redis_url: str, run_dir: Path, run_id: str,
+              target_addr: tuple[str, int] | None = None) -> dict[str, Any]:
     info = parse_url(redis_url)
     src, targets = keys_for(run, idx, inst)
     clients = []
     for j, key in enumerate(targets):
-        clients.append({
+        client: dict[str, Any] = {
             "name": f"t{j}",
             "key": key,
             "filter": CLIENT_FILTER if (inst["filter"] == "client" and j == 0) else None,
             "limits": limits_for(inst),
-        })
+        }
+        if target_addr is not None:
+            # The program reaches this target through the delay proxy; the harness keeps
+            # reading the lists on the Redis itself, so the accounting does not change
+            client["redis"] = {**_redis_spec(info), "host": target_addr[0], "port": target_addr[1]}
+        clients.append(client)
     return {
         "scenario": run.name,
         "run_id": run_id,
         "instance": idx,
         "transport": inst["transport"],
-        "redis": {"host": info["host"], "port": info["port"], "password": info["password"], "ssl": info["ssl"]},
+        "redis": _redis_spec(info),
         "source": {"key": src},
         "children": inst["children"],
         "mode": inst["mode"],
@@ -246,6 +269,151 @@ def make_spec(run: Run, idx: int, inst: dict[str, Any], redis_url: str, run_dir:
         "ordering": ORDERING if inst["ordering"] else None,
         "clients": clients,
     }
+
+
+def _redis_spec(info: dict[str, Any]) -> dict[str, Any]:
+    return {"host": info["host"], "port": info["port"], "password": info["password"], "ssl": info["ssl"]}
+
+
+# ---------------------------------------------------------------- delay proxy
+
+
+class DelayProxy:
+    """TCP forwarder in front of a Redis for scenarios with `target_delay_ms` (plan 9.6).
+
+    Bytes from a client go to the server at once; every read from the server is held
+    `delay_ms` before it is passed on, so each request/reply round trip through the proxy
+    costs about that much, as a target that far away would. Bytes pass unchanged and in
+    order in both directions. One thread for everything (selectors), so its own ceiling
+    is one CPU's worth of copying: plan 9.6 measures it with delay 0.
+    """
+
+    def __init__(self, host: str, port: int, delay_ms: float) -> None:
+        self.upstream = (host, port)
+        self.delay = delay_ms / 1000.0
+        self.listener = socket.create_server(("127.0.0.1", 0))
+        self.listener.setblocking(False)
+        self.addr: tuple[str, int] = self.listener.getsockname()[:2]
+        self._wake_r, self._wake_w = socket.socketpair()
+        self._stop = False
+        self._thread = threading.Thread(target=self._loop, name="delay-proxy", daemon=True)
+
+    def __enter__(self) -> "DelayProxy":
+        self._thread.start()
+        return self
+
+    def __exit__(self, *exc: Any) -> None:
+        self.close()
+
+    def close(self) -> None:
+        self._stop = True
+        try:
+            self._wake_w.send(b"x")
+        except OSError:
+            pass
+        self._thread.join(timeout=5)
+        for s in (self.listener, self._wake_r, self._wake_w):
+            s.close()
+
+    def _loop(self) -> None:
+        sel = selectors.DefaultSelector()
+        sel.register(self.listener, selectors.EVENT_READ, ("accept", None))
+        sel.register(self._wake_r, selectors.EVENT_READ, ("wake", None))
+        # Per pair: the client socket, the server socket, data owed to each and, for the
+        # client, the server's reads held until their release time
+        pairs: list[dict[str, Any]] = []
+        while not self._stop:
+            now = time.monotonic()
+            timeout = None
+            for pr in pairs:
+                if pr["held"]:
+                    t = max(0.0, pr["held"][0][0] - now)
+                    timeout = t if timeout is None else min(timeout, t)
+            for key, _ in sel.select(timeout):
+                kind, pr = key.data
+                if kind == "accept":
+                    self._accept(sel, pairs)
+                elif kind == "wake":
+                    return self._shut(sel, pairs)
+                else:
+                    self._readable(sel, pairs, pr, kind)
+            now = time.monotonic()
+            for pr in list(pairs):
+                while pr["held"] and pr["held"][0][0] <= now:
+                    pr["to_client"] += pr["held"].pop(0)[1]
+                self._flush(sel, pairs, pr)
+        self._shut(sel, pairs)
+
+    def _accept(self, sel: selectors.BaseSelector, pairs: list[dict[str, Any]]) -> None:
+        try:
+            c, _ = self.listener.accept()
+        except BlockingIOError:
+            return
+        try:
+            u = socket.create_connection(self.upstream, timeout=5)
+        except OSError:
+            c.close()
+            return
+        for x in (c, u):
+            x.setblocking(False)
+            x.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        pr = {"c": c, "u": u, "to_client": b"", "to_server": b"", "held": [], "open": True}
+        pairs.append(pr)
+        sel.register(c, selectors.EVENT_READ, ("client", pr))
+        sel.register(u, selectors.EVENT_READ, ("server", pr))
+
+    def _readable(self, sel: selectors.BaseSelector, pairs: list[dict[str, Any]], pr: dict[str, Any],
+                  kind: str) -> None:
+        sock = pr["c"] if kind == "client" else pr["u"]
+        try:
+            data = sock.recv(1 << 16)
+        except (BlockingIOError, InterruptedError):
+            return
+        except OSError:
+            data = b""
+        if not data:
+            self._drop(sel, pairs, pr)
+            return
+        if kind == "client":
+            pr["to_server"] += data
+        elif self.delay > 0:
+            pr["held"].append((time.monotonic() + self.delay, data))
+        else:
+            pr["to_client"] += data
+        self._flush(sel, pairs, pr)
+
+    def _flush(self, sel: selectors.BaseSelector, pairs: list[dict[str, Any]], pr: dict[str, Any]) -> None:
+        if not pr["open"]:
+            return
+        for buf, sock in (("to_server", pr["u"]), ("to_client", pr["c"])):
+            while pr[buf]:
+                try:
+                    n = sock.send(pr[buf])
+                except (BlockingIOError, InterruptedError):
+                    # A slow reader: wait for it (short sleep; the bench program reads fast)
+                    time.sleep(0.0005)
+                    continue
+                except OSError:
+                    self._drop(sel, pairs, pr)
+                    return
+                pr[buf] = pr[buf][n:]
+
+    def _drop(self, sel: selectors.BaseSelector, pairs: list[dict[str, Any]], pr: dict[str, Any]) -> None:
+        if not pr["open"]:
+            return
+        pr["open"] = False
+        for x in (pr["c"], pr["u"]):
+            try:
+                sel.unregister(x)
+            except (KeyError, ValueError):
+                pass
+            x.close()
+        pairs.remove(pr)
+
+    def _shut(self, sel: selectors.BaseSelector, pairs: list[dict[str, Any]]) -> None:
+        for pr in list(pairs):
+            self._drop(sel, pairs, pr)
+        sel.close()
 
 
 # ---------------------------------------------------------------- execution
@@ -275,6 +443,36 @@ class Proc:
     t_end: float = 0.0  # end of the measured window: last change (drain) or the time box
     win: tuple[int, ...] = ()  # list lengths (source, targets...) at t_end
     boxed: bool = False  # the time box closed the run (not a drain that came first)
+    fed: int | None = None  # feed_rate runs: packages pushed so far (the feeder thread's count)
+    fed_win: int = 0  # feed_rate runs: packages pushed when the window closed
+    feeding: threading.Event | None = None  # set: the feeder stops
+    t_first: float = 0.0  # first poll that saw a package at a target
+    d_first: int = 0  # packages at the targets at that poll
+
+
+def pushed(p: Proc) -> int:
+    """Packages put in the source: the whole count, or what the feeder pushed so far."""
+    return p.inst["count"] if p.fed is None else p.fed
+
+
+def _feed(r: Redis, p: Proc, rate: float) -> None:
+    assert p.feeding is not None
+    feed_source(r, p, rate, p.feeding)
+
+
+def feed_source(r: Redis, p: Proc, rate: float, stop_at: threading.Event) -> None:
+    """Push p.inst["count"] packages at `rate` per second, a batch every 10 ms, from the
+    program's start (M3R-14's shape: a live feed, not a backlog; owner, P5 first half)."""
+    t = time.monotonic()
+    n, step = p.inst["count"], max(1, round(rate / 100))
+    for start in range(0, n, step):
+        if stop_at.is_set():
+            return
+        batch = ["RPUSH", p.src, *(payload(seq, p.inst["payload"]) for seq in range(start, min(n, start + step)))]
+        _check(r.pipeline([batch]))
+        p.fed = min(n, start + step)
+        t += step / rate
+        time.sleep(max(0.0, t - time.monotonic()))
 
 
 def load_source(r: Redis, key: str, count: int, size: int) -> None:
@@ -383,9 +581,27 @@ def _run_once(run: Run, rep: int, args: argparse.Namespace, r: Redis, env: dict[
             p.status, p.reason = status, reason
         return build_rows(run, rep, run_id, procs, args, env, 0.0)
 
+    proxy: DelayProxy | None = None
+    delay = run_delay(run, args)
+    if delay is not None:
+        info = parse_url(args.redis)
+        if info["ssl"]:
+            return rows("n/a", "target_delay_ms needs a plain (non-TLS) Redis")
+        proxy = DelayProxy(info["host"], info["port"], delay).__enter__()
+    try:
+        return _run_procs(run, rep, args, r, env, procs, run_id, run_dir, all_keys, rows,
+                          proxy.addr if proxy else None)
+    finally:
+        if proxy is not None:
+            proxy.close()
+
+
+def _run_procs(run: Run, rep: int, args: argparse.Namespace, r: Redis, env: dict[str, Any],
+               procs: list[Proc], run_id: str, run_dir: Path, all_keys: list[str], rows: Any,
+               target_addr: tuple[str, int] | None) -> list[dict[str, Any]]:
     # Render every instance first: an unsupported scenario starts nothing.
     for p in procs:
-        spec = make_spec(run, p.idx, p.inst, args.redis, run_dir, run_id)
+        spec = make_spec(run, p.idx, p.inst, args.redis, run_dir, run_id, target_addr)
         spec_path = run_dir / f"i{p.idx}.spec.json"
         spec_path.write_text(json.dumps(spec, indent=2) + "\n")
         cfg = run_dir / f"i{p.idx}.config{args.config_ext}"
@@ -398,7 +614,10 @@ def _run_once(run: Run, rep: int, args: argparse.Namespace, r: Redis, env: dict[
 
     r.pipeline([["DEL", k] for k in all_keys])
     for p in procs:
-        load_source(r, p.src, p.inst["count"], p.inst["payload"])
+        if run.feed_rate is None:
+            load_source(r, p.src, p.inst["count"], p.inst["payload"])
+        else:
+            p.fed = 0
 
     duration = run_duration(run, args)
     settle = args.settle
@@ -418,7 +637,15 @@ def _run_once(run: Run, rep: int, args: argparse.Namespace, r: Redis, env: dict[
             out.close()
             err.close()
         p.t0 = p.t_change = time.monotonic()
-        p.last = tuple([p.inst["count"]] + [0] * len(p.targets))
+        p.last = tuple([pushed(p)] + [0] * len(p.targets))
+    feeders = []
+    for p in procs:
+        if run.feed_rate is not None and p.popen is not None:
+            p.feeding = threading.Event()
+            fr = Redis(args.redis).__enter__()
+            th = threading.Thread(target=_feed, args=(fr, p, run.feed_rate), daemon=True)
+            th.start()
+            feeders.append((th, fr))
 
     next_reap = 0.0
     while not all(p.done for p in procs):
@@ -434,9 +661,12 @@ def _run_once(run: Run, rep: int, args: argparse.Namespace, r: Redis, env: dict[
             if vals != p.last:
                 p.last, p.t_change = vals, now
             src_left, delivered = vals[0], sum(vals[1:])
+            if delivered and not p.t_first:
+                p.t_first, p.d_first = now, delivered
             if duration and now - p.t0 >= duration:
                 p.done, p.t_end, p.win, p.boxed = True, now, vals, True
-            elif src_left == 0 and delivered >= expected_total(p.inst):
+                p.fed_win = pushed(p)
+            elif src_left == 0 and pushed(p) == p.inst["count"] and delivered >= expected_total(p.inst):
                 p.done = True
             elif src_left == 0 and now - p.t_change >= settle:
                 p.done = True
@@ -452,9 +682,15 @@ def _run_once(run: Run, rep: int, args: argparse.Namespace, r: Redis, env: dict[
     h1 = resource.getrusage(resource.RUSAGE_SELF)
     harness_cpu = (h1.ru_utime - h0.ru_utime) + (h1.ru_stime - h0.ru_stime)
     for p in procs:
+        if p.feeding is not None:
+            p.feeding.set()
+    for th, fr in feeders:
+        th.join()
+        fr.__exit__(None, None, None)
+    for p in procs:
         if not p.win:
             # Drained, settled, timed out or failed before the time box: the window ends at the last change.
-            p.t_end, p.win = p.t_change, p.last
+            p.t_end, p.win, p.fed_win = p.t_change, p.last, pushed(p)
 
     for p in procs:
         stop(p)
@@ -482,6 +718,15 @@ def _run_once(run: Run, rep: int, args: argparse.Namespace, r: Redis, env: dict[
     return build_rows(run, rep, run_id, procs, args, env, harness_cpu)
 
 
+def run_delay(run: Run, args: argparse.Namespace) -> float | None:
+    """Delay of the targets' proxy in ms, None = no proxy: --target-delay-ms overrides the
+    value of a scenario that has one (0 measures the proxy's own ceiling, plan 9.6)."""
+    if run.target_delay_ms is None:
+        return None
+    d = getattr(args, "target_delay_ms", None)
+    return run.target_delay_ms if d is None else d
+
+
 def run_duration(run: Run, args: argparse.Namespace) -> float:
     """Time box in seconds (0 = drain): --duration overrides the scenario's value."""
     d = getattr(args, "duration", None)
@@ -497,8 +742,8 @@ def _window(p: Proc, timed: bool) -> tuple[float, int, int]:
     """
     span = p.t_end - p.t0
     if timed:
-        return span, p.inst["count"] - p.win[0], sum(p.win[1:])
-    return span, p.inst["count"] - p.src_left, sum(p.counts)
+        return span, (p.inst["count"] if p.fed is None else p.fed_win) - p.win[0], sum(p.win[1:])
+    return span, pushed(p) - p.src_left, sum(p.counts)
 
 
 def build_rows(run: Run, rep: int, run_id: str, procs: list[Proc], args: argparse.Namespace,
@@ -514,12 +759,21 @@ def build_rows(run: Run, rep: int, run_id: str, procs: list[Proc], args: argpars
         if timed and not boxed and p.status == "ok":
             p.reason = "source drained before the time box"
         drain, consumed, delivered_w = _window(p, boxed) if p.popen is not None else (0.0, 0, 0)
+        # The ordering buffer pops ahead of what reaches the target (far ahead behind a
+        # delay), so runs with ordering or a delay count what was delivered in the window,
+        # not what was taken (plan 9.6; owner, P5 second half)
+        rate = delivered_w if run.target_delay_ms is not None or inst["ordering"] else consumed
+        # A fed run counts from its first delivery: the time a build takes to start and
+        # deliver its first package is not its rate (owner, P5 first half)
+        span = drain
+        if run.feed_rate is not None and p.t_first and p.t_end > p.t_first:
+            rate, span = delivered_w - p.d_first, p.t_end - p.t_first
         delivered = sum(p.counts)
         # A time-boxed run leaves packages in the source: only those taken from it are expected.
         if boxed and p.popen is not None:
-            exp = expected_total(inst, inst["count"] - p.src_left)
+            exp = expected_total(inst, pushed(p) - p.src_left)
         else:
-            exp = expected_total(inst)
+            exp = expected_total(inst, pushed(p))
         row = {
             "ts_utc": ts, "label": args.label, "run_id": run_id,
             "scenario": f"{run.name}.i{p.idx}" if run.mixed else run.name,
@@ -528,7 +782,7 @@ def build_rows(run: Run, rep: int, run_id: str, procs: list[Proc], args: argpars
             "children": inst["children"], "mode": inst["mode"], "clients": inst["clients"],
             "ordering": _fmt(inst["ordering"]), "filter": inst["filter"], "limits": inst["limits"],
             "repeat_idx": rep, "status": p.status, "reason": p.reason,
-            "msg_s": f"{consumed / drain:.1f}" if drain > 0 and p.status != "n/a" else "",
+            "msg_s": f"{rate / span:.1f}" if span > 0 and p.status != "n/a" else "",
             "mib_s": f"{delivered_w * inst['payload'] / drain / 1048576:.3f}" if drain > 0 and p.status != "n/a" else "",
             "drain_s": f"{drain:.3f}" if p.popen is not None else "",
             "stop_s": f"{p.stop_s:.3f}" if p.popen is not None else "",
@@ -725,6 +979,8 @@ def cmd_run(args: argparse.Namespace) -> int:
         raise BenchError("no scenario selected")
     if args.duration is not None and args.duration < 0:
         raise BenchError("--duration must be 0 or positive")
+    if getattr(args, "target_delay_ms", None) is not None and args.target_delay_ms < 0:
+        raise BenchError("--target-delay-ms must be 0 or positive")
     for run in runs:
         validate(run, args.max_bytes)
         if run_duration(run, args) >= args.timeout:
@@ -802,6 +1058,8 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--keep-keys", action="store_true", help="keep the run's keys after it ends")
     p.add_argument("--duration", type=float, default=None,
                    help="time box in seconds for every selected run (0 = drain); default: the scenario's")
+    p.add_argument("--target-delay-ms", type=float, default=None,
+                   help="delay of the targets' proxy for runs that have one (0: the proxy's ceiling)")
     p.set_defaults(func=cmd_run)
 
     p = sub.add_parser("list", help="list the expanded runs")

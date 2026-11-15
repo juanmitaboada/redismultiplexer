@@ -18,7 +18,8 @@ python3 bench/rmbench.py run --cmd 'target/release/redismultiplexer {config}' \
     --label rust-1.0.7 --redis redis://127.0.0.1:6390 --results DIR \
     [--tag T ...] [--scenario GLOB ...] [--repeat N] [--scale F] \
     [--renderer CMD] [--config-ext .yaml] \
-    [--timeout 120] [--settle 2] [--max-bytes BYTES] [--keep-keys] [--duration S]
+    [--timeout 120] [--settle 2] [--max-bytes BYTES] [--keep-keys] [--duration S] \
+    [--target-delay-ms D]
 python3 bench/rmbench.py clean --redis URL
 python3 bench/rmbench.py compare A.csv B.csv [--label-a X] [--label-b Y] [--scenario GLOB ...]
 python3 -m unittest discover -s bench -p 'test_*.py'
@@ -30,6 +31,8 @@ python3 -m unittest discover -s bench -p 'test_*.py'
 - `--redis` defaults to `$RM_BENCH_REDIS_URL`, then `redis://127.0.0.1:6379`.
 - `--duration S` time-boxes every selected run to S seconds (`0` drains the
   source instead); without it each scenario's own `duration` applies.
+- `--target-delay-ms D` sets the delay of the targets' proxy for the runs whose
+  scenario has `target_delay_ms` (`0` keeps the proxy with no delay: its own ceiling).
 - `run` exits 1 if any run ended in `error` (renderer failure, program not
   starting or exiting early, non-zero exit after SIGINT), 3 if no run failed
   but some repetition has `missing` other than 0 (each one is listed on
@@ -61,10 +64,13 @@ aggregate row.
 | filter | `off`; `root`: `"k": [0-4],` on the first 64 bytes (half pass); `client`: same regex on target 0 with replacement `"K": $1,` (replicant only) |
 | limits | `off`; `countdown`: checklimit 1000, timelimit 3600; `time`: timelimit 1, checklimit 1000000; soft and hard limits are never reached |
 | duration | `0` (default): drain the source; `S` > 0: time-boxed run of S seconds (not a matrix axis) |
+| target_delay_ms | absent (default): no proxy; `D` >= 0: the program reaches the targets through a proxy started by the harness that holds every reply from the server D ms, so each round trip costs about D ms (a remote target); the harness reads the lists on the Redis itself, and `msg_s` counts the packages delivered in the window (the buffer pops far ahead of a slow target); plain Redis only (not a matrix axis) |
+| feed_rate | absent (default): `count` packages loaded before the program starts; `R` > 0: nothing loaded, the harness pushes `count` packages at R per second from the program's start (a live feed, not a backlog) and stops when the box closes; only what was pushed is expected, and `msg_s` counts the packages delivered from the first delivery to the end of the window over that time (not a matrix axis) |
 
-Tags: `smoke` (CI), `fast` (seven time-boxed runs of 5 s: plain with 1, 2 and 8
-children, spreader, ordering, root filter and countdown limits; about 1.5 min
-per build whatever its speed: the quick read of an improvement), `quick` (routine,
+Tags: `smoke` (CI), `fast` (eight time-boxed runs of 5 s: plain with 1, 2 and 8
+children, spreader, ordering, ordering to a target 1 ms away, root filter and
+countdown limits; about 1.5 min per build whatever its speed: the quick read of an
+improvement), `quick` (routine,
 about 1.5 min with 1.0.7 on 2 vCPU), `full` (whole matrix, about 10-12 min).
 `--scale F` multiplies every count (rounded to a multiple of 30) for when runs
 get too short to measure; for a deep comparison of fast builds use
@@ -114,7 +120,7 @@ One row per run and repetition (plus an aggregate row for mixed runs).
 
 | Column | Meaning |
 |---|---|
-| msg_s | source packages consumed / drain_s (time-boxed: consumed when the box closed) |
+| msg_s | source packages consumed / drain_s (time-boxed: consumed when the box closed); with ordering or a target delay, packages delivered instead of consumed (the ordering buffer takes packages ahead of what reaches the targets); with a feed rate, from the first delivery (see `feed_rate`) |
 | mib_s | payload bytes delivered / drain_s (time-boxed: delivered when the box closed) |
 | drain_s | from process start to the last change in any watched list (time-boxed: to the end of the box) |
 | stop_s | from SIGINT to process exit |

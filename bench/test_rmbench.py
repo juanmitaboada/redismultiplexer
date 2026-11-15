@@ -11,11 +11,14 @@ import io
 import json
 import os
 import re
+import random
 import signal
 import socket
+import statistics
 import sys
 import tempfile
 import threading
+import time
 import tomllib
 import unittest
 from pathlib import Path
@@ -59,6 +62,13 @@ children = [1, 8]
         self.assertEqual([r.name for r in runs], ["s.p64.c1", "s.p64.c8", "s.p200.c1", "s.p200.c8"])
         self.assertEqual(runs[3].instances[0]["children"], 8)
         self.assertEqual(runs[3].instances[0]["payload"], 200)
+
+    def test_feed_rate(self) -> None:
+        runs = rmbench.expand(doc(BASE + '[[scenario]]\nname = "f"\nfeed_rate = 6000\n[[scenario]]\nname = "g"\n'))
+        self.assertEqual([r.feed_rate for r in runs], [6000.0, None])
+        for bad in ("0", "-1"):
+            with self.assertRaises(rmbench.BenchError):
+                rmbench.expand(doc(BASE + f'[[scenario]]\nname = "f"\nfeed_rate = {bad}\n'))
 
     def test_mixed_instances_inherit(self) -> None:
         runs = rmbench.expand(doc(BASE + """
@@ -125,6 +135,21 @@ instances = [{ mode = "spreader", clients = 3 }, { ordering = true }]
         inst = {"count": 900, "mode": "spreader", "clients": 3, "filter": "root"}
         self.assertEqual(rmbench.expected_total(inst, 15), 10)
 
+    def test_target_delay(self) -> None:
+        runs = rmbench.expand(doc(BASE + '[[scenario]]\nname = "r"\ntarget_delay_ms = 1\n[[scenario]]\nname = "l"\n'))
+        self.assertEqual([r.target_delay_ms for r in runs], [1.0, None])
+        self.assertNotIn("target_delay_ms", runs[0].instances[0])
+        with self.assertRaises(rmbench.BenchError):
+            rmbench.expand(doc(BASE + '[[scenario]]\nname = "r"\ntarget_delay_ms = -1\n'))
+        # --target-delay-ms overrides it where a proxy is used (0: the proxy's ceiling), never adds one
+        ns = argparse.Namespace
+        self.assertEqual(rmbench.run_delay(runs[0], ns(target_delay_ms=None)), 1.0)
+        self.assertEqual(rmbench.run_delay(runs[0], ns(target_delay_ms=0.0)), 0.0)
+        self.assertIsNone(rmbench.run_delay(runs[1], ns(target_delay_ms=0.0)))
+        remote = [r for r in rmbench.load_scenarios(rmbench.DEFAULT_SCENARIOS, 1.0) if r.target_delay_ms is not None]
+        self.assertEqual([r.name for r in remote], ["fast_ordering_remote"])
+        self.assertTrue(remote[0].instances[0]["ordering"])
+
     def test_duration(self) -> None:
         runs = rmbench.expand(doc(BASE + '[[scenario]]\nname = "t"\nduration = 5\n[[scenario]]\nname = "d"\n'))
         self.assertEqual([r.duration for r in runs], [5.0, 0.0])
@@ -178,6 +203,17 @@ class RenderTests(unittest.TestCase):
         self.assertIn("    filter_replace: '\"K\": $1,'", text)
         self.assertIn("    timelimit: 3600\n    checklimit: 1000\n", text)
 
+    def test_targets_through_the_delay_proxy(self) -> None:
+        run = rmbench.expand(doc(BASE + '[[scenario]]\nname = "s"\nclients = 2\ntarget_delay_ms = 1\n'))[0]
+        spec = rmbench.make_spec(run, 0, run.instances[0], "redis://:pw@10.0.0.1:6390", Path("/tmp/x"), "id",
+                                 ("127.0.0.1", 41234))
+        text = render_rust.render(spec)
+        assert text is not None
+        # The source on the Redis, every target through the proxy, same password
+        self.assertIn("hostname: '10.0.0.1'\nport: 6390\npassword: 'pw'\n", text)
+        self.assertEqual(text.count("    hostname: '127.0.0.1'\n    port: 41234\n    password: 'pw'\n"), 2)
+        self.assertNotIn("    hostname: '10.0.0.1'", text)
+
     def test_unsupported_transport(self) -> None:
         spec = self.spec()
         spec["transport"] = "pubsub"
@@ -229,6 +265,81 @@ class RespTests(unittest.TestCase):
             srv.close()
 
 
+class DelayProxyTests(unittest.TestCase):
+    """The proxy of plan 9.6 against a plain echo server."""
+
+    def echo_server(self) -> tuple[socket.socket, threading.Thread]:
+        srv = socket.create_server(("127.0.0.1", 0))
+
+        def serve() -> None:
+            while True:
+                try:
+                    conn, _ = srv.accept()
+                except OSError:
+                    return
+                with conn:
+                    while True:
+                        data = conn.recv(1 << 16)
+                        if not data:
+                            break
+                        conn.sendall(data)
+
+        t = threading.Thread(target=serve, daemon=True)
+        t.start()
+        return srv, t
+
+    def round_trips(self, delay_ms: float, n: int) -> list[float]:
+        srv, _ = self.echo_server()
+        times = []
+        try:
+            with rmbench.DelayProxy("127.0.0.1", srv.getsockname()[1], delay_ms) as px:
+                with socket.create_connection(px.addr) as c:
+                    for _ in range(n):
+                        t = time.monotonic()
+                        c.sendall(b"PING\r\n")
+                        got = b""
+                        while len(got) < 6:
+                            got += c.recv(64)
+                        times.append(time.monotonic() - t)
+                        self.assertEqual(got, b"PING\r\n")
+        finally:
+            srv.close()
+        return times
+
+    def test_each_round_trip_costs_the_delay(self) -> None:
+        times = self.round_trips(20, 5)
+        self.assertGreaterEqual(min(times), 0.020)
+        # A doubled delay or one per byte would show here; generous for a loaded machine
+        self.assertLess(statistics.median(times), 0.035)
+
+    def test_bytes_pass_unchanged_and_in_order(self) -> None:
+        srv, _ = self.echo_server()
+        rnd = random.Random(7)
+        blobs = [bytes(rnd.getrandbits(8) for _ in range(n)) for n in (1, 2, 1000, 70000, 1 << 20)]
+        blobs.append(b"\r\n*3\r\n$5\r\nRPUSH\r\n\x00\xff")
+        sent = b"".join(blobs)
+        try:
+            with rmbench.DelayProxy("127.0.0.1", srv.getsockname()[1], 1) as px:
+                with socket.create_connection(px.addr) as c:
+                    def write() -> None:
+                        for b in blobs:
+                            c.sendall(b)
+                    w = threading.Thread(target=write)
+                    w.start()
+                    got = b""
+                    while len(got) < len(sent):
+                        chunk = c.recv(1 << 16)
+                        self.assertTrue(chunk, "connection closed early")
+                        got += chunk
+                    w.join()
+        finally:
+            srv.close()
+        self.assertEqual(got, sent)
+
+    def test_delay_zero_passes_at_once(self) -> None:
+        self.assertLess(statistics.median(self.round_trips(0, 5)), 0.010)
+
+
 class WindowTests(unittest.TestCase):
     ENV = {"redis_version": "7", "host_cpus": 2}
 
@@ -253,6 +364,39 @@ class WindowTests(unittest.TestCase):
         self.assertEqual((r["msg_s"], r["mib_s"], r["drain_s"]), ("100.0", "0.018", "5.000"))
         self.assertEqual((r["expected_total"], r["delivered_total"], r["missing"]), (510, 510, 0))
         self.assertEqual(r["duration_s"], "5")
+
+    def test_behind_the_proxy_msg_s_counts_what_was_delivered(self) -> None:
+        # The buffer took 500 in the box but only 120 reached the target (plan 9.6)
+        p = self.proc(t0=10.0, t_change=14.9, t_end=15.0, win=(400, 120), src_left=390, counts=[510], boxed=True)
+        r = self.row(rmbench.Run("t", ["fast"], [], duration=5.0, target_delay_ms=1.0), p)
+        self.assertEqual(r["msg_s"], "24.0")
+        # Without a proxy the same window reads what was taken, as before
+        r = self.row(rmbench.Run("t", ["fast"], [], duration=5.0), p)
+        self.assertEqual(r["msg_s"], "100.0")
+
+    def test_ordering_msg_s_counts_what_was_delivered(self) -> None:
+        # Owner, P5 second half: with ordering the buffer pops ahead of the target, so a
+        # run with ordering counts what was delivered in the window, with no proxy too
+        p = self.proc(t0=10.0, t_change=14.9, t_end=15.0, win=(400, 120), src_left=390, counts=[510], boxed=True)
+        p.inst["ordering"] = True
+        r = self.row(rmbench.Run("t", ["fast"], [], duration=5.0), p)
+        self.assertEqual(r["msg_s"], "24.0")
+
+    def test_fed_run_counts_from_the_first_delivery(self) -> None:
+        # Owner, P5 first half: 30 at the targets at the first delivery (t 12.0), 330 when
+        # the box closed (t 15.0): 100/s, not 330 over the 5 s since the start
+        p = self.proc(t0=10.0, t_change=14.9, t_end=15.0, win=(0, 330), src_left=0, counts=[400], boxed=True,
+                      fed=400, fed_win=330, t_first=12.0, d_first=30)
+        run = rmbench.Run("t", ["fast"], [], duration=5.0, target_delay_ms=1.0, feed_rate=100.0)
+        r = self.row(run, p)
+        self.assertEqual(r["msg_s"], "100.0")
+        # Only what was fed is expected
+        self.assertEqual((r["expected_total"], r["missing"]), (400, 0))
+        # Nothing delivered: no rate from the first delivery, the window's as before
+        p = self.proc(t0=10.0, t_change=14.9, t_end=15.0, win=(330, 0), src_left=330, counts=[0], boxed=True,
+                      fed=330, fed_win=330)
+        r = self.row(run, p)
+        self.assertEqual((r["msg_s"], r["expected_total"], r["missing"]), ("0.0", 0, 0))
 
     def test_drain_run_unchanged(self) -> None:
         run = rmbench.Run("d", ["quick"], [])
@@ -411,6 +555,52 @@ class RunOnceTests(unittest.TestCase):
         self.assertGreater(int(r["delivered_total"]), 0)
         self.assertGreater(float(r["msg_s"]), 0.0)
         self.assertEqual(r["reason"], "")
+
+    def run_fed(self, box: float, count: int, rate: float, fake: FakeRedis | None = None) -> tuple[dict, FakeRedis]:
+        run = rmbench.expand(doc(BASE + f'[[scenario]]\nname = "t"\nduration = {box}\ncount = {count}\n'
+                                        f'feed_rate = {rate}\n'))[0]
+        fake = fake or FakeRedis(step=100)
+        with tempfile.TemporaryDirectory() as d:
+            args = argparse.Namespace(
+                label="x", results=d, renderer=rmbench.DEFAULT_RENDERER, config_ext=".yaml",
+                redis="redis://127.0.0.1:6379", cmd=self.PROGRAM, settle=2.0, timeout=10.0,
+                keep_keys=False, duration=None)
+            # The feeder's own connection is the same fake
+            with mock.patch.object(rmbench, "Redis", lambda _url: fake):
+                rows = rmbench.run_once(run, 0, args, fake, {"redis_version": "7", "host_cpus": 2})
+        return rows[0], fake
+
+    def test_fed_run_feeds_while_the_program_runs(self) -> None:
+        # 2000 at 20000/s: fed in about 0.1 s, nothing loaded before, every package counted
+        r, _ = self.run_fed(3.0, 2000, 20000)
+        self.assertEqual((r["status"], r["missing"]), ("ok", 0))
+        self.assertEqual((r["expected_total"], r["delivered_total"]), (2000, 2000))
+        self.assertEqual(r["reason"], "source drained before the time box")
+        # A box that closes while it feeds: only what was fed is expected, the feed stops
+        r, fake = self.run_fed(0.5, 900000, 1000)
+        self.assertEqual((r["status"], r["duration_s"], r["missing"]), ("ok", "0.5", 0))
+        fed = int(r["expected_total"])
+        self.assertGreater(fed, 300)
+        self.assertLess(fed, 1000)
+        self.assertEqual(sum(fake.lists.values()), 0)  # the run's keys removed: nothing pushed after
+
+    def test_fed_run_rate_starts_at_the_first_delivery(self) -> None:
+        # A program that delivers nothing for its first 40 polls: msg/s is what it
+        # delivered after its first delivery over the time since then, so it reads
+        # about 1 / (1 - 0.4) times what the whole window gives
+        class Late(FakeRedis):
+            polls = 0
+
+            def pipeline(self, cmds: list[list[object]]) -> list[object]:
+                if cmds and cmds[0][0] == "LLEN":
+                    self.polls += 1
+                    self.step = 0 if self.polls <= 40 else 100
+                return super().pipeline(cmds)
+
+        r, _ = self.run_fed(1.0, 900000, 20000, Late(step=0))
+        delivered_w = float(r["mib_s"]) * 1048576 / 200 * float(r["drain_s"])
+        whole = delivered_w / float(r["drain_s"])
+        self.assertGreater(float(r["msg_s"]), 1.2 * whole, r)
 
     def test_source_drained_before_the_box_is_a_drain_run(self) -> None:
         # MQF-2: 500 packages at 100 per poll drain in about 50 ms, long before the 3 s box.

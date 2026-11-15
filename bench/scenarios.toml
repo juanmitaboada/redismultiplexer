@@ -63,6 +63,23 @@ duration = 5
 count = 900000
 limits = "countdown"
 
+# Ordered output to a target 1 ms away (plan 9.6, M3R-14): the targets are reached through
+# the harness's delay proxy. The source is fed live at 6000 packages/s, above what 1.0.8
+# delivers there (about 1700/s with 8 children; with a backlog loaded first it delivers
+# about half that, so a preloaded run would understate it), and msg/s counts what reached
+# the target from the first delivery on (owner, P5). The feed stops at 18000 so that what
+# the slowest build popped (about 800 packages/s at the stage 4 tip) is flushed inside the
+# harness's 30 s stop wait; a build that keeps up drains before the box closes.
+[[scenario]]
+name = "fast_ordering_remote"
+tags = ["fast"]
+duration = 5
+count = 18000
+feed_rate = 6000
+children = 8
+ordering = true
+target_delay_ms = 1
+
 # --- quick: routine runs, under five minutes ---
 
 [[scenario]]
