@@ -2381,3 +2381,167 @@ fn a_reachable_target_connects_inline() {
     assert!(ensure_link(0, &mut target), "not connected inline");
     assert!(target.link.is_some());
 }
+
+#[test]
+fn chunks_hold_at_most_the_bound() {
+    // P3 = p3a: 1000 packages or 4 MiB of them, whichever comes first; a larger package alone
+    let small: Vec<Vec<u8>> = (0..2500).map(|i| vec![b'x'; 10 + i % 7]).collect();
+    let sizes: Vec<usize> = chunks(&small).iter().map(|c| c.len()).collect();
+    assert_eq!(sizes, vec![1000, 1000, 500]);
+    let mib = vec![vec![b'y'; 1 << 20]; 9];
+    let sizes: Vec<usize> = chunks(&mib).iter().map(|c| c.len()).collect();
+    assert_eq!(sizes, vec![4, 4, 1]);
+    let mixed = vec![vec![1u8; 10], vec![2u8; 5 << 20], vec![3u8; 10]];
+    let cut = chunks(&mixed);
+    assert_eq!(
+        cut.iter().map(|c| c.len()).collect::<Vec<_>>(),
+        vec![1, 1, 1]
+    );
+    assert_eq!(cut[1][0].len(), 5 << 20);
+    assert!(chunks(&[]).is_empty());
+    // Every package once, in order
+    let joined: Vec<&Vec<u8>> = chunks(&small).into_iter().flatten().collect();
+    assert!(joined.iter().zip(&small).all(|(a, b)| *a == b) && joined.len() == small.len());
+}
+
+#[test]
+fn a_package_counts_once_with_one_reason() {
+    // D4d-3 = a: failed before stuck before filtered; a taken package is outgoing
+    let cases = [
+        (true, false, false, "outgoing"),
+        (true, true, true, "outgoing"),
+        (false, true, true, "failed"),
+        (false, false, true, "failed"),
+        (false, true, false, "stuck"),
+        (false, false, false, "filtered"),
+    ];
+    for (delivered, stuck, failed, want) in cases {
+        let mut c = Counts::default();
+        account(delivered, &Why { stuck, failed }, &mut c);
+        let got = [
+            ("outgoing", c.outgoing),
+            ("failed", c.failed),
+            ("stuck", c.stuck),
+            ("filtered", c.filtered),
+        ];
+        let named: Vec<&str> = got
+            .iter()
+            .filter(|(_, n)| *n == 1)
+            .map(|(k, _)| *k)
+            .collect();
+        assert_eq!(
+            named,
+            vec![want],
+            "delivered {delivered} stuck {stuck} failed {failed}"
+        );
+        assert_eq!(c.dropped, u64::from(!delivered));
+    }
+}
+
+/// A stand-in target for the sender's chunks: +OK to anything but RPUSH; the RPUSHes are
+/// answered by `script` in turn (Some(reply) as given, None: no reply, and none after it)
+fn scripted_target(script: Vec<Option<&'static str>>) -> u16 {
+    use std::io::{BufRead, BufReader, Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    thread::spawn(move || {
+        let Some(Ok(stream)) = listener.incoming().next() else {
+            return;
+        };
+        let mut w = stream.try_clone().unwrap();
+        let mut r = BufReader::new(stream);
+        let mut script = script.into_iter();
+        let mut mute = false;
+        loop {
+            let mut line = String::new();
+            if r.read_line(&mut line).unwrap_or(0) == 0 {
+                return;
+            }
+            let n: usize = line.trim_start_matches('*').trim().parse().unwrap();
+            let mut args = Vec::new();
+            for _ in 0..n {
+                line.clear();
+                r.read_line(&mut line).unwrap();
+                let len: usize = line.trim_start_matches('$').trim().parse().unwrap();
+                let mut buf = vec![0; len + 2];
+                r.read_exact(&mut buf).unwrap();
+                buf.truncate(len);
+                args.push(buf);
+            }
+            let reply = if args[0].eq_ignore_ascii_case(b"RPUSH") {
+                match script.next().flatten() {
+                    Some(reply) if !mute => reply.to_string(),
+                    _ => {
+                        mute = true;
+                        continue;
+                    }
+                }
+            } else {
+                "+OK\r\n".to_string()
+            };
+            if w.write_all(reply.as_bytes()).is_err() {
+                return;
+            }
+        }
+    });
+    port
+}
+
+#[test]
+fn flush_target_reads_reply_by_reply_and_stops_at_a_broken_link() {
+    // Plan 9.2/9.3: an integer reply is taken, an error reply refused (that RPUSH only, the
+    // link kept), the first reply that does not come makes it and the rest unknown and
+    // drops the link
+    let port = scripted_target(vec![
+        Some(":1\r\n"),
+        Some("-WRONGTYPE Operation against a key holding the wrong kind of value\r\n"),
+        Some(":2\r\n"),
+        None,
+    ]);
+    let mut c = config();
+    c.clients[0].hostname = "127.0.0.1".into();
+    c.clients[0].port = port;
+    c.clients[0].command_timeout = Some(0.3);
+    let mut target = new_link(0, &c, &c.clients[0], &None);
+    assert!(ensure_link(0, &mut target));
+    for p in 0..5 {
+        append_rpush(&mut target.request, b"dst", format!("p{p}").as_bytes());
+        target.pending.push(p);
+    }
+    let t = Instant::now();
+    let (replies, error) = flush_target(&mut target);
+    assert_eq!(
+        replies,
+        vec![
+            (0, Reply::Taken),
+            (1, Reply::Refused),
+            (2, Reply::Taken),
+            (3, Reply::Unknown),
+            (4, Reply::Unknown)
+        ]
+    );
+    assert!(error.unwrap().contains("WRONGTYPE"));
+    // One command timeout for the whole tail, not one per reply
+    assert!(
+        t.elapsed() < Duration::from_millis(1500),
+        "{:?}",
+        t.elapsed()
+    );
+    assert!(
+        target.link.is_none(),
+        "the link is kept after a reply that never came"
+    );
+    assert!(target.pending.is_empty() && target.request.is_empty());
+}
+
+#[test]
+fn flush_target_without_a_link_refuses_without_writing() {
+    let c = config();
+    let mut target = new_link(0, &c, &c.clients[0], &None);
+    append_rpush(&mut target.request, b"dst", b"x");
+    target.pending.push(7);
+    let (replies, error) = flush_target(&mut target);
+    assert_eq!(replies, vec![(7, Reply::Refused)]);
+    assert_eq!(error.as_deref(), Some("not connected"));
+    assert!(target.request.is_empty());
+}

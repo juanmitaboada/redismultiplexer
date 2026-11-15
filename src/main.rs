@@ -186,7 +186,8 @@ struct RedisLink {
     packages: u64,                   // Packages we have seen from last check
     last_check: Option<Instant>,     // last check of the queue's size; None: never (L1a)
     filter: Option<Filter>,          // Client filter, compiled at start
-    request: Vec<u8>,                // RPUSH request buffer, reused for every package
+    request: Vec<u8>,                // RPUSH requests not written yet, reused for every package
+    pending: Vec<usize>,             // the sender: package (index in the chunk) of each request
     endpoint: Endpoint,              // where to connect, built once
     connecting: Option<Connecting>,  // an attempt running outside this thread (X1c)
     down_since: Option<Instant>,     // when it was last seen working, while it is down
@@ -1817,14 +1818,14 @@ fn sender(
         let mut counts = Counts::default();
         match turn {
             Some(batch) => {
-                for package in &batch {
-                    deliver(
+                for chunk in chunks(&batch) {
+                    deliver_chunk(
                         id,
                         &filters.root,
                         &config,
                         &mut clients,
                         &mut cursor,
-                        package,
+                        chunk,
                         &mut counts,
                     );
                 }
@@ -1909,6 +1910,7 @@ fn new_link(id: u16, config: &Config, client: &ClientConfig, filter: &Option<Fil
         last_check: None,
         filter: filter.clone(),
         request: Vec::new(),
+        pending: Vec::new(),
         endpoint: Endpoint::target(client).named(connection_name(
             &config.name,
             &client.name,
@@ -2051,9 +2053,15 @@ fn mark_down(client: &mut RedisLink) {
 /// A command error that leaves the connection unusable: an I/O error, or a timeout (the
 /// late reply would be read as the answer to the next command)
 fn link_broken(client: &mut RedisLink, e: &redis::RedisError) {
-    if e.is_io_error() || e.is_timeout() || e.is_unrecoverable_error() {
+    if breaks_link(e) {
         mark_down(client);
     }
+}
+
+/// An error after which the connection cannot be used: anything but a reply the server
+/// sent (an error reply keeps the link)
+fn breaks_link(e: &redis::RedisError) -> bool {
+    e.is_io_error() || e.is_timeout() || e.is_unrecoverable_error()
 }
 
 /// After a command error on a target: a broken connection is dropped and reconnected after
@@ -2670,6 +2678,11 @@ fn send_to_client(client: &mut RedisLink, data: &[u8]) -> Result<(), String> {
 /// command builder produces, without building a command
 fn pack_rpush(buf: &mut Vec<u8>, key: &[u8], value: &[u8]) {
     buf.clear();
+    append_rpush(buf, key, value);
+}
+
+/// `RPUSH key value` in RESP, added at the end of `buf` (the sender's chunk of requests)
+fn append_rpush(buf: &mut Vec<u8>, key: &[u8], value: &[u8]) {
     buf.extend_from_slice(b"*3\r\n$5\r\nRPUSH\r\n");
     for arg in [key, value] {
         // Writing into a Vec cannot fail
@@ -2864,26 +2877,215 @@ fn send(
     dirty_bdata: &[u8],
     deleted: &mut u64,
 ) -> Result<Sent, String> {
+    match prepare(id, client, dirty_bdata, deleted)? {
+        Prepared::Ready(bdata) => match send_to_client(client, &bdata) {
+            Ok(_) => Ok(Sent::Taken),
+            Err(e) => Err(format!("error while sending to the client: {}", e)),
+        },
+        Prepared::Not(sent) => Ok(sent),
+    }
+}
+
+/// What a target will do with a package before anything is sent: its filter and its
+/// limits (the LLEN of a check that is due, and any trim, run here)
+enum Prepared<'a> {
+    /// To be pushed: the package as the target's filter left it
+    Ready(Cow<'a, [u8]>),
+    /// Not for this target: Sent::Filtered or Sent::Stuck
+    Not(Sent),
+}
+
+fn prepare<'a>(
+    id: u16,
+    client: &mut RedisLink,
+    dirty_bdata: &'a [u8],
+    deleted: &mut u64,
+) -> Result<Prepared<'a>, String> {
     let bdata = match &client.filter {
         Some(f) => match f.apply(dirty_bdata) {
             Some(b) => b,
-            None => return Ok(Sent::Filtered),
+            None => return Ok(Prepared::Not(Sent::Filtered)),
         },
         None => Cow::Borrowed(dirty_bdata),
     };
     // If we can send to this queue
     match can_send(id, client, deleted) {
-        // Allowed to send
-        Ok(true) => match send_to_client(client, &bdata) {
-            Ok(_) => Ok(Sent::Taken),
-            Err(e) => Err(format!("error while sending to the client: {}", e)),
-        },
-
-        // Not allowed to send
-        Ok(false) => Ok(Sent::Stuck),
-
-        // There was an error
+        Ok(true) => Ok(Prepared::Ready(bdata)),
+        Ok(false) => Ok(Prepared::Not(Sent::Stuck)),
         Err(e) => Err(format!("error while checking queue: {}", e)),
+    }
+}
+
+/// The batch cut into chunks of at most CHUNK_PACKAGES packages and CHUNK_BYTES bytes of
+/// them (P3 = p3a); a package larger than CHUNK_BYTES goes alone
+fn chunks(batch: &[Vec<u8>]) -> Vec<&[Vec<u8>]> {
+    let mut out = Vec::new();
+    let (mut start, mut bytes) = (0, 0);
+    for (i, package) in batch.iter().enumerate() {
+        if i > start && (i - start == CHUNK_PACKAGES || bytes + package.len() > CHUNK_BYTES) {
+            out.push(&batch[start..i]);
+            (start, bytes) = (i, 0);
+        }
+        bytes += package.len();
+    }
+    if start < batch.len() {
+        out.push(&batch[start..]);
+    }
+    out
+}
+
+/// What a target said about one RPUSH written to it
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Reply {
+    /// An integer reply: the package is in the list
+    Taken,
+    /// An error reply, or never written: certainly not applied (P2)
+    Refused,
+    /// The link broke or timed out before its reply: it may or may not have been applied
+    /// (P1); never sent to this target again
+    Unknown,
+}
+
+/// Write what is pending for a target in one go and read one reply per RPUSH, in order
+/// (plan 9.2: `send_packed_command`, then `recv_response` reply by reply, not
+/// `req_packed_commands`, which reads on after an error). At the first read or write that
+/// fails with the link the rest are Unknown and the link is dropped: a late reply must
+/// never be read as the answer to another command. Returns (package, reply) in order, and
+/// the first error seen, for the error line.
+fn flush_target(client: &mut RedisLink) -> (Vec<(usize, Reply)>, Option<String>) {
+    let packages = std::mem::take(&mut client.pending);
+    if packages.is_empty() {
+        return (Vec::new(), None);
+    }
+    let mut out = Vec::with_capacity(packages.len());
+    let mut first_error: Option<String> = None;
+    let Some(conn) = client.link.as_mut() else {
+        client.request.clear();
+        let refused = packages.iter().map(|&p| (p, Reply::Refused)).collect();
+        return (refused, Some("not connected".to_string()));
+    };
+    let written = conn.send_packed_command(&client.request);
+    client.request.clear();
+    let mut broken: Option<redis::RedisError> = None;
+    match written {
+        Err(e) => broken = Some(e),
+        Ok(()) => {
+            for &p in &packages {
+                match conn.recv_response().and_then(|v| v.extract_error()) {
+                    Ok(_) => out.push((p, Reply::Taken)),
+                    // A server error reply comes over a working link (wrong type, out of
+                    // memory): this RPUSH only
+                    Err(e) if !breaks_link(&e) => {
+                        first_error
+                            .get_or_insert_with(|| format!("couldn't push to channel: {}", e));
+                        out.push((p, Reply::Refused))
+                    }
+                    Err(e) => {
+                        broken = Some(e);
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    if out.iter().any(|&(_, r)| r == Reply::Taken) {
+        client.backoff = TARGET_BACKOFF_MIN;
+    }
+    if let Some(e) = broken {
+        first_error.get_or_insert_with(|| format!("couldn't push to channel: {}", e));
+        let done = out.len();
+        out.extend(packages[done..].iter().map(|&p| (p, Reply::Unknown)));
+        link_broken(client, &e);
+        if done + 1 < packages.len() && client.link.is_some() {
+            // More replies were owed on a link whose stream is out of step: drop it
+            mark_down(client);
+        }
+    }
+    (out, first_error)
+}
+
+/// The sender's delivery of one chunk (plan 9.2), package by package in order: for each
+/// package the targets the mode selects, each through its filter and limits; what a
+/// target takes is added to its pending requests and written and read at once, so one
+/// RPUSH and one reply at a time. Counted as `deliver` counts.
+fn deliver_chunk(
+    id: u16,
+    root_filter: &Option<Filter>,
+    config: &Config,
+    clients: &mut [RedisLink],
+    cursor: &mut usize,
+    chunk: &[Vec<u8>],
+    counts: &mut Counts,
+) {
+    for (index, package) in chunk.iter().enumerate() {
+        let bdata = match root_filter {
+            Some(f) => f.apply(package),
+            None => Some(Cow::Borrowed(package.as_slice())),
+        };
+        let mut why = Why::default();
+        let deleted = &mut counts.deleted;
+        let mut attempt = |client: &mut RedisLink, bdata: &[u8]| {
+            if !ensure_link(id, client) {
+                note_skip(id, client);
+                if client
+                    .filter
+                    .as_ref()
+                    .is_none_or(|f| f.apply(bdata).is_some())
+                {
+                    why.failed = true;
+                }
+                return false;
+            }
+            let error = match prepare(id, client, bdata, deleted) {
+                Ok(Prepared::Ready(b)) => {
+                    append_rpush(&mut client.request, client.config.channel.as_bytes(), &b);
+                    client.pending.push(index);
+                    let (replies, error) = flush_target(client);
+                    if replies.first().is_some_and(|&(_, r)| r == Reply::Taken) {
+                        return true;
+                    }
+                    format!(
+                        "error while sending to the client: {}",
+                        error.unwrap_or_default()
+                    )
+                }
+                Ok(Prepared::Not(Sent::Stuck)) => {
+                    why.stuck = true;
+                    return false;
+                }
+                Ok(Prepared::Not(_)) => return false,
+                Err(e) => e,
+            };
+            print_debug!(
+                PROGRAM_NAME,
+                stderr(),
+                COLOR_RED,
+                0,
+                "Error while sending to '{}:{}@{}': {}",
+                config.hostname,
+                config.port,
+                config.channel,
+                error
+            );
+            target_failed(client);
+            why.failed = true;
+            false
+        };
+        let delivered = match bdata {
+            None => false,
+            Some(bdata) => {
+                if config.mode == "replicant" {
+                    let mut sent = false;
+                    for client in clients.iter_mut() {
+                        sent |= attempt(client, &bdata);
+                    }
+                    sent
+                } else {
+                    spread(cursor, clients.len(), |i| attempt(&mut clients[i], &bdata)).is_some()
+                }
+            }
+        };
+        account(delivered, &why, counts);
     }
 }
 
@@ -2982,11 +3184,16 @@ fn deliver(
             }
         }
     };
+    account(delivered, &why, counts);
+}
+
+/// Count one package: outgoing when a target took it, else dropped with one reason
+/// (D4d-3 = a): filtered when no target accepted it, stuck when every target that
+/// accepted it was stuck, failed otherwise
+fn account(delivered: bool, why: &Why, counts: &mut Counts) {
     if delivered {
         counts.outgoing += 1;
     } else {
-        // One reason per package (D4d-3 = a): filtered when no target accepted it, stuck
-        // when every target that accepted it was stuck, failed otherwise
         counts.dropped += 1;
         if why.failed {
             counts.failed += 1;

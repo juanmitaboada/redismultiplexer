@@ -24,6 +24,10 @@ pub const START_POLL: Duration = Duration::from_millis(100);
 pub const BLPOP_WAIT: Duration = Duration::from_secs(1);
 pub const TARGET_BACKOFF_MIN: Duration = Duration::from_secs(1);
 pub const TARGET_BACKOFF_MAX: Duration = Duration::from_secs(5);
+// The sender delivers a released batch in chunks (plan 9.2, P3 = p3a): at most this many
+// packages and this many bytes of them per chunk; a larger package goes alone
+pub const CHUNK_PACKAGES: usize = 1000;
+pub const CHUNK_BYTES: usize = 4 << 20;
 
 // Autofields
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
