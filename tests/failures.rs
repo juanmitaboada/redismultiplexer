@@ -101,11 +101,51 @@ fn target_closes_mid_run(test: &str, cell: Cell) {
     ctx.wait_drained(&src, &[(&t0, need)]);
     p.stop(&ctx.pid_file());
     let t0_list = ctx.list(&t0);
-    if cell.spreader {
+    if cell.spreader && cell.ordering {
+        // C4b-1 = 1c's declared residual (plan 9.11.11): when the target closes while it is
+        // the last written in its chunk, its share of that chunk goes to t0 after t0's own,
+        // once. Which side of the turn the close falls on is chance, so t0 may hold one
+        // break of at most that share (half of a chunk of 1000 with two targets); the
+        // other target keeps its order, and every package is on exactly one target
+        assert_one_break_at_most(&t0_list, 500);
+        assert_one_break_at_most(&taken_by_other, 0);
+        let unordered = Cell {
+            ordering: false,
+            spreader: true,
+            children: 2,
+        };
+        assert_all(unordered, &[t0_list, taken_by_other], n);
+    } else if cell.spreader {
         assert_all(cell, &[t0_list, taken_by_other], n);
     } else {
         assert_all(cell, &[t0_list], n);
     }
+}
+
+/// At most one place where a package follows a later one, and at most `bound` packages
+/// placed after a later one there
+fn assert_one_break_at_most(list: &[String], bound: usize) {
+    let ts: Vec<u64> = list
+        .iter()
+        .map(|p| p[7..p.find(',').unwrap()].parse().unwrap())
+        .collect();
+    let breaks = ts.windows(2).filter(|w| w[0] > w[1]).count();
+    let mut top = 0;
+    let late = ts
+        .iter()
+        .filter(|&&t| {
+            let behind = t < top;
+            top = top.max(t);
+            behind
+        })
+        .count();
+    assert!(
+        breaks <= 1 && late <= bound,
+        "{} breaks, {} packages late (at most 1 and {})",
+        breaks,
+        late,
+        bound
+    );
 }
 
 /// A target refuses connections from the start: the healthy target receives everything,
@@ -943,6 +983,85 @@ matrix!(target_unreachable, target_unreachable_from_start, 2);
 matrix!(wrongtype, wrongtype_target, 2);
 matrix!(stop_target_down, stop_with_a_target_down, 4);
 matrix!(after_signal, push_after_the_signal, 2);
+matrix!(mute_target, mute_target_with_chunks, 2);
+
+/// M3R-33: a target that answers its handshake, PING and LLEN and never an RPUSH. With
+/// ordering every package is held until the stop (buffer 3600 s), so the stop flushes them
+/// all: the sender writes each chunk to both targets and reads the replies; the mute
+/// target's first reply never comes, so its chunk costs one command timeout (0.5 s here)
+/// and it goes down for its backoff while the rest goes to t0 (P6 = p6a: the stop takes
+/// the flush plus one command timeout per reconnect inside it). Every package reaches t0
+/// (replicant: in order; spreader: the unknown ones planned again for t0, P1 = p1b), and
+/// the two notice lines carry the number held. Ordering off: the workers' path, which
+/// pipelining does not touch, is checked the same way (t0 gets everything, the stop is
+/// prompt, no notice line).
+fn mute_target_with_chunks(test: &str, cell: Cell) {
+    let mute = SlowTarget::ambiguous(AfterPush::Mute);
+    let mut ctx = Ctx::new(test);
+    let src = ctx.key("src");
+    let t0 = ctx.key("t0");
+    let clients = [
+        ctx.client_yaml_at("mute", "rmtest:mute", mute.port) + SHORT_TIMEOUTS,
+        ctx.client_yaml("t0", &t0, ""),
+    ];
+    let extra = if cell.ordering {
+        "ordering: '\"ts\": *(?P<ts>\\d+),'\nordering_buffer_time: 3600\nordering_limit: 200\n"
+    } else {
+        ""
+    };
+    let cfg = ctx.config(&src, cell.children, cell.mode(), extra, &clients);
+    let mut p = ctx.spawn(&cfg);
+    let n: u64 = 3000;
+    let input: Vec<String> = (0..n).map(seq_pkg).collect();
+    ctx.push(&src, &input);
+    ctx.wait_for("the source drained", |c| c.llen(&src) == 0);
+    if !cell.ordering && !cell.spreader {
+        ctx.wait_for("every package at t0", |c| c.llen(&t0) == n as usize);
+    }
+    let t = Instant::now();
+    p.stop(&ctx.pid_file());
+    let stop = t.elapsed();
+    // The bound of P6 = p6a for this flush: one command timeout per reconnect inside it,
+    // here one (the flush to t0 is far shorter than the first backoff), plus margin for a
+    // loaded machine. A sender that waited the timeout once per package of a chunk would
+    // take minutes.
+    assert!(
+        stop < Duration::from_millis(3000),
+        "the stop took {:?}: {}",
+        stop,
+        p.stdout()
+    );
+    let at_t0 = ctx.list(&t0);
+    let mut sorted = at_t0.clone();
+    sorted.sort();
+    sorted.dedup();
+    assert_eq!(sorted.len(), at_t0.len(), "a package twice on t0");
+    let mut want = input.clone();
+    want.sort();
+    assert_eq!(sorted, want, "t0 does not hold every package");
+    if !cell.spreader {
+        assert_all(cell, std::slice::from_ref(&at_t0), n);
+    }
+    let mut recorded = mute.pushed();
+    let before = recorded.len();
+    recorded.sort();
+    recorded.dedup();
+    assert_eq!(recorded.len(), before, "a package twice on the mute target");
+    let out = p.stdout();
+    if cell.ordering {
+        let closing = format!("Closing: delivering {} held packages in order", n);
+        let flushed = format!("Flushed {} packages in ", n);
+        assert!(out.contains(&closing), "no '{}' line: {}", closing, out);
+        assert!(out.contains(&flushed), "no '{}' line: {}", flushed, out);
+        assert!(
+            out.contains(&format!("(delivered {}, dropped 0)", n)),
+            "{}",
+            out
+        );
+    } else {
+        assert!(!out.contains("Closing: delivering"), "{}", out);
+    }
+}
 
 /// With ordering, what the stop flushes towards targets that cannot be reached is counted
 /// as dropped and reaches the status file in the last write, after the stop; the program
@@ -976,6 +1095,18 @@ fn dropped_at_the_stop(test: &str, spreader: bool, children: u16) {
         );
     }
     assert!(p.stdout().contains("Dropped"), "{}", p.stdout());
+    // The notice of the stop's flush (P6 = p6a, 9.10.6): everything held, all dropped
+    let out = p.stdout();
+    assert!(
+        out.contains(&format!("Closing: delivering {} held packages in order", n)),
+        "{}",
+        out
+    );
+    assert!(
+        out.contains(&format!("(delivered 0, dropped {})", n)),
+        "{}",
+        out
+    );
 }
 
 #[test]

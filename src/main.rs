@@ -193,6 +193,7 @@ struct RedisLink {
     down_since: Option<Instant>,     // when it was last seen working, while it is down
     attempts: u32,                   // failed connects since it went down (S4-4)
     skip_noted: bool,                // the "not connected yet" line was printed (M3R-23)
+    failed_last: bool,               // the sender, spreader: a request failed in its last chunk
 }
 
 /// The result of a connect attempt that runs in its own short-lived thread, so a target
@@ -1814,11 +1815,27 @@ fn sender(
     // Nothing to deliver before the workers pop; at the stop finish() ends the wait
     let mut clients = new_targets(id, &config, &filters, || buffer.finished());
     let mut cursor: usize = 0;
+    // The stop's flush: when it began, how many it had to deliver, delivered, dropped
+    let mut flush: Option<(Instant, usize, u64, u64)> = None;
     send_ordered(buffer, hold, |turn| {
         let mut counts = Counts::default();
         match turn {
             Some(batch) => {
-                for chunk in chunks(&batch) {
+                // The first batch after finish(): say that the program is closing and what
+                // it still delivers (P6 = p6a: the stop takes the flush, 9.10.6)
+                if flush.is_none() && buffer.finished() {
+                    let held = batch.len() + buffer.len();
+                    print_debug!(
+                        PROGRAM_NAME,
+                        stdout(),
+                        COLOR_YELLOW,
+                        0,
+                        "Closing: delivering {} held packages in order",
+                        held
+                    );
+                    flush = Some((Instant::now(), held, 0, 0));
+                }
+                for chunk in chunks(&batch, CHUNK_PACKAGES) {
                     deliver_chunk(
                         id,
                         &filters.root,
@@ -1833,8 +1850,25 @@ fn sender(
             // Nothing for a second: the idle path, as a worker's
             None => refresh(id, &mut clients, &mut counts.deleted),
         }
+        if let Some((_, _, delivered, dropped)) = flush.as_mut() {
+            *delivered += counts.outgoing;
+            *dropped += counts.dropped;
+        }
         report(worker_slot(&stats, id), &clients, &mut counts);
     });
+    if let Some((since, held, delivered, dropped)) = flush {
+        print_debug!(
+            PROGRAM_NAME,
+            stdout(),
+            COLOR_YELLOW,
+            0,
+            "Flushed {} packages in {:.1} s (delivered {}, dropped {})",
+            held,
+            since.elapsed().as_secs_f64(),
+            delivered,
+            dropped
+        );
+    }
 }
 
 /// One link per target, in configuration order, each with its compiled filter; every
@@ -1920,6 +1954,7 @@ fn new_link(id: u16, config: &Config, client: &ClientConfig, filter: &Option<Fil
         down_since: None,
         attempts: 0,
         skip_noted: false,
+        failed_last: false,
     }
 }
 
@@ -2916,13 +2951,13 @@ fn prepare<'a>(
     }
 }
 
-/// The batch cut into chunks of at most CHUNK_PACKAGES packages and CHUNK_BYTES bytes of
-/// them (P3 = p3a); a package larger than CHUNK_BYTES goes alone
-fn chunks(batch: &[Vec<u8>]) -> Vec<&[Vec<u8>]> {
+/// The batch cut into chunks of at most `max` packages and CHUNK_BYTES bytes of them
+/// (P3 = p3a); a package larger than CHUNK_BYTES goes alone
+fn chunks(batch: &[Vec<u8>], max: usize) -> Vec<&[Vec<u8>]> {
     let mut out = Vec::new();
     let (mut start, mut bytes) = (0, 0);
     for (i, package) in batch.iter().enumerate() {
-        if i > start && (i - start == CHUNK_PACKAGES || bytes + package.len() > CHUNK_BYTES) {
+        if i > start && (i - start == max || bytes + package.len() > CHUNK_BYTES) {
             out.push(&batch[start..i]);
             (start, bytes) = (i, 0);
         }
@@ -2946,30 +2981,54 @@ enum Reply {
     Unknown,
 }
 
-/// Write what is pending for a target in one go and read one reply per RPUSH, in order
-/// (plan 9.2: `send_packed_command`, then `recv_response` reply by reply, not
-/// `req_packed_commands`, which reads on after an error). At the first read or write that
-/// fails with the link the rest are Unknown and the link is dropped: a late reply must
-/// never be read as the answer to another command. Returns (package, reply) in order, and
-/// the first error seen, for the error line.
-fn flush_target(client: &mut RedisLink) -> (Vec<(usize, Reply)>, Option<String>) {
-    let packages = std::mem::take(&mut client.pending);
-    if packages.is_empty() {
-        return (Vec::new(), None);
+/// How the write of a target's pending requests went
+enum Written {
+    /// Nothing was pending
+    Nothing,
+    Done,
+    /// No link: nothing was written, the requests are certainly not applied
+    NotConnected,
+    /// The write failed: some requests may have reached the server, so all are unknown
+    Broken(redis::RedisError),
+}
+
+/// Write what is pending for a target in one go (`send_packed_command`); the replies are
+/// read by read_pending()
+fn write_pending(client: &mut RedisLink) -> Written {
+    if client.pending.is_empty() {
+        return Written::Nothing;
     }
+    let result = match client.link.as_mut() {
+        None => Written::NotConnected,
+        Some(conn) => match conn.send_packed_command(&client.request) {
+            Ok(()) => Written::Done,
+            Err(e) => Written::Broken(e),
+        },
+    };
+    client.request.clear();
+    result
+}
+
+/// Read one reply per RPUSH written, in order (plan 9.2: `recv_response` reply by reply,
+/// not `req_packed_commands`, which reads on after an error, so a target that stops
+/// answering would cost the read timeout once per pending reply). At the first read or
+/// write that fails with the link the rest are Unknown and the link is dropped: a late
+/// reply must never be read as the answer to another command. Returns (package, reply) in
+/// order, and the first error seen, for the error line.
+fn read_pending(client: &mut RedisLink, written: Written) -> (Vec<(usize, Reply)>, Option<String>) {
+    let packages = std::mem::take(&mut client.pending);
     let mut out = Vec::with_capacity(packages.len());
     let mut first_error: Option<String> = None;
-    let Some(conn) = client.link.as_mut() else {
-        client.request.clear();
-        let refused = packages.iter().map(|&p| (p, Reply::Refused)).collect();
-        return (refused, Some("not connected".to_string()));
-    };
-    let written = conn.send_packed_command(&client.request);
-    client.request.clear();
     let mut broken: Option<redis::RedisError> = None;
     match written {
-        Err(e) => broken = Some(e),
-        Ok(()) => {
+        Written::Nothing => return (out, None),
+        Written::NotConnected => {
+            out.extend(packages.iter().map(|&p| (p, Reply::Refused)));
+            return (out, Some("not connected".to_string()));
+        }
+        Written::Broken(e) => broken = Some(e),
+        Written::Done => {
+            let conn = client.link.as_mut().expect("written over this link");
             for &p in &packages {
                 match conn.recv_response().and_then(|v| v.extract_error()) {
                     Ok(_) => out.push((p, Reply::Taken)),
@@ -3004,10 +3063,52 @@ fn flush_target(client: &mut RedisLink) -> (Vec<(usize, Reply)>, Option<String>)
     (out, first_error)
 }
 
-/// The sender's delivery of one chunk (plan 9.2), package by package in order: for each
-/// package the targets the mode selects, each through its filter and limits; what a
-/// target takes is added to its pending requests and written and read at once, so one
-/// RPUSH and one reply at a time. Counted as `deliver` counts.
+/// Write what is pending for a target and read its replies at once
+fn flush_target(client: &mut RedisLink) -> (Vec<(usize, Reply)>, Option<String>) {
+    let written = write_pending(client);
+    read_pending(client, written)
+}
+
+/// Whether a target's next prepare() runs a limits check (an LLEN): only a target with a
+/// hardlimit has limits (M3F-7)
+fn check_due(client: &RedisLink) -> bool {
+    client.config.hardlimit.is_some()
+        && can_check_queue(
+            client.config.timelimit,
+            client.config.checklimit,
+            client.packages,
+            client.last_check,
+            Instant::now(),
+        )
+}
+
+/// What the sender knows of each package of a chunk while it delivers it
+struct ChunkState {
+    targets: usize,
+    taken: Vec<bool>,
+    why: Vec<Why>,
+    /// package x target: planned there, or that target could not take it (never again)
+    tried: Vec<bool>,
+    /// spreader: packages to plan again for another target (P1 = p1b, P2 = p2a)
+    replan: Vec<usize>,
+    replicant: bool,
+}
+
+/// The sender's delivery of one chunk, pipelined (plan 9.2, 9.3; M3R-14 = R14a):
+/// - plan: for each package in order, the targets the mode selects, each through its
+///   link (looked at once per target and pass), its filter and its limits; what a target
+///   can take is added to its pending requests. A limits check that is due first writes
+///   and reads what is pending for that target, so the length it reads includes them
+///   (P4 = p4a).
+/// - replicant: every target's requests in one write each, before any reply is read, so
+///   the round trips overlap; then the replies, reply by reply per target (read_pending).
+///   A package a target refused (P2) or whose outcome is unknown (P1 = p1b) counts failed
+///   for that target and is never sent to it again.
+/// - spreader: spread_chunk (C4b-1 = 1c).
+/// - count: outgoing when a target took it, else dropped with one reason (account).
+///
+/// Within one target the requests run in the order written and a chunk is written only
+/// after the previous one was read, so the order holds at every target.
 fn deliver_chunk(
     id: u16,
     root_filter: &Option<Filter>,
@@ -3017,76 +3118,250 @@ fn deliver_chunk(
     chunk: &[Vec<u8>],
     counts: &mut Counts,
 ) {
-    for (index, package) in chunk.iter().enumerate() {
-        let bdata = match root_filter {
+    let n = chunk.len();
+    let targets = clients.len();
+    let data: Vec<Option<Cow<[u8]>>> = chunk
+        .iter()
+        .map(|package| match root_filter {
             Some(f) => f.apply(package),
             None => Some(Cow::Borrowed(package.as_slice())),
-        };
-        let mut why = Why::default();
-        let deleted = &mut counts.deleted;
-        let mut attempt = |client: &mut RedisLink, bdata: &[u8]| {
-            if !ensure_link(id, client) {
-                note_skip(id, client);
-                if client
-                    .filter
-                    .as_ref()
-                    .is_none_or(|f| f.apply(bdata).is_some())
-                {
-                    why.failed = true;
-                }
-                return false;
+        })
+        .collect();
+    let mut st = ChunkState {
+        targets,
+        taken: vec![false; n],
+        why: (0..n).map(|_| Why::default()).collect(),
+        tried: vec![false; n * targets],
+        replan: Vec::new(),
+        replicant: config.mode == "replicant",
+    };
+    let todo: Vec<usize> = (0..n).filter(|&p| data[p].is_some()).collect();
+    if st.replicant {
+        let mut up: Vec<Option<bool>> = vec![None; targets];
+        for &p in &todo {
+            let bdata = data[p].as_deref().unwrap_or_default();
+            for (t, client) in clients.iter_mut().enumerate() {
+                plan(id, config, client, t, p, bdata, &mut up[t], &mut st, counts);
             }
-            let error = match prepare(id, client, bdata, deleted) {
-                Ok(Prepared::Ready(b)) => {
-                    append_rpush(&mut client.request, client.config.channel.as_bytes(), &b);
-                    client.pending.push(index);
-                    let (replies, error) = flush_target(client);
-                    if replies.first().is_some_and(|&(_, r)| r == Reply::Taken) {
-                        return true;
-                    }
-                    format!(
-                        "error while sending to the client: {}",
-                        error.unwrap_or_default()
-                    )
-                }
-                Ok(Prepared::Not(Sent::Stuck)) => {
-                    why.stuck = true;
-                    return false;
-                }
-                Ok(Prepared::Not(_)) => return false,
-                Err(e) => e,
-            };
-            print_debug!(
-                PROGRAM_NAME,
-                stderr(),
-                COLOR_RED,
-                0,
-                "Error while sending to '{}:{}@{}': {}",
-                config.hostname,
-                config.port,
-                config.channel,
-                error
-            );
-            target_failed(client);
-            why.failed = true;
-            false
-        };
-        let delivered = match bdata {
-            None => false,
-            Some(bdata) => {
-                if config.mode == "replicant" {
-                    let mut sent = false;
-                    for client in clients.iter_mut() {
-                        sent |= attempt(client, &bdata);
-                    }
-                    sent
-                } else {
-                    spread(cursor, clients.len(), |i| attempt(&mut clients[i], &bdata)).is_some()
-                }
-            }
-        };
-        account(delivered, &why, counts);
+        }
+        // Every target's requests first, then the replies
+        let written: Vec<Written> = clients.iter_mut().map(write_pending).collect();
+        for (client, w) in clients.iter_mut().zip(written) {
+            let (replies, error) = read_pending(client, w);
+            settle(config, client, replies, error, &mut st);
+        }
+    } else {
+        spread_chunk(id, config, clients, cursor, &data, &todo, &mut st, counts);
     }
+    for (taken, why) in st.taken.iter().zip(&st.why) {
+        account(*taken, why, counts);
+    }
+}
+
+/// Spreader's delivery of one chunk (C4b-1 = 1c, plan 9.11.6). Each package gets a first
+/// target round robin from the cursor. The targets are then written and read one after
+/// another, in the turn's order from the cursor, first the targets with no link, with a
+/// filter or that did not take every package of their last chunk. Before a target is written, the
+/// packages that earlier targets of this chunk could not take (filter, limits, no link)
+/// or refused or never answered (P2 = p2a, P1 = p1b) join its own, in release order, so
+/// they take their place in its order. Never sent to a target twice. What is left once
+/// every target was written goes, in another pass, to a target that already got later
+/// packages of this chunk: the one place where the order at a target breaks. That needs a
+/// target with a link and no filter that took all of its last chunk to stop taking
+/// packages in this one (an error or no reply, its link lost, its limits) while it is the
+/// last written (or every target after it was tried already); the break is at most its
+/// share of one chunk, once: from the next chunk on it is written first.
+#[allow(clippy::too_many_arguments)]
+fn spread_chunk(
+    id: u16,
+    config: &Config,
+    clients: &mut [RedisLink],
+    cursor: &mut usize,
+    data: &[Option<Cow<[u8]>>],
+    todo: &[usize],
+    st: &mut ChunkState,
+    counts: &mut Counts,
+) {
+    let targets = clients.len();
+    // Each link looked at once before the first pass, so a target with none goes first
+    let mut up: Vec<Option<bool>> = clients
+        .iter_mut()
+        .map(|client| {
+            let ok = ensure_link(id, client);
+            if !ok {
+                note_skip(id, client);
+            }
+            Some(ok)
+        })
+        .collect();
+    let mut order: Vec<usize> = (0..targets).map(|k| (*cursor + k) % targets).collect();
+    // The targets that may not take every package go first: their refusals then join the
+    // others' own. Stable: each group keeps the cursor's order
+    order.sort_by_key(|&t| {
+        !(clients[t].failed_last || up[t] == Some(false) || clients[t].filter.is_some())
+    });
+    let mut own: Vec<Vec<usize>> = vec![Vec::new(); targets];
+    for (k, &p) in todo.iter().enumerate() {
+        own[(*cursor + k) % targets].push(p);
+    }
+    *cursor = (*cursor + todo.len()) % targets;
+    let mut carried: Vec<usize> = Vec::new();
+    loop {
+        for &t in &order {
+            let (mut list, mut rest): (Vec<usize>, Vec<usize>) =
+                carried.drain(..).partition(|&p| !st.tried[p * targets + t]);
+            list.append(&mut own[t]);
+            if list.is_empty() {
+                carried = rest;
+                continue;
+            }
+            // Release order: a chunk is in release order, so its index is
+            list.sort_unstable();
+            let before = rest.len();
+            for p in list {
+                let bdata = data[p].as_deref().unwrap_or_default();
+                if !plan(
+                    id,
+                    config,
+                    &mut clients[t],
+                    t,
+                    p,
+                    bdata,
+                    &mut up[t],
+                    st,
+                    counts,
+                ) {
+                    rest.push(p);
+                }
+            }
+            let written = write_pending(&mut clients[t]);
+            let (replies, error) = read_pending(&mut clients[t], written);
+            settle(config, &mut clients[t], replies, error, st);
+            // Anything it did not take (plan refused it, or settle and a flush before a
+            // limits check put it in st.replan) makes it go first in the next chunk
+            clients[t].failed_last = rest.len() > before || !st.replan.is_empty();
+            rest.append(&mut st.replan);
+            rest.sort_unstable();
+            carried = rest;
+        }
+        // Another pass for what some target was not tried for yet
+        carried.retain(|&p| !st.taken[p] && (0..targets).any(|t| !st.tried[p * targets + t]));
+        if carried.is_empty() {
+            break;
+        }
+        up = vec![None; targets];
+    }
+}
+
+/// Plan package `p` for target `t`; true when it was added to the target's pending
+/// requests
+fn plan(
+    id: u16,
+    config: &Config,
+    client: &mut RedisLink,
+    t: usize,
+    p: usize,
+    bdata: &[u8],
+    up: &mut Option<bool>,
+    st: &mut ChunkState,
+    counts: &mut Counts,
+) -> bool {
+    st.tried[p * st.targets + t] = true;
+    let accepts = |client: &RedisLink| {
+        client
+            .filter
+            .as_ref()
+            .is_none_or(|f| f.apply(bdata).is_some())
+    };
+    let alive = *up.get_or_insert_with(|| {
+        let ok = ensure_link(id, client);
+        if !ok {
+            note_skip(id, client);
+        }
+        ok
+    });
+    if !alive {
+        // Failed only if its filter would have taken it (D4d-3 = a)
+        if accepts(client) {
+            st.why[p].failed = true;
+        }
+        return false;
+    }
+    // P4 = p4a: a limits check that is due reads what is pending first, so the length it
+    // sees includes every package sent before, as with one RPUSH at a time
+    if !client.pending.is_empty() && check_due(client) {
+        let (replies, error) = flush_target(client);
+        settle(config, client, replies, error, st);
+        if client.link.is_none() {
+            *up = Some(false);
+            if accepts(client) {
+                st.why[p].failed = true;
+            }
+            return false;
+        }
+    }
+    match prepare(id, client, bdata, &mut counts.deleted) {
+        Ok(Prepared::Ready(b)) => {
+            append_rpush(&mut client.request, client.config.channel.as_bytes(), &b);
+            client.pending.push(p);
+            true
+        }
+        Ok(Prepared::Not(Sent::Stuck)) => {
+            st.why[p].stuck = true;
+            false
+        }
+        Ok(Prepared::Not(_)) => false,
+        Err(e) => {
+            send_error(config, &e);
+            target_failed(client);
+            if client.link.is_none() {
+                *up = Some(false);
+            }
+            st.why[p].failed = true;
+            false
+        }
+    }
+}
+
+/// The replies of one target's requests: taken, or failed for it; spreader plans a
+/// package again for another target. One error line per target and flush, not per package.
+fn settle(
+    config: &Config,
+    client: &mut RedisLink,
+    replies: Vec<(usize, Reply)>,
+    error: Option<String>,
+    st: &mut ChunkState,
+) {
+    if let Some(e) = error {
+        send_error(config, &format!("error while sending to the client: {}", e));
+        target_failed(client);
+    }
+    for (p, reply) in replies {
+        match reply {
+            Reply::Taken => st.taken[p] = true,
+            Reply::Refused | Reply::Unknown => {
+                st.why[p].failed = true;
+                if !st.replicant {
+                    st.replan.push(p);
+                }
+            }
+        }
+    }
+}
+
+/// The error line of a failed delivery (it names the source, as 1.0.8 did)
+fn send_error(config: &Config, error: &str) {
+    print_debug!(
+        PROGRAM_NAME,
+        stderr(),
+        COLOR_RED,
+        0,
+        "Error while sending to '{}:{}@{}': {}",
+        config.hostname,
+        config.port,
+        config.channel,
+        error
+    );
 }
 
 /// Timestamp of a package for ordering: the named group `ts` of the ordering regex, looked

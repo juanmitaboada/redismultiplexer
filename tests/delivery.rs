@@ -64,36 +64,42 @@ matrix!(status_file_counts_every_package, status_counts, 2);
 
 /// The breakdown of `drop` (M3-e = ea, D4d-3 = a), over the matrix: packages the root
 /// filter refuses are `filtered`; those only a stuck target accepts are `stuck`; those only a
-/// target that is down accepts are `failed`; the rest delivered. The last write (after the
-/// stop) carries the counts since the start, the stuck and the down targets, the version.
+/// target that is down accepts are `failed`; the rest delivered. A package that both the
+/// stuck and the down target accept is `failed` (failed wins, D4d-3 = a), and one that only
+/// a target answering errors accepts is `failed` (M3R-39). The last write (after the stop) carries
+/// the counts since the start, the stuck and the down targets, the version.
 fn status_breakdown(test: &str, cell: Cell) {
     let mut ctx = Ctx::new(test);
     let src = ctx.key("src");
     let healthy = ctx.key("t0");
     let full = ctx.key("t1");
     ctx.push(&full, &packages("old", 10));
+    let refusing = ctx.key("t3");
+    let _: () = ctx.cmd(&["SET", &refusing, "not a list"]);
     let down = closed_port();
     let limits = "    timelimit: 1\n    checklimit: 1\n    softlimit: 2\n    hardlimit: 5\n";
     let clients = [
         ctx.client_yaml("t0", &healthy, "    filter: '^k'\n"),
-        ctx.client_yaml("t1", &full, &format!("    filter: '^s'\n{}", limits)),
+        ctx.client_yaml("t1", &full, &format!("    filter: '^(s|b)'\n{}", limits)),
         format!(
-            "  - name: 't2'\n    ssl: false\n    hostname: '127.0.0.1'\n    port: {}\n    password: ''\n    channel: 'rmtest:down'\n    filter: '^d'\n{}",
+            "  - name: 't2'\n    ssl: false\n    hostname: '127.0.0.1'\n    port: {}\n    password: ''\n    channel: 'rmtest:down'\n    filter: '^(d|b)'\n{}",
             down, SHORT_TIMEOUTS
         ),
+        ctx.client_yaml("t3", &refusing, "    filter: '^e'\n"),
     ];
-    // k: delivered; s: only the stuck target; d: only the down one; x: the root filter
+    // k: delivered; s: only the stuck target; d: only the down one; x: the root filter;
+    // b: the stuck and the down target; e: only the target that answers errors
     let mut input = Vec::new();
-    for (i, kind) in ["k", "s", "d", "x", "k", "k"]
+    for (i, kind) in ["k", "s", "d", "x", "k", "k", "b", "e"]
         .iter()
         .cycle()
-        .take(600)
+        .take(800)
         .enumerate()
     {
         input.push(format!("{}{}", kind, seq_pkg(i as u64)));
     }
     ctx.push(&src, &input);
-    let root = format!("filter: '^(k|s|d)'\n{}", cell.extra());
+    let root = format!("filter: '^(k|s|d|b|e)'\n{}", cell.extra());
     let cfg = ctx.config(&src, cell.children, cell.mode(), &root, &clients);
     let mut p = ctx.spawn(&cfg);
     ctx.wait_for("the source drained", |c| {
@@ -117,7 +123,7 @@ fn status_breakdown(test: &str, cell: Cell) {
             n("stuck"),
             n("failed")
         ],
-        [600, 300, 300, 100, 100, 100],
+        [800, 300, 500, 100, 100, 300],
         "{}",
         status
     );
@@ -134,6 +140,8 @@ fn status_breakdown(test: &str, cell: Cell) {
     assert_eq!(names("down_targets"), vec!["t2:rmtest:down".to_string()]);
     assert_eq!(status["version"], env!("CARGO_PKG_VERSION"));
     assert_eq!(status["queue"], 0);
+    let still: String = ctx.cmd(&["GET", &refusing]);
+    assert_eq!(still, "not a list", "the refusing target took packages");
     // The last interval's breakdown sums to its drop, as every interval's does
     let t = |k: &str| status[k].as_u64().unwrap();
     assert_eq!(
@@ -143,6 +151,56 @@ fn status_breakdown(test: &str, cell: Cell) {
 }
 
 matrix!(status_drop_breakdown, status_breakdown, 2);
+
+/// The status file's `queue` is what the ordering buffer holds when it is written (M3R-39):
+/// a buffer time far above the 10 s between writes keeps every package in it
+#[test]
+fn status_queue_counts_the_held_packages() {
+    let mut ctx = Ctx::new("status_queue_held");
+    let src = ctx.key("src");
+    let t0 = ctx.key("t0");
+    let n = 40;
+    let input: Vec<String> = (0..n).map(seq_pkg).collect();
+    let extra =
+        "ordering: '\"ts\": *(?P<ts>\\d+),'\nordering_buffer_time: 120\nordering_limit: 200\n";
+    let cfg = ctx.config(
+        &src,
+        2,
+        "replicant",
+        extra,
+        &[ctx.client_yaml("t0", &t0, "")],
+    );
+    let mut p = ctx.spawn(&cfg);
+    ctx.push(&src, &input);
+    ctx.wait_for("the source drained", |c| c.llen(&src) == 0);
+    let status = ctx.dir.join("rm.status");
+    let queue = || -> u64 {
+        std::fs::read_to_string(&status)
+            .ok()
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+            .and_then(|v| v["queue"].as_u64())
+            .unwrap_or(0)
+    };
+    // The next write (at most 10 s away) sees the packages held
+    let start = std::time::Instant::now();
+    while queue() != n && start.elapsed() < std::time::Duration::from_secs(25) {
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    assert_eq!(
+        queue(),
+        n,
+        "queue in {:?}",
+        std::fs::read_to_string(&status)
+    );
+    assert_eq!(ctx.llen(&t0), 0, "released before the buffer time");
+    p.stop(&ctx.pid_file());
+    assert_eq!(
+        ctx.list(&t0),
+        input,
+        "not every held package at the stop, in order"
+    );
+    assert_eq!(queue(), 0);
+}
 
 /// Every target gets every package on every delivery path (project rule, M3R-12), in
 /// source order where the cell keeps it.

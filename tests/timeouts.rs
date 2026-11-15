@@ -228,6 +228,43 @@ fn sender_connect_timeout_key() {
 }
 
 #[test]
+fn sender_connect_timeout_above_the_default() {
+    // M3R-39: a key above the 2 s default gives a lower bound that does not depend on
+    // load. The worker and the sender each try the target that never connects (one error
+    // line each); with the key neither line comes before 4 s, while a sender on the 2 s
+    // default prints its own at 2 s
+    let hole = blackhole();
+    let mut ctx = Ctx::new("sender_ct_above");
+    let src = ctx.key("src");
+    let t0 = ctx.key("t0");
+    let clients = [
+        ctx.client_yaml_at("hole", "rmtest:hole", hole.port) + "    connect_timeout: 4\n",
+        ctx.client_yaml("t0", &t0, ""),
+    ];
+    let cfg = ctx.config(&src, 1, "replicant", ORDERING_1S, &clients);
+    let start = Instant::now();
+    let mut p = ctx.spawn(&cfg);
+    ctx.push(&src, &[seq_pkg(1)]);
+    let lines = |p: &Proc| p.stderr().matches("Error while connecting").count();
+    let mut first = None;
+    while lines(&p) < 2 && start.elapsed() < Duration::from_secs(10) {
+        if first.is_none() && lines(&p) > 0 {
+            first = Some(start.elapsed());
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    let first = first.unwrap_or_else(|| start.elapsed());
+    ctx.wait_for("the package at the healthy target", |c| c.llen(&t0) == 1);
+    p.stop(&ctx.pid_file());
+    assert!(lines(&p) >= 2, "{}", p.stderr());
+    assert!(
+        first >= Duration::from_millis(3500),
+        "a connect error after {:?}",
+        first
+    );
+}
+
+#[test]
 fn sender_command_timeout_key() {
     let mute = SilentTarget::start();
     sender_honours_the_keys("sender_mt_key", mute.port);

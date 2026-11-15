@@ -2386,21 +2386,30 @@ fn a_reachable_target_connects_inline() {
 fn chunks_hold_at_most_the_bound() {
     // P3 = p3a: 1000 packages or 4 MiB of them, whichever comes first; a larger package alone
     let small: Vec<Vec<u8>> = (0..2500).map(|i| vec![b'x'; 10 + i % 7]).collect();
-    let sizes: Vec<usize> = chunks(&small).iter().map(|c| c.len()).collect();
+    let sizes: Vec<usize> = chunks(&small, CHUNK_PACKAGES)
+        .iter()
+        .map(|c| c.len())
+        .collect();
     assert_eq!(sizes, vec![1000, 1000, 500]);
     let mib = vec![vec![b'y'; 1 << 20]; 9];
-    let sizes: Vec<usize> = chunks(&mib).iter().map(|c| c.len()).collect();
+    let sizes: Vec<usize> = chunks(&mib, CHUNK_PACKAGES)
+        .iter()
+        .map(|c| c.len())
+        .collect();
     assert_eq!(sizes, vec![4, 4, 1]);
     let mixed = vec![vec![1u8; 10], vec![2u8; 5 << 20], vec![3u8; 10]];
-    let cut = chunks(&mixed);
+    let cut = chunks(&mixed, CHUNK_PACKAGES);
     assert_eq!(
         cut.iter().map(|c| c.len()).collect::<Vec<_>>(),
         vec![1, 1, 1]
     );
     assert_eq!(cut[1][0].len(), 5 << 20);
-    assert!(chunks(&[]).is_empty());
+    assert!(chunks(&[], CHUNK_PACKAGES).is_empty());
     // Every package once, in order
-    let joined: Vec<&Vec<u8>> = chunks(&small).into_iter().flatten().collect();
+    let joined: Vec<&Vec<u8>> = chunks(&small, CHUNK_PACKAGES)
+        .into_iter()
+        .flatten()
+        .collect();
     assert!(joined.iter().zip(&small).all(|(a, b)| *a == b) && joined.len() == small.len());
 }
 
@@ -2544,4 +2553,476 @@ fn flush_target_without_a_link_refuses_without_writing() {
     assert_eq!(replies, vec![(7, Reply::Refused)]);
     assert_eq!(error.as_deref(), Some("not connected"));
     assert!(target.request.is_empty());
+}
+
+/// How a recording stand-in answers RPUSH (the sender's chunk tests)
+#[derive(Clone, Copy, Debug)]
+enum Answer {
+    Int,
+    Error,
+    /// No reply, and the connection is read on (M3R-33)
+    Never,
+    /// No reply until this many RPUSHes have come, then all of them at once: a sender that
+    /// waits for each reply before it writes the next gets none
+    AfterAll(usize),
+    /// RPUSH answered, LLEN refused with an error reply
+    LlenError,
+    /// The connection closed at the first RPUSH, which is recorded and never answered
+    Close,
+}
+
+type Record = Arc<Mutex<Vec<(String, Vec<u8>)>>>;
+
+/// A stand-in target that records every command (name, last argument) in arrival order;
+/// +OK to anything but RPUSH and LLEN (0)
+fn recording_target(answer: Answer) -> (u16, Record) {
+    use std::io::{BufRead, BufReader, Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let record: Record = Arc::new(Mutex::new(Vec::new()));
+    let rec = record.clone();
+    thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            let rec = rec.clone();
+            thread::spawn(move || {
+                let mut w = stream.try_clone().unwrap();
+                let mut r = BufReader::new(stream);
+                let mut queued = 0;
+                loop {
+                    let mut line = String::new();
+                    if r.read_line(&mut line).unwrap_or(0) == 0 {
+                        return;
+                    }
+                    let Ok(n) = line.trim_start_matches('*').trim().parse::<usize>() else {
+                        return;
+                    };
+                    let mut args = Vec::new();
+                    for _ in 0..n {
+                        line.clear();
+                        r.read_line(&mut line).unwrap();
+                        let len: usize = line.trim_start_matches('$').trim().parse().unwrap();
+                        let mut buf = vec![0; len + 2];
+                        r.read_exact(&mut buf).unwrap();
+                        buf.truncate(len);
+                        args.push(buf);
+                    }
+                    let cmd = String::from_utf8_lossy(&args[0]).to_ascii_uppercase();
+                    rec.lock()
+                        .unwrap()
+                        .push((cmd.clone(), args.last().unwrap().clone()));
+                    let reply = match (cmd.as_str(), answer) {
+                        ("LLEN", Answer::LlenError) => "-ERR no length\r\n".to_string(),
+                        ("LLEN", _) => ":0\r\n".to_string(),
+                        ("RPUSH", Answer::LlenError) => ":1\r\n".to_string(),
+                        ("RPUSH", Answer::Int) => ":1\r\n".to_string(),
+                        ("RPUSH", Answer::Error) => "-ERR refused\r\n".to_string(),
+                        ("RPUSH", Answer::Never) => continue,
+                        ("RPUSH", Answer::Close) => return,
+                        ("RPUSH", Answer::AfterAll(k)) => {
+                            queued += 1;
+                            if queued < k {
+                                continue;
+                            }
+                            ":1\r\n".repeat(k)
+                        }
+                        _ => "+OK\r\n".to_string(),
+                    };
+                    if w.write_all(reply.as_bytes()).is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    (port, record)
+}
+
+/// The packages a recording stand-in got by RPUSH
+fn pushed_to(record: &Record) -> Vec<Vec<u8>> {
+    record
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(c, _)| c == "RPUSH")
+        .map(|(_, v)| v.clone())
+        .collect()
+}
+
+/// A configuration whose targets are the given local ports, with short timeouts
+fn chunk_config(mode: &str, ports: &[u16]) -> Config {
+    let mut c = config();
+    c.mode = mode.to_string();
+    c.clients = ports
+        .iter()
+        .enumerate()
+        .map(|(i, &port)| {
+            let mut t = client(&format!("t{i}"), &format!("dst{i}"));
+            t.hostname = "127.0.0.1".into();
+            t.port = port;
+            t.command_timeout = Some(0.3);
+            t
+        })
+        .collect();
+    c
+}
+
+fn connected_links(c: &Config) -> Vec<RedisLink> {
+    let mut links: Vec<RedisLink> = c.clients.iter().map(|t| new_link(1, c, t, &None)).collect();
+    for l in links.iter_mut() {
+        assert!(ensure_link(1, l), "not connected");
+    }
+    links
+}
+
+fn packages_n(n: usize) -> Vec<Vec<u8>> {
+    (0..n).map(|i| format!("pkg{i:04}").into_bytes()).collect()
+}
+
+#[test]
+fn a_chunk_is_written_before_its_replies_are_read() {
+    // M3R-14: the replies come only once the whole chunk was written; a sender that waits
+    // for each reply before the next RPUSH gets none and loses the chunk
+    let (port, record) = recording_target(Answer::AfterAll(10));
+    let c = chunk_config("replicant", &[port]);
+    let mut links = connected_links(&c);
+    let chunk = packages_n(10);
+    let mut counts = Counts::default();
+    deliver_chunk(1, &None, &c, &mut links, &mut 0, &chunk, &mut counts);
+    assert_eq!((counts.outgoing, counts.dropped), (10, 0));
+    assert_eq!(
+        pushed_to(&record),
+        chunk,
+        "not in order, or not every package"
+    );
+}
+
+#[test]
+fn spreader_plans_again_what_a_target_refused_or_never_answered() {
+    // P2 = p2a and P1 = p1b: a package refused by a target (error reply) or whose reply
+    // never came goes to the next target in another pass; never twice to one target
+    for answer in [Answer::Error, Answer::Never] {
+        let (bad, bad_rec) = recording_target(answer);
+        let (good, good_rec) = recording_target(Answer::Int);
+        let c = chunk_config("spreader", &[bad, good]);
+        let mut links = connected_links(&c);
+        let chunk = packages_n(10);
+        let mut counts = Counts::default();
+        let mut cursor = 0;
+        deliver_chunk(1, &None, &c, &mut links, &mut cursor, &chunk, &mut counts);
+        assert_eq!((counts.outgoing, counts.dropped), (10, 0));
+        let mut at_good = pushed_to(&good_rec);
+        at_good.sort();
+        assert_eq!(at_good, chunk, "the good target misses packages");
+        let at_bad = pushed_to(&bad_rec);
+        let mut unique = at_bad.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(unique.len(), at_bad.len(), "a package twice on one target");
+        // The first pass alternated: half of the chunk was planned for the bad target
+        assert_eq!(at_bad.len(), 5);
+    }
+}
+
+#[test]
+fn replicant_counts_an_unanswered_target_failed_and_never_resends_to_it() {
+    // P1 = p1b, replicant: the other target takes every package (outgoing); the one whose
+    // replies never came is not sent them again; its link is dropped
+    let (mute, mute_rec) = recording_target(Answer::Never);
+    let (good, _) = recording_target(Answer::Int);
+    let c = chunk_config("replicant", &[mute, good]);
+    let mut links = connected_links(&c);
+    let chunk = packages_n(10);
+    let mut counts = Counts::default();
+    deliver_chunk(1, &None, &c, &mut links, &mut 0, &chunk, &mut counts);
+    assert_eq!((counts.outgoing, counts.dropped), (10, 0));
+    assert_eq!(pushed_to(&mute_rec), chunk, "written once, in order");
+    assert!(links[0].link.is_none() && links[1].link.is_some());
+    // Every package lost on the only target: dropped as failed, once each
+    let (mute, _) = recording_target(Answer::Never);
+    let c = chunk_config("replicant", &[mute]);
+    let mut links = connected_links(&c);
+    let mut counts = Counts::default();
+    deliver_chunk(1, &None, &c, &mut links, &mut 0, &chunk, &mut counts);
+    assert_eq!(
+        (counts.outgoing, counts.dropped, counts.failed),
+        (0, 10, 10)
+    );
+}
+
+#[test]
+fn a_limits_check_reads_the_pending_requests_first() {
+    // P4 = p4a: a check that is due writes and reads what is pending for that target
+    // before its LLEN, so the length includes every package sent before. checklimit 3:
+    // a check every 3 packages; without the flush every LLEN would come before any RPUSH
+    let (port, record) = recording_target(Answer::Int);
+    let mut c = chunk_config("replicant", &[port]);
+    let t = &mut c.clients[0];
+    (t.timelimit, t.checklimit, t.softlimit, t.hardlimit) =
+        (Some(3600), Some(3), Some(50), Some(100));
+    let mut links = connected_links(&c);
+    let chunk = packages_n(10);
+    let mut counts = Counts::default();
+    deliver_chunk(1, &None, &c, &mut links, &mut 0, &chunk, &mut counts);
+    assert_eq!(counts.outgoing, 10);
+    let seq: Vec<String> = record
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(c, _)| c.clone())
+        .filter(|c| c == "RPUSH" || c == "LLEN")
+        .collect();
+    let llens: Vec<usize> = seq
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| *c == "LLEN")
+        .map(|(i, _)| i)
+        .collect();
+    assert!(llens.len() >= 3, "{seq:?}");
+    for (k, &at) in llens.iter().enumerate().skip(1) {
+        let before = seq[..at].iter().filter(|c| *c == "RPUSH").count();
+        assert!(
+            before >= 3 * k - 2,
+            "LLEN {k} after only {before} RPUSH: {seq:?}"
+        );
+    }
+}
+
+#[test]
+fn a_limits_check_that_fails_drops_the_package_as_failed() {
+    // A due LLEN refused by the target: that package is not sent there (failed), the
+    // others go on; a due LLEN whose flush finds the link gone: every package is failed
+    // there, and nothing hangs
+    for answer in [Answer::LlenError, Answer::Never] {
+        let (port, record) = recording_target(answer);
+        let mut c = chunk_config("replicant", &[port]);
+        let t = &mut c.clients[0];
+        (t.timelimit, t.checklimit, t.softlimit, t.hardlimit) =
+            (Some(3600), Some(3), Some(50), Some(100));
+        let mut links = connected_links(&c);
+        let chunk = packages_n(10);
+        let mut counts = Counts::default();
+        deliver_chunk(1, &None, &c, &mut links, &mut 0, &chunk, &mut counts);
+        let llens = record
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(c, _)| c == "LLEN")
+            .count() as u64;
+        match answer {
+            Answer::LlenError => {
+                assert!(llens >= 3, "{llens}");
+                assert_eq!((counts.dropped, counts.failed), (llens, llens));
+                assert_eq!(counts.outgoing, 10 - llens);
+            }
+            _ => assert_eq!(
+                (counts.outgoing, counts.dropped, counts.failed),
+                (0, 10, 10)
+            ),
+        }
+    }
+}
+
+/// Packages `from..from + n` as in packages_n
+fn packages_from(from: usize, n: usize) -> Vec<Vec<u8>> {
+    (from..from + n)
+        .map(|i| format!("pkg{i:04}").into_bytes())
+        .collect()
+}
+
+/// C4b-1 = 1c: spreader over three targets, the one at `bad` refusing every RPUSH
+/// (`Answer::Error`) or closing at the first (`Answer::Close`); two chunks of 30 packages
+/// from cursor 0, so the turn is t0, t1, t2. Returns what each good target got, by index
+fn spread_two_chunks(bad: usize, answer: Answer) -> (Vec<Vec<Vec<u8>>>, Counts) {
+    let stands: Vec<(u16, Record)> = (0..3)
+        .map(|t| recording_target(if t == bad { answer } else { Answer::Int }))
+        .collect();
+    let ports: Vec<u16> = stands.iter().map(|(p, _)| *p).collect();
+    let c = chunk_config("spreader", &ports);
+    let mut links = connected_links(&c);
+    let mut counts = Counts::default();
+    let mut cursor = 0;
+    for from in [0, 30] {
+        let chunk = packages_from(from, 30);
+        deliver_chunk(1, &None, &c, &mut links, &mut cursor, &chunk, &mut counts);
+    }
+    // Never twice to one target (P1 = p1b, P2 = p2a)
+    let at_bad = pushed_to(&stands[bad].1);
+    let mut unique = at_bad.clone();
+    unique.sort();
+    unique.dedup();
+    assert_eq!(
+        unique.len(),
+        at_bad.len(),
+        "a package twice on the failing target"
+    );
+    let got = stands
+        .iter()
+        .enumerate()
+        .map(|(t, (_, rec))| if t == bad { Vec::new() } else { pushed_to(rec) })
+        .collect();
+    (got, counts)
+}
+
+/// Every package 0..60 exactly once over the good targets
+fn every_package_once(got: &[Vec<Vec<u8>>]) {
+    let mut all: Vec<Vec<u8>> = got.concat();
+    all.sort();
+    assert_eq!(all, packages_from(0, 60), "not every package exactly once");
+}
+
+/// Places where a target got a package after a later one
+fn breaks(list: &[Vec<u8>]) -> usize {
+    list.windows(2).filter(|w| w[0] > w[1]).count()
+}
+
+#[test]
+fn spreader_keeps_the_order_when_a_target_before_the_last_fails() {
+    // 1c: the packages the failing target refused or never answered join the next
+    // targets' own before those are written, in release order: no break at any target
+    for answer in [Answer::Error, Answer::Close] {
+        for bad in [0, 1] {
+            let (got, counts) = spread_two_chunks(bad, answer);
+            every_package_once(&got);
+            assert_eq!((counts.outgoing, counts.dropped), (60, 0));
+            for (t, list) in got.iter().enumerate() {
+                assert_eq!(
+                    breaks(list),
+                    0,
+                    "target {t}, the failing one at {bad}: {list:?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn spreader_breaks_the_order_once_when_the_last_target_fails() {
+    // 1c's residual (plan 9.11.6, declared): the target written last in the turn fails,
+    // no target is left unwritten in that chunk, so its packages go in another pass to the
+    // first target of the turn, after that target's own share: one break there, at most
+    // the failing target's share of the chunk late. From the next chunk the failing
+    // target is written first (or it is down), so no break again
+    for answer in [Answer::Error, Answer::Close] {
+        let (got, counts) = spread_two_chunks(2, answer);
+        every_package_once(&got);
+        assert_eq!((counts.outgoing, counts.dropped), (60, 0));
+        assert_eq!(breaks(&got[1]), 0, "{:?}", got[1]);
+        let t0 = &got[0];
+        assert_eq!(breaks(t0), 1, "{t0:?}");
+        // The first chunk at t0: its own share (0, 3, ...) then t2's (2, 5, ...)
+        let first: Vec<Vec<u8>> = t0
+            .iter()
+            .filter(|p| p.as_slice() < b"pkg0030".as_slice())
+            .cloned()
+            .collect();
+        let own: Vec<Vec<u8>> = (0..30)
+            .step_by(3)
+            .map(|i| format!("pkg{i:04}").into_bytes())
+            .collect();
+        let late: Vec<Vec<u8>> = (2..30)
+            .step_by(3)
+            .map(|i| format!("pkg{i:04}").into_bytes())
+            .collect();
+        assert_eq!(first, [own, late.clone()].concat(), "{answer:?}");
+        // At most the failing target's share of one chunk late
+        assert_eq!(late.len(), 10);
+        // The second chunk keeps the order at every target
+        let second: Vec<Vec<u8>> = t0
+            .iter()
+            .filter(|p| p.as_slice() >= b"pkg0030".as_slice())
+            .cloned()
+            .collect();
+        assert_eq!(breaks(&second), 0, "{answer:?}: {second:?}");
+        assert!(
+            t0.iter()
+                .position(|p| p.as_slice() >= b"pkg0030".as_slice())
+                .unwrap()
+                == first.len()
+        );
+    }
+}
+
+/// Spreader over three recording targets, two chunks of 30 from cursor 0 (turn t0, t1,
+/// t2); with `down` t2 is on a port nobody listens on, else `last` sets t2 up before the
+/// first chunk
+fn spread_with_last(down: bool, last: impl FnOnce(&mut RedisLink)) -> (Vec<Vec<Vec<u8>>>, Counts) {
+    let stands: Vec<(u16, Record)> = (0..3).map(|_| recording_target(Answer::Int)).collect();
+    let mut ports: Vec<u16> = stands.iter().map(|(p, _)| *p).collect();
+    if down {
+        let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        ports[2] = closed.local_addr().unwrap().port();
+    }
+    let c = chunk_config("spreader", &ports);
+    let mut links: Vec<RedisLink> = c
+        .clients
+        .iter()
+        .map(|t| new_link(1, &c, t, &None))
+        .collect();
+    for l in links.iter_mut().take(if down { 2 } else { 3 }) {
+        assert!(ensure_link(1, l), "not connected");
+    }
+    last(&mut links[2]);
+    let mut counts = Counts::default();
+    let mut cursor = 0;
+    for from in [0, 30] {
+        let chunk = packages_from(from, 30);
+        deliver_chunk(1, &None, &c, &mut links, &mut cursor, &chunk, &mut counts);
+    }
+    (
+        stands.iter().map(|(_, rec)| pushed_to(rec)).collect(),
+        counts,
+    )
+}
+
+#[test]
+fn spreader_writes_a_target_with_no_link_first() {
+    // Known before anything is written: its share joins the others' own, no break even
+    // in the first chunk with it last in the turn
+    let (got, counts) = spread_with_last(true, |_| {});
+    assert!(got[2].is_empty());
+    every_package_once(&got);
+    assert_eq!((counts.outgoing, counts.dropped), (60, 0));
+    for list in &got {
+        assert_eq!(breaks(list), 0, "{list:?}");
+    }
+}
+
+#[test]
+fn spreader_writes_a_target_with_a_filter_first() {
+    // A client filter that takes only even packages: what it leaves joins the others' own
+    let (got, counts) = spread_with_last(false, |l| {
+        l.filter = Some(Filter::new("[02468]$", None, false, None, None).unwrap());
+    });
+    assert!(got[2].iter().all(|p| p.last().unwrap() % 2 == 0));
+    assert!(!got[2].is_empty());
+    let mut all: Vec<Vec<u8>> = got.concat();
+    all.sort();
+    assert_eq!(all, packages_from(0, 60), "not every package exactly once");
+    assert_eq!((counts.outgoing, counts.dropped), (60, 0));
+    for list in &got {
+        assert_eq!(breaks(list), 0, "{list:?}");
+    }
+}
+
+#[test]
+fn spreader_never_sends_a_package_twice_to_one_target() {
+    // Every target refuses: each package is tried once on each target and dropped as
+    // failed, in the other pass too (P2 = p2a: never the same target twice)
+    let stands: Vec<(u16, Record)> = (0..3).map(|_| recording_target(Answer::Error)).collect();
+    let ports: Vec<u16> = stands.iter().map(|(p, _)| *p).collect();
+    let c = chunk_config("spreader", &ports);
+    let mut links = connected_links(&c);
+    let mut counts = Counts::default();
+    let mut cursor = 1;
+    let chunk = packages_n(30);
+    deliver_chunk(1, &None, &c, &mut links, &mut cursor, &chunk, &mut counts);
+    assert_eq!(
+        (counts.outgoing, counts.dropped, counts.failed),
+        (0, 30, 30)
+    );
+    for (_, rec) in &stands {
+        let mut got = pushed_to(rec);
+        got.sort();
+        assert_eq!(got, chunk, "not every package once on every target");
+    }
 }

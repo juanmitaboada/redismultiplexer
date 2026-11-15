@@ -652,6 +652,9 @@ pub enum AfterPush {
     Close,
     /// Never answers: the program's command timeout ends the wait
     Silent,
+    /// Records it and never answers, but keeps reading the connection: a target that
+    /// answers its handshake, PING and LLEN and never an RPUSH (M3R-33)
+    Mute,
 }
 
 /// What a SlowTarget does with a CLIENT command (CLIENT SETNAME at each connect)
@@ -682,7 +685,8 @@ impl SlowTarget {
         t
     }
 
-    /// A target that records each RPUSH and then closes or stays silent (M3R-20)
+    /// A target that records each RPUSH and then closes, stays silent or stays mute
+    /// (M3R-20, M3R-33)
     pub fn ambiguous(after_push: AfterPush) -> SlowTarget {
         SlowTarget::start_on(0, Duration::ZERO, OnClient::Ok, after_push)
     }
@@ -898,6 +902,11 @@ fn slow_target_serve(stream: TcpStream, delay: Duration, st: Arc<Mutex<SlowState
                         loop {
                             thread::sleep(Duration::from_secs(3600));
                         }
+                    }
+                    AfterPush::Mute => {
+                        // No reply; the next request is read as usual
+                        drop(g);
+                        continue;
                     }
                 }
             }
