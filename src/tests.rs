@@ -2031,6 +2031,48 @@ fn supervise_signal_is_a_clean_stop() {
 }
 
 #[test]
+fn supervise_a_stop_flag_without_the_wake_up_is_a_clean_stop() {
+    // M3R-34: the handler stores the stop flag, then prints, then wakes main. Here the
+    // flag is set, the workers leave at once and nothing comes on the channel: a clean
+    // stop, not a death, and seen within main's one-second turn
+    let stop = Arc::new(AtomicBool::new(false));
+    let buffer = Arc::new(OrderBuffer::new());
+    let delivered = Arc::new(AtomicU64::new(0));
+    let pushed = Arc::new(AtomicU64::new(0));
+    let (_tx, rx) = mpsc::channel::<bool>();
+    let workers: Vec<thread::JoinHandle<()>> = (0..2)
+        .map(|_| test_worker(stop.clone(), buffer.clone(), pushed.clone(), None, false))
+        .collect();
+    let sender = test_sender(buffer.clone(), delivered.clone(), false);
+    thread::sleep(Duration::from_millis(200));
+    stop.store(true, Ordering::Relaxed);
+    // The workers have left before main's next turn, as a busy worker does
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !workers.iter().all(|h| h.is_finished()) {
+        assert!(Instant::now() < deadline, "the test workers did not leave");
+        thread::sleep(Duration::from_millis(10));
+    }
+    let start = Instant::now();
+    let ending = supervise(&stop, &rx, workers, Some((buffer.clone(), sender)), || {});
+    assert_eq!(
+        ending,
+        Ending {
+            died: false,
+            abandoned: 0
+        }
+    );
+    assert!(
+        start.elapsed() < Duration::from_secs(3),
+        "{:?}",
+        start.elapsed()
+    );
+    assert_eq!(
+        delivered.load(Ordering::Relaxed),
+        pushed.load(Ordering::Relaxed)
+    );
+}
+
+#[test]
 fn supervise_a_worker_that_dies_stops_the_program() {
     // The other worker is told to stop, the sender flushes everything: nothing lost
     let (ending, pushed, delivered) = supervised([Some(50), None], false, false, None);

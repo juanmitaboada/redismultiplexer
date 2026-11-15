@@ -623,6 +623,12 @@ fn supervise(
         if signals.recv_timeout(Duration::from_secs(1)).is_ok() {
             break;
         }
+        // The handler sets the stop flag before it wakes this loop, and a busy worker
+        // leaves as soon as it sees the flag: a thread found finished then was told to
+        // stop, not dead (M3R-34). A panic is still seen by its join below.
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
         // A thread only ends when told to: one that ended on its own stops the program
         if workers.iter().any(|h| h.is_finished()) {
             print_debug!(
