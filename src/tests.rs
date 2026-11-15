@@ -2569,6 +2569,12 @@ enum Answer {
     LlenError,
     /// The connection closed at the first RPUSH, which is recorded and never answered
     Close,
+    /// RPUSH answered, LLEN answered far above any hardlimit: the target is stuck
+    Full,
+    /// An error reply to an RPUSH of a package numbered from the first to below the second
+    /// (`pkgNNNN`), an integer to the others: a target that fails or is fixed at a point
+    /// of the stream
+    ErrorIn(usize, usize),
 }
 
 type Record = Arc<Mutex<Vec<(String, Vec<u8>)>>>;
@@ -2584,6 +2590,9 @@ fn recording_target(answer: Answer) -> (u16, Record) {
     thread::spawn(move || {
         for stream in listener.incoming().flatten() {
             let rec = rec.clone();
+            // Each reply is its own write: without this a pipelined chunk waits on the
+            // client's delayed ACK at every reply after the first
+            let _ = stream.set_nodelay(true);
             thread::spawn(move || {
                 let mut w = stream.try_clone().unwrap();
                 let mut r = BufReader::new(stream);
@@ -2612,7 +2621,19 @@ fn recording_target(answer: Answer) -> (u16, Record) {
                         .push((cmd.clone(), args.last().unwrap().clone()));
                     let reply = match (cmd.as_str(), answer) {
                         ("LLEN", Answer::LlenError) => "-ERR no length\r\n".to_string(),
+                        ("LLEN", Answer::Full) => ":1000000\r\n".to_string(),
                         ("LLEN", _) => ":0\r\n".to_string(),
+                        ("RPUSH", Answer::Full) => ":1\r\n".to_string(),
+                        ("RPUSH", Answer::ErrorIn(from, to)) => {
+                            let number = std::str::from_utf8(&args[2][3..])
+                                .ok()
+                                .and_then(|n| n.parse::<usize>().ok());
+                            if number.is_some_and(|n| (from..to).contains(&n)) {
+                                "-ERR refused\r\n".to_string()
+                            } else {
+                                ":1\r\n".to_string()
+                            }
+                        }
                         ("RPUSH", Answer::LlenError) => ":1\r\n".to_string(),
                         ("RPUSH", Answer::Int) => ":1\r\n".to_string(),
                         ("RPUSH", Answer::Error) => "-ERR refused\r\n".to_string(),
@@ -2897,11 +2918,11 @@ fn spreader_keeps_the_order_when_a_target_before_the_last_fails() {
 
 #[test]
 fn spreader_breaks_the_order_once_when_the_last_target_fails() {
-    // 1c's residual (plan 9.11.6, declared): the target written last in the turn fails,
-    // no target is left unwritten in that chunk, so its packages go in another pass to the
-    // first target of the turn, after that target's own share: one break there, at most
-    // the failing target's share of the chunk late. From the next chunk the failing
-    // target is written first (or it is down), so no break again
+    // The residual (plan 9.11.13 part 4, declared): the target written last in the turn
+    // refuses in its replies, no target is left unwritten in that chunk, so its packages go
+    // in another pass to the first target of the turn, after that target's own share: one
+    // break there, at most the packages refused in that chunk late. From the next chunk the
+    // failing target is written first (or it is down), so no break again
     for answer in [Answer::Error, Answer::Close] {
         let (got, counts) = spread_two_chunks(2, answer);
         every_package_once(&got);
@@ -2975,9 +2996,9 @@ fn spread_with_last(down: bool, last: impl FnOnce(&mut RedisLink)) -> (Vec<Vec<V
 }
 
 #[test]
-fn spreader_writes_a_target_with_no_link_first() {
-    // Known before anything is written: its share joins the others' own, no break even
-    // in the first chunk with it last in the turn
+fn spreader_keeps_the_order_with_a_target_down() {
+    // Refused at planning time (plan 9.11.13): the turn passes over it, nothing of its is
+    // carried, no break even in the first chunk with it last in the turn
     let (got, counts) = spread_with_last(true, |_| {});
     assert!(got[2].is_empty());
     every_package_once(&got);
@@ -2988,8 +3009,9 @@ fn spreader_writes_a_target_with_no_link_first() {
 }
 
 #[test]
-fn spreader_writes_a_target_with_a_filter_first() {
-    // A client filter that takes only even packages: what it leaves joins the others' own
+fn spreader_keeps_the_order_with_a_filtered_target() {
+    // A client filter that takes only even packages: the turn passes over it for the odd
+    // ones (plan 9.11.13), no break
     let (got, counts) = spread_with_last(false, |l| {
         l.filter = Some(Filter::new("[02468]$", None, false, None, None).unwrap());
     });
@@ -3027,6 +3049,393 @@ fn spreader_never_sends_a_package_twice_to_one_target() {
     }
 }
 
+/// How the failing target of a shares case behaves (plan 9.11.13)
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Fails {
+    /// Refuses at planning time: stuck by its limits
+    Stuck,
+    /// Refuses at planning time: nobody listens on its port
+    Down,
+    /// Refuses in its replies: an error to every RPUSH
+    Errors,
+    /// Refuses in its replies: closes at its first RPUSH (then down)
+    Closes,
+    /// Refuses in its replies: never answers (a short command timeout, then down)
+    Mute,
+    /// Refuses in its replies: an error to the packages before the 80th, then takes them
+    ErrorsFirst,
+}
+
+/// The stand-ins' answers in a shares pool
+const SHARE_ANSWERS: [Answer; 6] = [
+    Answer::Int,
+    Answer::Full,
+    Answer::Error,
+    Answer::Close,
+    Answer::Never,
+    Answer::ErrorIn(0, 80),
+];
+
+/// Stand-ins for `targets` targets, one per answer of SHARE_ANSWERS each
+fn shares_pool(targets: usize) -> Vec<Vec<(u16, Record)>> {
+    (0..targets)
+        .map(|_| SHARE_ANSWERS.iter().map(|&a| recording_target(a)).collect())
+        .collect()
+}
+
+/// The client filters of the shares cases, by the package's last digit
+const SHARE_FILTERS: [Option<&str>; 4] =
+    [None, Some("[02468]$"), Some("[13579]$"), Some("[0369]$")];
+
+const SHARE_PACKAGES: usize = 600;
+const SHARE_CHUNK: usize = 50;
+
+/// What each target got, in arrival order, and the counts: spreader over `filters.len()`
+/// stand-ins, the one at `bad` failing as said, `SHARE_PACKAGES` packages from cursor 0;
+/// `chunked`: through deliver_chunk() in chunks of `SHARE_CHUNK` (the sender), else one by
+/// one through deliver() (the workers' rotation: 1.0.8's and the stage 4 tip's rule)
+fn shares_run(
+    pool: &[Vec<(u16, Record)>],
+    filters: &[Option<&str>],
+    bad: Option<(usize, Fails)>,
+    chunked: bool,
+) -> (Vec<Vec<Vec<u8>>>, Counts) {
+    // The stand-ins are reused from case to case (a fresh set each time runs out of file
+    // descriptors): pool[t] holds one per answer, in the order of SHARE_ANSWERS
+    let answer = |t: usize| match bad {
+        Some((b, Fails::Stuck)) if b == t => 1,
+        Some((b, Fails::Errors)) if b == t => 2,
+        Some((b, Fails::Closes)) if b == t => 3,
+        Some((b, Fails::Mute)) if b == t => 4,
+        Some((b, Fails::ErrorsFirst)) if b == t => 5,
+        _ => 0,
+    };
+    let stands: Vec<(u16, Record)> = (0..filters.len())
+        .map(|t| pool[t][answer(t)].clone())
+        .collect();
+    for (_, rec) in &stands {
+        rec.lock().unwrap().clear();
+    }
+    let mut ports: Vec<u16> = stands.iter().map(|(p, _)| *p).collect();
+    let mut closed = None;
+    if let Some((b, Fails::Down)) = bad {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        ports[b] = l.local_addr().unwrap().port();
+        closed = Some(l);
+    }
+    let mut c = chunk_config("spreader", &ports);
+    for t in c.clients.iter_mut() {
+        t.command_timeout = Some(0.2);
+    }
+    if let Some((b, Fails::Stuck)) = bad {
+        let t = &mut c.clients[b];
+        (t.timelimit, t.checklimit, t.softlimit, t.hardlimit) =
+            (Some(3600), Some(7), Some(50), Some(100));
+    }
+    let mut links: Vec<RedisLink> = c
+        .clients
+        .iter()
+        .zip(filters)
+        .map(|(t, f)| {
+            let filter = f.map(|re| Filter::new(re, None, false, None, None).unwrap());
+            new_link(1, &c, t, &filter)
+        })
+        .collect();
+    for (t, l) in links.iter_mut().enumerate() {
+        if !matches!(bad, Some((b, Fails::Down)) if b == t) {
+            assert!(ensure_link(1, l), "not connected");
+        }
+    }
+    let mut counts = Counts::default();
+    let mut cursor = 0;
+    let packages = packages_n(SHARE_PACKAGES);
+    if chunked {
+        for chunk in packages.chunks(SHARE_CHUNK) {
+            deliver_chunk(1, &None, &c, &mut links, &mut cursor, chunk, &mut counts);
+        }
+    } else {
+        for package in &packages {
+            deliver(1, &None, &c, &mut links, &mut cursor, package, &mut counts);
+        }
+    }
+    drop(closed);
+    (
+        stands.iter().map(|(_, rec)| pushed_to(rec)).collect(),
+        counts,
+    )
+}
+
+/// Packages that reached a target after a later one
+fn late(list: &[Vec<u8>]) -> usize {
+    let mut top: Option<&Vec<u8>> = None;
+    let mut n = 0;
+    for p in list {
+        if top.is_some_and(|t| p < t) {
+            n += 1;
+        } else {
+            top = Some(p);
+        }
+    }
+    n
+}
+
+/// The generated cases of one target count: every combination of SHARE_FILTERS (a seeded
+/// sample of 48 for 4 targets), each with no failure and with each kind of failure at
+/// each position (Mute on every fourth combination only: it costs its timeout)
+fn share_cases(targets: usize) -> Vec<(Vec<Option<&'static str>>, Option<(usize, Fails)>)> {
+    let mut combos: Vec<Vec<Option<&'static str>>> = vec![vec![]];
+    for _ in 0..targets {
+        combos = combos
+            .into_iter()
+            .flat_map(|c| {
+                SHARE_FILTERS.iter().map(move |f| {
+                    let mut c = c.clone();
+                    c.push(*f);
+                    c
+                })
+            })
+            .collect();
+    }
+    if targets == 4 {
+        // A fixed linear congruential sample: the same cases on every run
+        let mut x: u64 = 42;
+        let mut picked = Vec::new();
+        while picked.len() < 48 {
+            x = x
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let i = (x >> 33) as usize % combos.len();
+            if !picked.contains(&i) {
+                picked.push(i);
+            }
+        }
+        combos = picked.into_iter().map(|i| combos[i].clone()).collect();
+    }
+    let mut cases = Vec::new();
+    for (k, f) in combos.into_iter().enumerate() {
+        cases.push((f.clone(), None));
+        for b in 0..targets {
+            let mut kinds = vec![Fails::Stuck, Fails::Down, Fails::Errors, Fails::Closes];
+            if k % 4 == 0 {
+                kinds.push(Fails::Mute);
+            }
+            for kind in kinds {
+                cases.push((f.clone(), Some((b, kind))));
+            }
+        }
+    }
+    cases
+}
+
+/// The differential of plan 9.11.13 (rule of 2026-11-16): spreader with ordering (the
+/// sender's chunks) against the workers' rotation, over the generated cases of one target
+/// count. A failure at planning time (none, stuck, down) gives each healthy target the
+/// very packages the old rule gives it, in order; a failure in the replies (errors, a
+/// close, no reply) changes the shares of one chunk at most, by at most that chunk (the
+/// failing target's share of it, declared), and as many packages late at most. Every
+/// package the old rule delivers is delivered, never twice to one target.
+fn spreader_shares_match_the_workers_rotation(targets: usize) {
+    use std::collections::BTreeMap;
+    // class -> (cases, equal, largest difference, most late)
+    let mut table: BTreeMap<String, (usize, usize, usize, usize, f64)> = BTreeMap::new();
+    let pool = shares_pool(targets);
+    for (filters, bad) in share_cases(targets) {
+        let began = Instant::now();
+        let (old, old_counts) = shares_run(&pool, &filters, bad, false);
+        let (new, new_counts) = shares_run(&pool, &filters, bad, true);
+        let what = format!("{filters:?} {bad:?}");
+        let healthy: Vec<usize> = (0..targets)
+            .filter(|&t| bad.is_none_or(|(b, _)| b != t))
+            .collect();
+        for list in &new {
+            let mut u = list.clone();
+            u.sort();
+            u.dedup();
+            assert_eq!(u.len(), list.len(), "a package twice on one target: {what}");
+        }
+        let union = |got: &[Vec<Vec<u8>>]| {
+            let mut all: Vec<Vec<u8>> = healthy.iter().flat_map(|&t| got[t].clone()).collect();
+            all.sort();
+            all
+        };
+        let delivered = union(&new);
+        let mut once = delivered.clone();
+        once.dedup();
+        assert_eq!(
+            once.len(),
+            delivered.len(),
+            "on two healthy targets: {what}"
+        );
+        assert_eq!(
+            delivered,
+            union(&old),
+            "not the same packages delivered: {what}"
+        );
+        assert_eq!(
+            (new_counts.outgoing, new_counts.dropped),
+            (old_counts.outgoing, old_counts.dropped),
+            "{what}"
+        );
+        let mut equal = true;
+        let mut diff = 0;
+        let mut most_late = 0;
+        for &t in &healthy {
+            let mut a = old[t].clone();
+            let mut b = new[t].clone();
+            most_late = most_late.max(late(&b));
+            a.sort();
+            b.sort();
+            equal &= a == b;
+            diff = diff.max(a.len().abs_diff(b.len()));
+        }
+        let class = match bad {
+            None => "none".to_string(),
+            Some((_, kind)) => format!("{kind:?}"),
+        };
+        match bad {
+            None | Some((_, Fails::Stuck | Fails::Down)) => {
+                assert!(equal, "shares differ: {what}\nold {old:?}\nnew {new:?}");
+                assert_eq!(most_late, 0, "out of order: {what}\n{new:?}");
+            }
+            _ => {
+                assert!(diff <= SHARE_CHUNK, "{diff} apart: {what}");
+                assert!(most_late <= SHARE_CHUNK, "{most_late} late: {what}");
+            }
+        }
+        let row = table.entry(class).or_default();
+        row.0 += 1;
+        row.1 += usize::from(equal);
+        row.2 = row.2.max(diff);
+        row.3 = row.3.max(most_late);
+        row.4 += began.elapsed().as_secs_f64();
+    }
+    for (class, (cases, equal, diff, most_late, secs)) in table {
+        eprintln!(
+            "\nshares {targets} targets | {class} | {cases} cases | {equal} equal | largest difference {diff} | most late {most_late} | {secs:.1} s"
+        );
+    }
+}
+
+#[test]
+fn spreader_shares_match_the_workers_rotation_2_targets() {
+    spreader_shares_match_the_workers_rotation(2);
+}
+
+#[test]
+fn spreader_shares_match_the_workers_rotation_3_targets() {
+    spreader_shares_match_the_workers_rotation(3);
+}
+
+#[test]
+fn spreader_shares_match_the_workers_rotation_4_targets() {
+    spreader_shares_match_the_workers_rotation(4);
+}
+
+/// The packages of `got` from `from` on, sorted
+fn from_package(got: &[Vec<u8>], from: usize) -> Vec<Vec<u8>> {
+    let mut v: Vec<Vec<u8>> = got
+        .iter()
+        .filter(|p| p.as_slice() >= format!("pkg{from:04}").as_bytes())
+        .cloned()
+        .collect();
+    v.sort();
+    v
+}
+
+#[test]
+fn spreader_with_a_filter_on_every_target_keeps_the_order() {
+    // M3R-43: filters "even", "odd" and none (the review's three-filter case), and one on
+    // every target: the shares are the workers' rotation's, no package late anywhere
+    let pool = shares_pool(3);
+    for filters in [
+        [Some("[02468]$"), Some("[13579]$"), None],
+        [Some("[02468]$"), Some("[13579]$"), Some("[0369]$")],
+    ] {
+        let (old, _) = shares_run(&pool, &filters, None, false);
+        let (new, counts) = shares_run(&pool, &filters, None, true);
+        assert_eq!(counts.outgoing, SHARE_PACKAGES as u64);
+        for t in 0..3 {
+            assert_eq!(late(&new[t]), 0, "{filters:?} t{t}: {:?}", new[t]);
+            assert_eq!(
+                from_package(&new[t], 0),
+                from_package(&old[t], 0),
+                "{filters:?} t{t}"
+            );
+        }
+    }
+}
+
+#[test]
+fn spreader_shares_as_the_old_rule_after_a_failure_event() {
+    // Plan 9.11.13 part 3: the shares differ only in the chunk of the failure event. After
+    // it the cursor is where the old rule leaves it (resync), and a target that keeps
+    // answering errors is held back with one probe per chunk (C4b-2 = a). Filters that
+    // depend on the position make any shift of the cursor show
+    let pool = shares_pool(4);
+    for filters in [
+        vec![None, None, None, Some("[13579]$")],
+        vec![Some("[02468]$"), None, Some("[13579]$")],
+        vec![None, None, None],
+    ] {
+        for kind in [Fails::Errors, Fails::Closes, Fails::Mute] {
+            let bad = Some((1, kind));
+            let (old, _) = shares_run(&pool, &filters, bad, false);
+            let (new, _) = shares_run(&pool, &filters, bad, true);
+            for t in (0..filters.len()).filter(|&t| t != 1) {
+                assert_eq!(
+                    from_package(&new[t], SHARE_CHUNK),
+                    from_package(&old[t], SHARE_CHUNK),
+                    "{filters:?} {kind:?} t{t}"
+                );
+            }
+            if kind == Fails::Errors {
+                // Its share of the first chunk, then one probe per chunk
+                let first = new[1].len() - from_package(&new[1], SHARE_CHUNK).len();
+                assert_eq!(
+                    new[1].len(),
+                    first + SHARE_PACKAGES / SHARE_CHUNK - 1,
+                    "{filters:?}: {:?}",
+                    new[1]
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn spreader_takes_back_a_held_target_after_its_probe() {
+    // C4b-2 = a: a target fixed at package 80 (errors before) is held back after the first
+    // chunk; the probe of the second chunk (the last package the turn offered it) is taken,
+    // and from the third chunk it gets its share again, in order. The chunk in which it
+    // comes back is one of those that differ (declared): only the totals are compared
+    let pool = shares_pool(3);
+    let bad = Some((1, Fails::ErrorsFirst));
+    let filters = [None, None, None];
+    let (old, old_counts) = shares_run(&pool, &filters, bad, false);
+    let (new, new_counts) = shares_run(&pool, &filters, bad, true);
+    assert_eq!(new_counts.outgoing, old_counts.outgoing);
+    let second: Vec<&Vec<u8>> = new[1]
+        .iter()
+        .filter(|p| (b"pkg0050".as_slice()..b"pkg0100".as_slice()).contains(&p.as_slice()))
+        .collect();
+    assert_eq!(
+        second.len(),
+        1,
+        "one probe in the second chunk: {:?}",
+        new[1]
+    );
+    let back = from_package(&new[1], 2 * SHARE_CHUNK);
+    assert!(
+        back.len() >= (SHARE_PACKAGES - 2 * SHARE_CHUNK) / 3 - 1,
+        "not its share again: {:?}",
+        new[1]
+    );
+    assert!(from_package(&old[1], 80).len() > 0);
+    for list in &new {
+        assert_eq!(late(list), 0, "{list:?}");
+    }
+}
+
 #[test]
 fn pending_requests_stay_in_release_order() {
     // A request put before later ones lands before them, bytes and package alike
@@ -3045,4 +3454,69 @@ fn pending_requests_stay_in_release_order() {
     let (replies, _) = flush_target(&mut link);
     assert!(link.request.is_empty() && link.ends.is_empty() && link.pending.is_empty());
     assert_eq!(replies.len(), 5);
+}
+
+/// Spreader over stand-ins answering as given, `chunks` chunks of `size` from cursor 0,
+/// with the client filters given; what each got
+fn spread_answers(
+    answers: &[Answer],
+    filters: &[Option<&str>],
+    chunks: usize,
+    size: usize,
+) -> Vec<Vec<Vec<u8>>> {
+    let stands: Vec<(u16, Record)> = answers.iter().map(|&a| recording_target(a)).collect();
+    let ports: Vec<u16> = stands.iter().map(|(p, _)| *p).collect();
+    let c = chunk_config("spreader", &ports);
+    let mut links: Vec<RedisLink> = c
+        .clients
+        .iter()
+        .zip(filters)
+        .map(|(t, f)| {
+            let filter = f.map(|re| Filter::new(re, None, false, None, None).unwrap());
+            new_link(1, &c, t, &filter)
+        })
+        .collect();
+    for l in links.iter_mut() {
+        assert!(ensure_link(1, l), "not connected");
+    }
+    let mut counts = Counts::default();
+    let mut cursor = 0;
+    for chunk in packages_n(chunks * size).chunks(size) {
+        deliver_chunk(1, &None, &c, &mut links, &mut cursor, chunk, &mut counts);
+    }
+    stands.iter().map(|(_, rec)| pushed_to(rec)).collect()
+}
+
+#[test]
+fn spreader_carries_only_to_targets_that_wrote_nothing_later() {
+    // Plan 9.11.13 part 2. A: t2 answers errors to everything (held back, written first
+    // from the second chunk); chunks of 48 leave the cursor at t0, so the turn is t2, t0,
+    // t1, t3. t1 answers errors in the second chunk: what it refuses goes to t3, not yet
+    // written, rather than to t2, which wrote its probe (a later package) and would refuse
+    // it anyway, after which t3 would have written later ones
+    let got = spread_answers(
+        &[
+            Answer::Int,
+            Answer::ErrorIn(48, 96),
+            Answer::Error,
+            Answer::Int,
+        ],
+        &[None, None, None, None],
+        3,
+        48,
+    );
+    for t in [0, 3] {
+        assert_eq!(late(&got[t]), 0, "t{t}: {:?}", got[t]);
+    }
+    // B: only a refusal in the replies puts a target first in the turn. t2 has a filter
+    // (packages whose last digit is 0, 3, 6 or 9); t1 answers errors in
+    // the second chunk: written in the cursor's turn, t2 is still unwritten and takes what
+    // t1 refused that it accepts, in its place (t0 gets the rest late: the residual)
+    let got = spread_answers(
+        &[Answer::Int, Answer::ErrorIn(30, 60), Answer::Int],
+        &[None, None, Some("[0369]$")],
+        3,
+        30,
+    );
+    assert_eq!(late(&got[2]), 0, "t2: {:?}", got[2]);
 }

@@ -194,7 +194,8 @@ struct RedisLink {
     down_since: Option<Instant>,     // when it was last seen working, while it is down
     attempts: u32,                   // failed connects since it went down (S4-4)
     skip_noted: bool,                // the "not connected yet" line was printed (M3R-23)
-    failed_last: bool,               // the sender, spreader: a request failed in its last chunk
+    failed_last: bool,               // the sender, spreader: a reply refused in its last chunk
+    held_back: bool,                 // the sender, spreader: error replies to all of its last chunk
 }
 
 /// The result of a connect attempt that runs in its own short-lived thread, so a target
@@ -1957,6 +1958,7 @@ fn new_link(id: u16, config: &Config, client: &ClientConfig, filter: &Option<Fil
         attempts: 0,
         skip_noted: false,
         failed_last: false,
+        held_back: false,
     }
 }
 
@@ -2762,6 +2764,21 @@ fn put_request(client: &mut RedisLink, p: usize, request: &[u8]) {
     client.ends.insert(at, end);
 }
 
+/// Take package `p`'s request out of a target's pending ones (not written yet); its
+/// encoded bytes, to put back later without planning it again
+fn take_request(client: &mut RedisLink, p: usize) -> Option<Vec<u8>> {
+    let at = client.pending.binary_search(&p).ok()?;
+    let from = if at == 0 { 0 } else { client.ends[at - 1] };
+    let to = client.ends[at];
+    let request: Vec<u8> = client.request.drain(from..to).collect();
+    client.pending.remove(at);
+    client.ends.remove(at);
+    for end in &mut client.ends[at..] {
+        *end -= request.len();
+    }
+    Some(request)
+}
+
 /// Whether the queue of a target is due a check (L1a: monotonic clock, `>=`): never
 /// checked yet, `timelimit` seconds since the last check, or the countdown at 0. A target
 /// without `timelimit` and `checklimit` is checked every `DEFAULT_CHECK`.
@@ -3125,8 +3142,17 @@ struct ChunkState {
     why: Vec<Why>,
     /// package x target: planned there, or that target could not take it (never again)
     tried: Vec<bool>,
-    /// spreader: packages to plan again for another target (P1 = p1b, P2 = p2a)
-    replan: Vec<usize>,
+    /// package x target: its request is pending or was written there
+    planned: Vec<bool>,
+    /// package x target: refused in that target's replies (an error, no reply)
+    refused: Vec<bool>,
+    /// spreader: (package, target that refused it) to plan again for another target
+    /// (P1 = p1b, P2 = p2a)
+    replan: Vec<(usize, usize)>,
+    /// per target: the highest package of this chunk written to it
+    written: Vec<Option<usize>>,
+    /// per target: (replies read, refused among them, some never answered)
+    answers: Vec<(usize, usize, bool)>,
     replicant: bool,
 }
 
@@ -3140,7 +3166,7 @@ struct ChunkState {
 ///   the round trips overlap; then the replies, reply by reply per target (read_pending).
 ///   A package a target refused (P2) or whose outcome is unknown (P1 = p1b) counts failed
 ///   for that target and is never sent to it again.
-/// - spreader: spread_chunk (C4b-1 = 1c).
+/// - spreader: spread_chunk (C4b-1 = 1c; planned by the workers' rotation, M3R-42 = R42a).
 /// - count: outgoing when a target took it, else dropped with one reason (account).
 ///
 /// Within one target the requests run in the order written and a chunk is written only
@@ -3168,7 +3194,11 @@ fn deliver_chunk(
         taken: vec![false; n],
         why: (0..n).map(|_| Why::default()).collect(),
         tried: vec![false; n * targets],
+        planned: vec![false; n * targets],
+        refused: vec![false; n * targets],
         replan: Vec::new(),
+        written: vec![None; targets],
+        answers: vec![(0, 0, false); targets],
         replicant: config.mode == "replicant",
     };
     let todo: Vec<usize> = (0..n).filter(|&p| data[p].is_some()).collect();
@@ -3182,9 +3212,9 @@ fn deliver_chunk(
         }
         // Every target's requests first, then the replies
         let written: Vec<Written> = clients.iter_mut().map(write_pending).collect();
-        for (client, w) in clients.iter_mut().zip(written) {
+        for (t, (client, w)) in clients.iter_mut().zip(written).enumerate() {
             let (replies, error) = read_pending(client, w);
-            settle(config, client, replies, error, &mut st);
+            settle(config, client, t, replies, error, &mut st);
         }
     } else {
         spread_chunk(id, config, clients, cursor, &data, &todo, &mut st, counts);
@@ -3194,19 +3224,25 @@ fn deliver_chunk(
     }
 }
 
-/// Spreader's delivery of one chunk (C4b-1 = 1c, plan 9.11.6). Each package gets a first
-/// target round robin from the cursor. The targets are then written and read one after
-/// another, in the turn's order from the cursor, first the targets with no link, with a
-/// filter or that did not take every package of their last chunk. Before a target is written, the
-/// packages that earlier targets of this chunk could not take (filter, limits, no link)
-/// or refused or never answered (P2 = p2a, P1 = p1b) join its own, in release order, so
-/// they take their place in its order. Never sent to a target twice. What is left once
-/// every target was written goes, in another pass, to a target that already got later
-/// packages of this chunk: the one place where the order at a target breaks. That needs a
-/// target with a link and no filter that took all of its last chunk to stop taking
-/// packages in this one (an error or no reply, its link lost, its limits) while it is the
-/// last written (or every target after it was tried already); the break is at most its
-/// share of one chunk, once: from the next chunk on it is written first.
+/// Spreader's delivery of one chunk (C4b-1 = 1c, plan 9.11.13; M3R-42 = R42a).
+/// - Planned package by package with the workers' rotation (`spread()`, 1.0.8): from the
+///   cursor, the first target whose link, filter and limits take the package gets it and
+///   the cursor moves past it. A refusal at planning time is never carried, so the shares
+///   are 1.0.8's whenever no reply refuses.
+/// - A target held back (error replies to everything it got in its last chunk) is passed
+///   over as refusing, as 1.0.8 would see it; it gets one probe, the last package the
+///   rotation offered it, taken back from the target that got it instead (C4b-2 = a).
+/// - The targets are then written and read one after another, first those that refused
+///   in their replies in their last chunk. A package a target refused in its replies (an
+///   error, no reply, P2 = p2a, P1 = p1b) goes to the first target after it in the turn
+///   that was not tried for it, has written nothing later of this chunk and takes it; it
+///   joins that target's requests in release order. A probe goes back where it came from.
+/// - What no such target takes goes, in another pass, to a target that already wrote
+///   later packages: the one place where the order at a target breaks, at most the
+///   packages refused in that chunk, once per failure event. Never twice to one target.
+/// - After a chunk with a refusal in the replies (or a held-back target that took its
+///   probe) the cursor is set where 1.0.8's rotation over the chunk would have left it,
+///   so the shares differ from 1.0.8's in that chunk only.
 #[allow(clippy::too_many_arguments)]
 fn spread_chunk(
     id: u16,
@@ -3219,74 +3255,185 @@ fn spread_chunk(
     counts: &mut Counts,
 ) {
     let targets = clients.len();
-    // Each link looked at once before the first pass, so a target with none goes first
-    let mut up: Vec<Option<bool>> = clients
-        .iter_mut()
-        .map(|client| {
-            let ok = ensure_link(id, client);
-            if !ok {
-                note_skip(id, client);
-            }
-            Some(ok)
-        })
-        .collect();
-    let mut order: Vec<usize> = (0..targets).map(|k| (*cursor + k) % targets).collect();
-    // The targets that may not take every package go first: their refusals then join the
-    // others' own. Stable: each group keeps the cursor's order
-    order.sort_by_key(|&t| {
-        !(clients[t].failed_last || up[t] == Some(false) || clients[t].filter.is_some())
-    });
-    let mut own: Vec<Vec<usize>> = vec![Vec::new(); targets];
-    for (k, &p) in todo.iter().enumerate() {
-        own[(*cursor + k) % targets].push(p);
+    let start = *cursor;
+    let bytes = |p: usize| data[p].as_deref().unwrap_or_default();
+    let mut up: Vec<Option<bool>> = vec![None; targets];
+    // Plan package p for target t (plan())
+    macro_rules! plan_at {
+        ($t:expr, $p:expr) => {
+            plan(
+                id,
+                config,
+                &mut clients[$t],
+                $t,
+                $p,
+                bytes($p),
+                &mut up[$t],
+                st,
+                counts,
+            )
+        };
     }
-    *cursor = (*cursor + todo.len()) % targets;
-    let mut carried: Vec<usize> = Vec::new();
-    loop {
-        for &t in &order {
-            let (mut list, mut rest): (Vec<usize>, Vec<usize>) =
-                carried.drain(..).partition(|&p| !st.tried[p * targets + t]);
-            list.append(&mut own[t]);
-            if list.is_empty() {
-                carried = rest;
+    let held: Vec<bool> = clients.iter().map(|c| c.held_back).collect();
+    // Per held-back target: the last package the rotation offered it, and who took it
+    let mut offered: Vec<Option<(usize, Option<usize>)>> = vec![None; targets];
+    let mut passed: Vec<usize> = Vec::new();
+    for &p in todo {
+        passed.clear();
+        let mut got = None;
+        for k in 0..targets {
+            let t = (*cursor + k) % targets;
+            if held[t] {
+                if takes_unplanned(id, &mut clients[t], &mut up[t], bytes(p)) {
+                    passed.push(t);
+                }
                 continue;
             }
-            // Release order: a chunk is in release order, so its index is
-            list.sort_unstable();
-            let before = rest.len();
-            for p in list {
-                let bdata = data[p].as_deref().unwrap_or_default();
-                if !plan(
-                    id,
-                    config,
-                    &mut clients[t],
-                    t,
-                    p,
-                    bdata,
-                    &mut up[t],
-                    st,
-                    counts,
-                ) {
-                    rest.push(p);
+            if plan_at!(t, p) {
+                got = Some(t);
+                break;
+            }
+        }
+        match got {
+            Some(t) => *cursor = (t + 1) % targets,
+            // Only a held-back target would take it: tried, as 1.0.8 would (cursor stays)
+            None => {
+                for &t in &passed {
+                    if plan_at!(t, p) {
+                        passed.retain(|&h| h != t);
+                        break;
+                    }
                 }
             }
-            let written = write_pending(&mut clients[t]);
-            let (replies, error) = read_pending(&mut clients[t], written);
-            settle(config, &mut clients[t], replies, error, st);
-            // Anything it did not take (plan refused it, or settle and a flush before a
-            // limits check put it in st.replan) makes it go first in the next chunk
-            clients[t].failed_last = rest.len() > before || !st.replan.is_empty();
-            rest.append(&mut st.replan);
-            rest.sort_unstable();
-            carried = rest;
         }
-        // Another pass for what some target was not tried for yet
-        carried.retain(|&p| !st.taken[p] && (0..targets).any(|t| !st.tried[p * targets + t]));
-        if carried.is_empty() {
+        for &t in &passed {
+            offered[t] = Some((p, got));
+        }
+    }
+    // The probes: taken back from the target that got the package, not written yet
+    let mut probes: Vec<Option<(usize, usize, Vec<u8>)>> = vec![None; targets];
+    for t in 0..targets {
+        let Some((p, Some(u))) = offered[t] else {
+            continue;
+        };
+        let Some(request) = take_request(&mut clients[u], p) else {
+            continue;
+        };
+        st.planned[p * targets + u] = false;
+        if plan_at!(t, p) {
+            probes[t] = Some((p, u, request));
+        } else {
+            put_request(&mut clients[u], p, &request);
+            st.planned[p * targets + u] = true;
+        }
+    }
+    let mut order: Vec<usize> = (0..targets).map(|k| (start + k) % targets).collect();
+    // Stable: those that refused in their replies last time first, each group in turn
+    order.sort_by_key(|&t| !clients[t].failed_last);
+    let mut left: Vec<(usize, usize)> = Vec::new();
+    loop {
+        for &t in &order {
+            if !clients[t].pending.is_empty() {
+                let (replies, error) = write_target(&mut clients[t], t, st);
+                settle(config, &mut clients[t], t, replies, error, st);
+            }
+            let mut refused = std::mem::take(&mut st.replan);
+            refused.sort_unstable();
+            for (p, from) in refused {
+                // A refused probe goes back to the target it was taken from
+                if let Some((q, u, request)) = probes[from]
+                    .take_if(|(q, u, _)| *q == p && st.written[*u].is_none_or(|w| w < p))
+                {
+                    put_request(&mut clients[u], q, &request);
+                    st.planned[q * targets + u] = true;
+                    continue;
+                }
+                // To a target that wrote nothing later: written in this turn or the next
+                let carried = (1..targets).map(|k| (from + k) % targets).any(|u| {
+                    !st.tried[p * targets + u]
+                        && st.written[u].is_none_or(|w| w < p)
+                        && plan_at!(u, p)
+                });
+                if !carried {
+                    left.push((p, from));
+                }
+            }
+        }
+        left.append(&mut st.replan);
+        // Another pass for what only a target that wrote later packages can take
+        left.sort_unstable();
+        for (p, from) in left.drain(..) {
+            let _ = (1..targets)
+                .map(|k| (from + k) % targets)
+                .any(|u| !st.tried[p * targets + u] && plan_at!(u, p));
+        }
+        if st.replan.is_empty() && clients.iter().all(|c| c.pending.is_empty()) {
             break;
         }
-        up = vec![None; targets];
     }
+    // What each target showed in its replies decides its place in the next chunk
+    let mut resync = false;
+    for (t, client) in clients.iter_mut().enumerate() {
+        let (read, refused, unknown) = st.answers[t];
+        if read == 0 {
+            continue;
+        }
+        let held_now = refused == read && !unknown && client.link.is_some();
+        resync |= refused > 0 || (held[t] && !held_now);
+        client.failed_last = refused > 0;
+        client.held_back = held_now;
+    }
+    if resync {
+        // Where 1.0.8's rotation over this chunk would have left the cursor: each target
+        // answers as it did; one never tried for a package, as its state now says (a
+        // target held back in this chunk refused it: it came back at its probe at most)
+        let mut c = start;
+        for &p in todo {
+            for k in 0..targets {
+                let t = (c + k) % targets;
+                let i = p * targets + t;
+                let took = if st.tried[i] {
+                    st.planned[i] && !st.refused[i]
+                } else {
+                    !held[t] && would_take(&clients[t], bytes(p))
+                };
+                if took {
+                    c = (t + 1) % targets;
+                    break;
+                }
+            }
+        }
+        *cursor = c;
+    }
+}
+
+/// A held-back target passed over by the rotation: whether its link and filter would take
+/// the package (its limits are not checked: nothing is planned)
+fn takes_unplanned(id: u16, client: &mut RedisLink, up: &mut Option<bool>, bdata: &[u8]) -> bool {
+    let alive = *up.get_or_insert_with(|| {
+        let ok = ensure_link(id, client);
+        if !ok {
+            note_skip(id, client);
+        }
+        ok
+    });
+    alive
+        && client
+            .filter
+            .as_ref()
+            .is_none_or(|f| f.apply(bdata).is_some())
+}
+
+/// For the cursor's resync: whether a target would take a package it was never offered,
+/// as its state at the end of the chunk says
+fn would_take(client: &RedisLink, bdata: &[u8]) -> bool {
+    !client.held_back
+        && client.link.is_some()
+        && client.stuck_since.is_none()
+        && client
+            .filter
+            .as_ref()
+            .is_none_or(|f| f.apply(bdata).is_some())
 }
 
 /// Plan package `p` for target `t`; true when it was added to the target's pending
@@ -3326,8 +3473,8 @@ fn plan(
     // P4 = p4a: a limits check that is due reads what is pending first, so the length it
     // sees includes every package sent before, as with one RPUSH at a time
     if !client.pending.is_empty() && check_due(client) {
-        let (replies, error) = flush_target(client);
-        settle(config, client, replies, error, st);
+        let (replies, error) = write_target(client, t, st);
+        settle(config, client, t, replies, error, st);
         if client.link.is_none() {
             *up = Some(false);
             if accepts(client) {
@@ -3339,6 +3486,7 @@ fn plan(
     match prepare(id, client, bdata, &mut counts.deleted) {
         Ok(Prepared::Ready(b)) => {
             push_request(client, p, &b);
+            st.planned[p * st.targets + t] = true;
             true
         }
         Ok(Prepared::Not(Sent::Stuck)) => {
@@ -3363,6 +3511,7 @@ fn plan(
 fn settle(
     config: &Config,
     client: &mut RedisLink,
+    t: usize,
     replies: Vec<(usize, Reply)>,
     error: Option<String>,
     st: &mut ChunkState,
@@ -3371,17 +3520,33 @@ fn settle(
         send_error(config, &format!("error while sending to the client: {}", e));
         target_failed(client);
     }
+    st.answers[t].0 += replies.len();
     for (p, reply) in replies {
         match reply {
             Reply::Taken => st.taken[p] = true,
             Reply::Refused | Reply::Unknown => {
                 st.why[p].failed = true;
+                st.refused[p * st.targets + t] = true;
+                st.answers[t].1 += 1;
+                st.answers[t].2 |= reply == Reply::Unknown;
                 if !st.replicant {
-                    st.replan.push(p);
+                    st.replan.push((p, t));
                 }
             }
         }
     }
+}
+
+/// Write and read what is pending for target `t`, noting the highest package written
+fn write_target(
+    client: &mut RedisLink,
+    t: usize,
+    st: &mut ChunkState,
+) -> (Vec<(usize, Reply)>, Option<String>) {
+    if let Some(&last) = client.pending.last() {
+        st.written[t] = st.written[t].max(Some(last));
+    }
+    flush_target(client)
 }
 
 /// The error line of a failed delivery (it names the source, as 1.0.8 did)
