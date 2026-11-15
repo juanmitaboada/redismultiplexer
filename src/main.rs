@@ -188,6 +188,7 @@ struct RedisLink {
     filter: Option<Filter>,          // Client filter, compiled at start
     request: Vec<u8>,                // RPUSH requests not written yet, reused for every package
     pending: Vec<usize>,             // the sender: package (index in the chunk) of each request
+    ends: Vec<usize>,                // the sender: where each pending request ends in `request`
     endpoint: Endpoint,              // where to connect, built once
     connecting: Option<Connecting>,  // an attempt running outside this thread (X1c)
     down_since: Option<Instant>,     // when it was last seen working, while it is down
@@ -1945,6 +1946,7 @@ fn new_link(id: u16, config: &Config, client: &ClientConfig, filter: &Option<Fil
         filter: filter.clone(),
         request: Vec::new(),
         pending: Vec::new(),
+        ends: Vec::new(),
         endpoint: Endpoint::target(client).named(connection_name(
             &config.name,
             &client.name,
@@ -2727,6 +2729,39 @@ fn append_rpush(buf: &mut Vec<u8>, key: &[u8], value: &[u8]) {
     }
 }
 
+/// Add `RPUSH channel value` for package `p` to a target's pending requests, in release
+/// order: a package carried from another target can come before later ones planned there
+fn push_request(client: &mut RedisLink, p: usize, value: &[u8]) {
+    let channel = client.config.channel.as_bytes();
+    if client.pending.last().is_none_or(|&q| q < p) {
+        // The usual case, planned in release order: encoded in place
+        append_rpush(&mut client.request, channel, value);
+        client.pending.push(p);
+        client.ends.push(client.request.len());
+        return;
+    }
+    let mut one = Vec::new();
+    append_rpush(&mut one, channel, value);
+    put_request(client, p, &one);
+}
+
+/// Put an encoded request for package `p` among a target's pending ones, in release order
+fn put_request(client: &mut RedisLink, p: usize, request: &[u8]) {
+    let at = client.pending.partition_point(|&q| q < p);
+    if at == client.pending.len() {
+        client.request.extend_from_slice(request);
+    } else {
+        let from = if at == 0 { 0 } else { client.ends[at - 1] };
+        client.request.splice(from..from, request.iter().copied());
+        for end in &mut client.ends[at..] {
+            *end += request.len();
+        }
+    }
+    let end = if at == 0 { 0 } else { client.ends[at - 1] } + request.len();
+    client.pending.insert(at, p);
+    client.ends.insert(at, end);
+}
+
 /// Whether the queue of a target is due a check (L1a: monotonic clock, `>=`): never
 /// checked yet, `timelimit` seconds since the last check, or the countdown at 0. A target
 /// without `timelimit` and `checklimit` is checked every `DEFAULT_CHECK`.
@@ -3006,6 +3041,7 @@ fn write_pending(client: &mut RedisLink) -> Written {
         },
     };
     client.request.clear();
+    client.ends.clear();
     result
 }
 
@@ -3302,8 +3338,7 @@ fn plan(
     }
     match prepare(id, client, bdata, &mut counts.deleted) {
         Ok(Prepared::Ready(b)) => {
-            append_rpush(&mut client.request, client.config.channel.as_bytes(), &b);
-            client.pending.push(p);
+            push_request(client, p, &b);
             true
         }
         Ok(Prepared::Not(Sent::Stuck)) => {

@@ -3026,3 +3026,23 @@ fn spreader_never_sends_a_package_twice_to_one_target() {
         assert_eq!(got, chunk, "not every package once on every target");
     }
 }
+
+#[test]
+fn pending_requests_stay_in_release_order() {
+    // A request put before later ones lands before them, bytes and package alike
+    let c = chunk_config("spreader", &[1]);
+    let mut link = new_link(1, &c, &c.clients[0], &None);
+    for p in [5, 1, 3, 9, 0] {
+        push_request(&mut link, p, format!("v{p}").as_bytes());
+    }
+    assert_eq!(link.pending, vec![0, 1, 3, 5, 9]);
+    let mut want = Vec::new();
+    for p in [0, 1, 3, 5, 9] {
+        append_rpush(&mut want, b"dst0", format!("v{p}").as_bytes());
+    }
+    assert_eq!(link.request, want);
+    assert_eq!(link.ends.last(), Some(&want.len()));
+    let (replies, _) = flush_target(&mut link);
+    assert!(link.request.is_empty() && link.ends.is_empty() && link.pending.is_empty());
+    assert_eq!(replies.len(), 5);
+}
