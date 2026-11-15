@@ -881,7 +881,7 @@ fn run() -> i32 {
                         let ordered: Option<Arc<OrderBuffer>> = ordering_regex
                             .as_ref()
                             .map(|_| Arc::new(OrderBuffer::new()));
-                        let hold = Duration::from_secs(inconfig.ordering_buffer_time.unwrap_or(0));
+                        let hold = ordering_hold(inconfig.ordering_buffer_time);
 
                         // Counters of every child, and of the sender after them (no messages)
                         let stats = stats_slots(
@@ -1289,6 +1289,17 @@ fn filter_options_set(
     .collect()
 }
 
+/// How long the ordering buffer holds a package after it arrives (M3-c = ca). Absent:
+/// released at once. 0 is read as 1 s: 1.0.8 compared whole seconds, so 0 held a package
+/// until the next second and what arrived within it left sorted (M3R-35 = R35a).
+fn ordering_hold(buffer_time: Option<u64>) -> Duration {
+    match buffer_time {
+        None => Duration::ZERO,
+        Some(0) => Duration::from_secs(1),
+        Some(seconds) => Duration::from_secs(seconds),
+    }
+}
+
 /// Odd but working settings: the program starts and says so (M3-m = ma). Read on the
 /// configuration as parsed, before verify_config reads 0 as not set.
 fn config_warnings(config: &Config) -> Vec<String> {
@@ -1320,14 +1331,17 @@ fn config_warnings(config: &Config) -> Vec<String> {
             "{} has an empty ordering: every package is delivered at once, without ordering information",
             source
         )),
-        Some(_) => {
-            if config.ordering_buffer_time.unwrap_or(0) == 0 {
-                warnings.push(format!(
-                    "{} uses ordering without ordering_buffer_time: packages are released at once, still in order",
-                    source
-                ));
-            }
-        }
+        Some(_) => match config.ordering_buffer_time {
+            None => warnings.push(format!(
+                "{} uses ordering without ordering_buffer_time: packages are released at once, so only those that arrive together are sorted",
+                source
+            )),
+            Some(0) => warnings.push(format!(
+                "{} has ordering_buffer_time: 0, read as 1 second: packages are held 1 s, so those that arrive within it leave sorted",
+                source
+            )),
+            Some(_) => {}
+        },
     }
     let mut names: Vec<&str> = Vec::new();
     for client in &config.clients {
@@ -1346,19 +1360,31 @@ fn config_warnings(config: &Config) -> Vec<String> {
         } else {
             names.push(&client.name);
         }
-        if let (Some(soft), Some(hard)) = (client.softlimit, client.hardlimit) {
-            if soft > 0 && hard > 0 && soft >= hard {
-                warnings.push(format!(
-                    "{} has softlimit {} at or above hardlimit {}: the target is freed at the check right after it gets stuck",
+        let hard = client.hardlimit.filter(|&h| h > 0);
+        if let (Some(soft), Some(hard)) = (client.softlimit, hard) {
+            // Freed at a check that reads the list under softlimit; stuck at one that reads
+            // it at or above hardlimit (M3R-38)
+            match soft.cmp(&hard) {
+                std::cmp::Ordering::Equal => warnings.push(format!(
+                    "{} has softlimit {} equal to hardlimit: the target is freed only when its list goes under hardlimit",
+                    target, soft
+                )),
+                std::cmp::Ordering::Greater => warnings.push(format!(
+                    "{} has softlimit {} above hardlimit {}: the target is freed at the check right after it gets stuck",
                     target, soft, hard
-                ));
+                )),
+                std::cmp::Ordering::Less => {}
             }
         }
         if client.deleteblock == Some(0) {
-            warnings.push(format!(
-                "{} has deleteblock: 0, read as not set: the target is stuck at hardlimit instead of trimmed",
-                target
-            ));
+            warnings.push(if hard.is_some() {
+                format!(
+                    "{} has deleteblock: 0, read as not set: the target is stuck at hardlimit instead of trimmed",
+                    target
+                )
+            } else {
+                format!("{} has deleteblock: 0, read as not set", target)
+            });
         }
     }
     warnings
@@ -2493,7 +2519,18 @@ fn write_replacing(path: &Path, text: &[u8]) -> io::Result<()> {
     let tmp = PathBuf::from(tmp);
     let old = fs::metadata(&target).ok();
     let result = (|| {
-        fs::write(&tmp, text)?;
+        // A new file of our own: a stale one is removed first, and whatever is at that
+        // name when it is created (a file, a link planted there) fails the create instead
+        // of being written through (M3R-40)
+        match fs::remove_file(&tmp) {
+            Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
+            _ => {}
+        }
+        fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)?
+            .write_all(text)?;
         if let Some(old) = &old {
             let new = fs::metadata(&tmp)?;
             if (new.uid(), new.gid()) != (old.uid(), old.gid()) {

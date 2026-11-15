@@ -195,7 +195,7 @@ fn odd_settings_warn_and_start() {
         "Warning: A client has an empty name",
         "Warning: Client 'twin' is the name of more than one client",
         "sets ordering_limit without ordering: ignored",
-        "has softlimit 50 at or above hardlimit 40",
+        "has softlimit 50 above hardlimit 40",
     ] {
         assert!(err.contains(w), "no {:?} in {}", w, err);
     }

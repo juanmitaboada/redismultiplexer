@@ -217,3 +217,55 @@ fn ordering_strict_order_two_children() {
 fn ordering_strict_order_eight_children() {
     strict_order("ordering_strict_8", 8);
 }
+
+/// Pairs of neighbours out of ts order at the target, for 2000 packages pushed shuffled in
+/// four commands while the program runs (the review's measure of M3R-35)
+fn pairs_out_of_order(test: &str, buffer_time: &str, children: u16) -> usize {
+    let mut ctx = Ctx::new(test);
+    let src = ctx.key("src");
+    let t0 = ctx.key("t0");
+    let extra = format!(
+        "ordering: '\"ts\": *(?P<ts>\\d+),'\n{}ordering_limit: 200\n",
+        buffer_time
+    );
+    let cfg = ctx.config(
+        &src,
+        children,
+        "replicant",
+        &extra,
+        &[ctx.client_yaml("t0", &t0, "")],
+    );
+    let mut p = ctx.spawn(&cfg);
+    ctx.wait_for("the program started", |c| c.llen(&src) == 0);
+    thread::sleep(Duration::from_millis(500));
+    let input: Vec<String> = shuffled(2000).into_iter().map(pkg).collect();
+    for chunk in input.chunks(500) {
+        ctx.push(&src, chunk);
+    }
+    ctx.wait_drained(&src, &[(&t0, 2000)]);
+    p.stop(&ctx.pid_file());
+    let ts: Vec<u64> = ctx
+        .list(&t0)
+        .iter()
+        .map(|p| p[7..p.find(',').unwrap()].parse().unwrap())
+        .collect();
+    ts.windows(2).filter(|w| w[0] > w[1]).count()
+}
+
+/// M3R-35 = R35a: `ordering_buffer_time: 0` with `ordering` holds 1 s, as 1.0.8 did in
+/// effect (it compared whole seconds): what arrives together leaves sorted. Released at
+/// once, the stage 3 tip left 210 to 815 pairs out of order here.
+fn buffer_time_zero(test: &str, children: u16) {
+    let out = pairs_out_of_order(test, "ordering_buffer_time: 0\n", children);
+    assert_eq!(out, 0, "pairs out of order with ordering_buffer_time: 0");
+}
+
+#[test]
+fn ordering_buffer_time_zero_holds_a_second_one_child() {
+    buffer_time_zero("ordering_zero_1", 1);
+}
+
+#[test]
+fn ordering_buffer_time_zero_holds_a_second_four_children() {
+    buffer_time_zero("ordering_zero_4", 4);
+}

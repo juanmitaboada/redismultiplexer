@@ -1158,7 +1158,8 @@ fn verify_accepts_every_ordering_combination() {
                 let warned = |text: &str| config_warnings(&c).iter().any(|w| w.contains(text));
                 let without = warned("without ordering: ignored");
                 let empty = warned("has an empty ordering");
-                let no_time = warned("without ordering_buffer_time");
+                let no_time = warned("without ordering_buffer_time: packages are released at once, so only those that arrive together are sorted");
+                let zero = warned("has ordering_buffer_time: 0, read as 1 second");
                 assert_eq!(
                     without,
                     o.is_none() && (b.is_some() || l.is_some()),
@@ -1166,16 +1167,23 @@ fn verify_accepts_every_ordering_combination() {
                     (&o, b, l)
                 );
                 assert_eq!(empty, o.as_deref() == Some(""), "{:?}", (&o, b, l));
-                assert_eq!(
-                    no_time,
-                    o == regex && b.unwrap_or(0) == 0,
-                    "{:?}",
-                    (&o, b, l)
-                );
+                assert_eq!(no_time, o == regex && b.is_none(), "{:?}", (&o, b, l));
+                assert_eq!(zero, o == regex && b == Some(0), "{:?}", (&o, b, l));
+                assert!(!warned("still in order"), "{:?}", (&o, b, l));
                 assert!(verify_config(c).is_ok(), "{:?}", (&o, b, l));
             }
         }
     }
+}
+
+#[test]
+fn ordering_buffer_time_zero_holds_a_second() {
+    // M3R-35 = R35a: 1.0.8 compared whole seconds, so 0 held a package up to 1 s
+    assert_eq!(ordering_hold(None), Duration::ZERO);
+    assert_eq!(ordering_hold(Some(0)), Duration::from_secs(1));
+    assert_eq!(ordering_hold(Some(1)), Duration::from_secs(1));
+    assert_eq!(ordering_hold(Some(30)), Duration::from_secs(30));
+    assert_eq!(ordering_hold(Some(u64::MAX)), Duration::from_secs(u64::MAX));
 }
 
 #[test]
@@ -1817,11 +1825,55 @@ fn config_warnings_for_duplicate_names_and_soft_above_hard() {
     );
     assert!(
         w.iter()
-            .any(|w| w.contains("softlimit 10 at or above hardlimit 10")),
+            .any(|w| w.contains("softlimit 10 equal to hardlimit: the target is freed only when its list goes under hardlimit")),
         "{:?}",
         w
     );
     assert!(config_warnings(&config()).is_empty());
+}
+
+#[test]
+fn limit_warnings_say_what_happens() {
+    // M3R-38: softlimit above hardlimit frees the target at the next check; equal to it,
+    // only under hardlimit; deleteblock 0 without hardlimit has nothing to be stuck at
+    let warned = |soft: Option<u64>, hard: Option<u64>, block: Option<u64>| {
+        let mut c = config();
+        (
+            c.clients[0].softlimit,
+            c.clients[0].hardlimit,
+            c.clients[0].deleteblock,
+        ) = (soft, hard, block);
+        config_warnings(&c)
+    };
+    let w = warned(Some(12), Some(10), None);
+    assert!(
+        w.iter().any(|w| w.contains(
+            "softlimit 12 above hardlimit 10: the target is freed at the check right after it gets stuck"
+        )),
+        "{:?}",
+        w
+    );
+    let w = warned(Some(10), Some(10), None);
+    assert!(
+        w.iter()
+            .any(|w| w.contains("freed only when its list goes under hardlimit")),
+        "{:?}",
+        w
+    );
+    assert!(!w.iter().any(|w| w.contains("right after")), "{:?}", w);
+    assert!(warned(Some(9), Some(10), None).is_empty());
+    let w = warned(None, Some(10), Some(0));
+    assert!(
+        w.iter()
+            .any(|w| w.contains("stuck at hardlimit instead of trimmed")),
+        "{:?}",
+        w
+    );
+    let w = warned(None, None, Some(0));
+    assert_eq!(
+        w,
+        vec!["Client 't1' has deleteblock: 0, read as not set".to_string()]
+    );
 }
 
 #[test]
@@ -2253,6 +2305,36 @@ fn status_file_through_a_symbolic_link() {
     // The temporary file went beside the target, and is gone
     assert!(!dir.join("real").join("rm.status.tmp").exists());
     assert!(!dir.join("rm.status.tmp").exists());
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn status_file_never_written_through_what_is_at_the_temporary_name() {
+    // M3R-40: a stale file at <status>.tmp is replaced, not reused; a link planted there
+    // is removed, and the file it points to is left as it was
+    use std::os::unix::fs::MetadataExt;
+    let dir = scratch_dir("status_tmp_name");
+    let path = dir.join("rm.status");
+    let tmp = dir.join("rm.status.tmp");
+    fs::write(&path, "old").unwrap();
+    let before = fs::metadata(&path).unwrap().ino();
+    fs::write(&tmp, "stale stale stale stale").unwrap();
+    write_status(&path, b"new").unwrap();
+    assert_eq!(fs::read_to_string(&path).unwrap(), "new");
+    // Replaced whole, not written in place for want of the temporary file
+    assert_ne!(fs::metadata(&path).unwrap().ino(), before);
+    assert!(!tmp.exists());
+    let victim = dir.join("victim");
+    fs::write(&victim, "keep me").unwrap();
+    std::os::unix::fs::symlink(&victim, &tmp).unwrap();
+    write_status(&path, b"newer").unwrap();
+    assert_eq!(fs::read_to_string(&victim).unwrap(), "keep me");
+    assert_eq!(fs::read_to_string(&path).unwrap(), "newer");
+    assert!(!fs::symlink_metadata(&path)
+        .unwrap()
+        .file_type()
+        .is_symlink());
+    assert!(fs::symlink_metadata(&tmp).is_err());
     fs::remove_dir_all(&dir).unwrap();
 }
 

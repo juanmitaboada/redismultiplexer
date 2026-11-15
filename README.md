@@ -92,7 +92,7 @@ This feature take care of ordering the incoming queue before being processed, it
 ```yaml
 ordering: '.*"ts": *(?P<ts>\d+),.*#'
 ``` 
-- `ordering_buffer_time`: total of seconds that new packages must stay in the buffer so they get ordered
+- `ordering_buffer_time`: total of seconds that new packages must stay in the buffer so they get ordered. 0 is read as 1, as earlier versions held such a package up to a second (a warning at start says so); without the key, packages are released at once and only those that arrive together are sorted
 - `ordering_limit`: how many bytes to process during the extraction of the substring
 
 As an example:
