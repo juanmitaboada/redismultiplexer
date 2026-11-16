@@ -1,6 +1,6 @@
 name: redismultiplexer
-base: core20
-version: '1.0.8'
+base: core26
+version: '1.1.0'
 summary: A flexible Redis queue manager
 description: |
   RedisMultiplexer will take care of your queues in Redis.
@@ -13,17 +13,18 @@ website: https://www.juanmitaboada.com/
 contact: https://www.juanmitaboada.com/contact/
 
 grade: stable
+confinement: strict
 
-architectures:
-  - amd64
+platforms:
+  amd64:
 
 parts:
   redismultiplexer:
     plugin: rust
-    source: https://github.com/juanmitaboada/redismultiplexer.git
+    source: .
     build-packages:
+      - libssl-dev
       - pkg-config
-      - librust-openssl-dev
 
 apps:
   redismultiplexer:
