@@ -3,13 +3,23 @@ name = "redismultiplexer"
 version = "1.0.8"
 edition = "2021"
 rust-version = "1.85"
-description = "This is a program to transfer data from queues (push/pop) between different Redis server"
+description = "This is a program to transfer data from queues (push/pop) between different Redis servers"
 license = "Apache-2.0"
 homepage = "https://github.com/juanmitaboada/redismultiplexer"
 repository = "https://github.com/juanmitaboada/redismultiplexer"
 documentation = "https://github.com/juanmitaboada/redismultiplexer"
 readme = "README.md"
 authors = ["Juanmi Taboada <juanmi@juanmitaboada.com>"]
+# Only what builds and tests the program goes into the published crate
+include = [
+    "/src/**/*.rs",
+    "/tests/**/*.rs",
+    "/Cargo.toml",
+    "/Cargo.lock",
+    "/LICENSE",
+    "/README.md",
+    "/CHANGELOG",
+]
 
 [package.metadata.deb]
 maintainer = "Juanmi Taboada <juanmi@juanmitaboada.com>"
