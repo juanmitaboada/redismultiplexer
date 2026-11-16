@@ -1439,7 +1439,7 @@ fn stats_slots_do_not_share_a_cache_line() {
 
 /// The 1.0.8 spreader: try clients[0], rotate the list by one after every attempt, stop at
 /// the first success or after one full turn. Returns the original index that took it.
-fn old_spread(order: &mut Vec<usize>, mut attempt: impl FnMut(usize) -> bool) -> Option<usize> {
+fn old_spread(order: &mut [usize], mut attempt: impl FnMut(usize) -> bool) -> Option<usize> {
     let n = order.len();
     for _ in 0..n {
         let i = order[0];
@@ -3207,10 +3207,13 @@ fn late(list: &[Vec<u8>]) -> usize {
     n
 }
 
+/// One generated case: a client filter per target, and the failing target with its kind
+type ShareCase = (Vec<Option<&'static str>>, Option<(usize, Fails)>);
+
 /// The generated cases of one target count: every combination of SHARE_FILTERS (a seeded
 /// sample of 48 for 4 targets), each with no failure and with each kind of failure at
 /// each position (Mute on every fourth combination only: it costs its timeout)
-fn share_cases(targets: usize) -> Vec<(Vec<Option<&'static str>>, Option<(usize, Fails)>)> {
+fn share_cases(targets: usize) -> Vec<ShareCase> {
     let mut combos: Vec<Vec<Option<&'static str>>> = vec![vec![]];
     for _ in 0..targets {
         combos = combos
@@ -3458,7 +3461,7 @@ fn spreader_takes_back_a_held_target_after_its_probe() {
         "not its share again: {:?}",
         new[1]
     );
-    assert!(from_package(&old[1], 80).len() > 0);
+    assert!(!from_package(&old[1], 80).is_empty());
     for list in &new {
         assert_eq!(late(list), 0, "{list:?}");
     }

@@ -10,29 +10,6 @@
 //! It can replicate data between queues or sparce it between them
 //! It can reorder an incoming queue
 
-// Lints present in 1.0.7, allowed so that CI can enforce clippy -D warnings on new code.
-// Each one is tracked for removal in M3; unknown_lints keeps older clippy versions quiet.
-#![allow(
-    unknown_lints,
-    clippy::absurd_extreme_comparisons,
-    clippy::explicit_counter_loop,
-    clippy::len_zero,
-    clippy::needless_bool_assign,
-    clippy::needless_borrow,
-    clippy::needless_late_init,
-    clippy::needless_return,
-    clippy::partialeq_to_none,
-    clippy::println_empty_string,
-    clippy::ptr_arg,
-    clippy::redundant_field_names,
-    clippy::single_match,
-    clippy::too_many_arguments,
-    clippy::type_complexity,
-    clippy::unused_io_amount,
-    clippy::useless_borrows_in_formatting,
-    clippy::useless_conversion,
-    clippy::useless_format
-)]
 // Nothing writes to stdout or stderr but the logger (src/debugger.rs; with clippy.toml)
 #![cfg_attr(not(test), deny(clippy::print_stdout, clippy::print_stderr))]
 
@@ -773,12 +750,11 @@ fn run() -> i32 {
             let systemd = (args.len() == 3) && (args[2] == "systemd");
 
             // Build path to configuration
-            let final_path: String;
-            if systemd {
-                final_path = format!("/etc/redismultiplexer/{}.yaml", &args[1]);
+            let final_path: String = if systemd {
+                format!("/etc/redismultiplexer/{}.yaml", args[1])
             } else {
-                final_path = args[1].clone();
-            }
+                args[1].clone()
+            };
 
             // A configuration that cannot be used ends the program with EXIT_CONFIG
             let mut code = EXIT_CONFIG;
@@ -805,8 +781,8 @@ fn run() -> i32 {
                 let pidfile: Option<String>;
                 let statusfile: Option<String>;
                 if systemd {
-                    pidfile = Some(format!("/run/redismultiplexer/{}.pid", &args[1]));
-                    statusfile = Some(format!("/run/redismultiplexer/{}.status", &args[1]));
+                    pidfile = Some(format!("/run/redismultiplexer/{}.pid", args[1]));
+                    statusfile = Some(format!("/run/redismultiplexer/{}.status", args[1]));
                 } else {
                     // Get path to pid
                     if let Some(pid) = inconfig.pid.clone() {
@@ -1081,7 +1057,8 @@ fn verify_config(config: Config) -> Result<Config, String> {
     }
 
     // Verify children
-    if config.children <= 0 {
+    // u16: `<= 0` read as `== 0` (clippy::absurd_extreme_comparisons), same outcome
+    if config.children == 0 {
         return Err(format!(
             "Children is set to '{}', there is nothing to do without children",
             config.children
@@ -1089,7 +1066,7 @@ fn verify_config(config: Config) -> Result<Config, String> {
     }
 
     // Verify source name
-    if source.name.len() == 0 {
+    if source.name.is_empty() {
         return Err(format!(
             "Source '{}' has an empty name [hostname=\"{}\", port={}, channel=\"{}\"]",
             source.name, source.hostname, source.port, source.channel
@@ -1097,7 +1074,7 @@ fn verify_config(config: Config) -> Result<Config, String> {
     }
 
     // Verify source hostname
-    if source.hostname.len() == 0 {
+    if source.hostname.is_empty() {
         return Err(format!(
             "Source '{}' has an empty hostname [hostname=\"{}\", port={}, channel=\"{}\"]",
             source.name, source.hostname, source.port, source.channel
@@ -1105,7 +1082,7 @@ fn verify_config(config: Config) -> Result<Config, String> {
     }
 
     // Verify source channel
-    if source.channel.len() == 0 {
+    if source.channel.is_empty() {
         return Err(format!(
             "Source '{}' has an empty channel [hostname=\"{}\", port={}, channel=\"{}\"]",
             source.name, source.hostname, source.port, source.channel
@@ -1138,7 +1115,7 @@ fn verify_config(config: Config) -> Result<Config, String> {
             }
         }
         Some(v) => {
-            if v.len() == 0 {
+            if v.is_empty() {
                 return Err(format!(
                     "Source '{}' is using filters, but filter can not empty",
                     source.name
@@ -1168,11 +1145,11 @@ fn verify_config(config: Config) -> Result<Config, String> {
     }
 
     // Verify there are clients
-    if config.clients.len() > 0 {
+    if !config.clients.is_empty() {
         // Verify all clients
         for client in &config.clients {
             // Verify that hostname is not empty (an empty name only gets a warning, M1F-6)
-            if client.hostname.len() == 0 {
+            if client.hostname.is_empty() {
                 return Err(format!(
                     "Client '{}' has an empty hostname [hostname=\"{}\", port={}, channel=\"{}\"]",
                     client.name, client.hostname, client.port, client.channel
@@ -1180,7 +1157,7 @@ fn verify_config(config: Config) -> Result<Config, String> {
             }
 
             // Verify that channel is not empty
-            if client.channel.len() == 0 {
+            if client.channel.is_empty() {
                 return Err(format!(
                     "Client '{}' has an empty channel [hostname=\"{}\", port={}, channel=\"{}\"]",
                     client.name, client.hostname, client.port, client.channel
@@ -1237,7 +1214,7 @@ fn verify_config(config: Config) -> Result<Config, String> {
                     }
                 }
                 Some(v) => {
-                    if v.len() == 0 {
+                    if v.is_empty() {
                         return Err(format!(
                             "Client '{}' is using filters, but filter can not empty",
                             client.name
@@ -1253,9 +1230,7 @@ fn verify_config(config: Config) -> Result<Config, String> {
             }
         }
     } else {
-        return Err(format!(
-            "No clients found, you need clients to make this to work"
-        ));
+        return Err("No clients found, you need clients to make this to work".to_string());
     }
 
     // Every filter must compile: a bad client regex used to panic the workers (M1F-8)
@@ -1271,7 +1246,7 @@ fn verify_config(config: Config) -> Result<Config, String> {
         }
         limits_defaults(client);
     }
-    return Ok(config);
+    Ok(config)
 }
 
 /// The filtering options set, by key name, for the error when `filter` is missing (M3R-10)
@@ -1567,30 +1542,26 @@ fn get_config(path_to_config: String) -> Result<Config, String> {
                                     w
                                 );
                             }
-                            return Ok(vv);
+                            Ok(vv)
                         }
-                        Err(e) => {
-                            return Err(format!("There is an error in your configuration: {}", e))
-                        }
-                    };
+                        Err(e) => Err(format!("There is an error in your configuration: {}", e)),
+                    }
                 }
-                Err(e) => {
-                    return Err(format!(
-                        "Couldn't parse configuration at '{}': {}",
-                        path_to_config, e
-                    ))
-                }
+                Err(e) => Err(format!(
+                    "Couldn't parse configuration at '{}': {}",
+                    path_to_config, e
+                )),
             }
         } else {
             let error = format!(
                 "Couldn't open configuration at '{}': it is not a file!",
                 path_to_config
             );
-            return Err(error);
+            Err(error)
         }
     } else {
         let error = format!("Configuration at '{}' not found!", path_to_config);
-        return Err(error);
+        Err(error)
     }
 }
 
@@ -2138,6 +2109,7 @@ fn link(link: &mut Option<redis::Connection>) -> Result<&mut redis::Connection, 
 }
 
 /// Manage the full process from a child
+#[allow(clippy::too_many_arguments)] // a worker's whole setup, passed once at its start
 fn child(
     id: u16,
     ordering_regex: Option<Regex>,
@@ -2795,7 +2767,7 @@ fn can_check_queue(
         None => return true,
         Some(at) => now.saturating_duration_since(at),
     };
-    if (timelimit == None) && (checklimit == None) {
+    if timelimit.is_none() && checklimit.is_none() {
         return since >= DEFAULT_CHECK;
     }
     if let Some(t) = timelimit {
@@ -2832,11 +2804,11 @@ fn can_send(id: u16, client: &mut RedisLink, deleted: &mut u64) -> Result<bool, 
         let result: redis::RedisResult<u64> = link(&mut client.link)?.llen(&client.config.channel);
         match result {
             Ok(len) => {
-                if client.config.hardlimit != None {
+                if client.config.hardlimit.is_some() {
                     if client.stuck_since.is_none() {
                         // The client is not sleeping
                         if len >= client.config.hardlimit.unwrap() {
-                            if client.config.deleteblock == None {
+                            if client.config.deleteblock.is_none() {
                                 // We lock the client
                                 client.stuck_since = Some(Instant::now());
                                 print_debug!(
@@ -2916,13 +2888,13 @@ fn can_send(id: u16, client: &mut RedisLink, deleted: &mut u64) -> Result<bool, 
                 }
 
                 // If not stuck, can keep sending
-                return Ok(client.stuck_since.is_none());
+                Ok(client.stuck_since.is_none())
             }
             Err(e) => {
                 link_broken(client, &e);
-                return Err(format!("error requesting the length to the channel: {}", e));
+                Err(format!("error requesting the length to the channel: {}", e))
             }
-        };
+        }
     } else {
         // Count down packages, only with a checklimit (without one the counter was 0
         // after every check and this underflowed: a panic in a debug build, A-C4, M1F-1)
@@ -2956,7 +2928,7 @@ fn can_send(id: u16, client: &mut RedisLink, deleted: &mut u64) -> Result<bool, 
         }
 
         // Return whatever is the status of the queue (we can not check it out)
-        return Ok(client.stuck_since.is_none());
+        Ok(client.stuck_since.is_none())
     }
 }
 
@@ -3440,6 +3412,7 @@ fn would_take(client: &RedisLink, bdata: &[u8]) -> bool {
 
 /// Plan package `p` for target `t`; true when it was added to the target's pending
 /// requests
+#[allow(clippy::too_many_arguments)] // the planning state of one chunk, as spread_chunk holds it
 fn plan(
     id: u16,
     config: &Config,
