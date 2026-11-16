@@ -1,3 +1,149 @@
+rust-redismultiplexer (1.1.0-1) stable; urgency=medium
+
+  Speed
+  * Without ordering, each child delivers its own packages: no queuer thread
+    and no channel hops. Faster and less CPU per package (bench/BASELINE.md)
+  * Packages are bytes from end to end: payloads that are not UTF-8 are
+    delivered (1.0.8 lost them); filters are compiled once at start
+  * With ordering, one sender delivers for every child, in strict ts order
+    with any number of children (1.0.8: only with one child), writing up to
+    1000 RPUSH (4 MiB) per round trip to each target
+  * Stop within about a second without ordering (1.0.8: 2 to 4 s); with
+    ordering, the time to deliver what the buffer holds, at the pipelined
+    rate, with two lines: "Closing: delivering N held packages in order"
+    and "Flushed N packages in T s"
+
+  New optional keys (root and per client); files without them work as before
+  * `database`, `username` (Redis 6 ACL); passwords are passed as written,
+    so `#`, `/`, `?` and `%` work
+  * `connect_timeout` (default 2 s) and `command_timeout` (default 5 s), in
+    seconds, decimals allowed, at least 0.001; 0 waits as 1.0.8 did
+  * `filter_until_included`: the `filter_until` delimiter belongs to the
+    header (default false, as before)
+  * `filter_replace_header`: replace the whole header with a literal text
+  * Keys 1.0.8 ignored now act: a file that already had `database: 1`
+    now delivers to database 1
+
+  Failures
+  * A target that cannot be reached, closes or does not answer within
+    `command_timeout` is down: the others keep receiving, it is connected
+    again in the background after 1 s and then every 5 s at most, with one
+    line when it goes down and one when it is back. Packages are not kept
+    for it: replicant counts them failed for it; spreader gives them to the
+    next target, so after an unanswered RPUSH a package can be on two
+    targets (with ordering, up to one chunk)
+  * The source has the same timeouts: a source silent for more than 6 s is
+    connected again, and a reply that comes later than that loses its
+    package; `command_timeout: 0` at the root restores the 1.0.8 wait
+  * At its start each thread waits for its targets' first connection, up to
+    their connect plus command timeout, before it reads the source
+  * While the source is idle each connected target gets a PING once a
+    second instead of an LLEN, so a target restarted at night is connected
+    again before the next packages; an error reply to it keeps the link
+  * Every connection is named with CLIENT SETNAME; no CLIENT SETINFO
+  * With ordering, a target whose replies fail prints one error line per
+    flush, not one per package
+
+  Spreader with ordering
+  * Packages are shared as the round robin shares them one by one. When a
+    target refuses in its replies (an error reply, no reply, its connection
+    lost while a chunk is written), what it refused goes to the next target
+    that takes it: the shares of that chunk can differ from 1.0.8's by up to
+    those packages (at most the target's share of one chunk), and the order
+    at a target can break once per failure event, by at most the packages
+    refused in that chunk; with client filters that depend on the package's
+    place in the stream, the split after such an event can settle in
+    another of the splits 1.0.8 itself gives. A target that comes back is
+    used from the next chunk
+  * A target that answers errors to every package is offered one package
+    per chunk until it takes one, and is back to its share one chunk later
+  * Replicant with ordering: a target that breaks in the middle of a chunk
+    can miss the rest of that chunk (counted failed for it)
+
+  Limits
+  * `hardlimit` alone turns the limits on, with `softlimit` 80 % of it,
+    `checklimit` 10000 and `timelimit` 1 s unless given; between two checks
+    a queue can pass `hardlimit` by up to children x `checklimit` (one x
+    `checklimit` with ordering)
+  * A limit key at 0 is not set: a target with all four at 0 delivers
+    (1.0.8: stuck for the whole run)
+  * `deleteblock: 0` is read as not set, with a warning (1.0.8: an endless
+    trim once over `hardlimit`); trims go to the end of the list, lists
+    longer than 100000000 are no longer cut, and `deleted` counts what was
+    removed
+  * `timelimit: N` checks N s after the last check, on a monotonic clock
+  * No LLEN for a target without limits; a stuck target is checked again
+    once a second while the source is idle
+
+  Ordering
+  * A package is held `ordering_buffer_time` seconds from its arrival, on a
+    monotonic clock in milliseconds (1.0.8: between T and T + 1 s); equal
+    ts leave in arrival order (1.0.8: by payload bytes)
+  * `ordering_buffer_time: 0` is read as 1 s, with a warning
+  * No combination of `ordering`, `ordering_buffer_time` and
+    `ordering_limit` is an error any more; the odd ones get a warning
+  * "without ordering information" and "couldn't be parsed" warnings are
+    printed the first time, then at most once every 10 s per thread, with
+    the count of packages since the line before
+
+  Process
+  * SIGTERM and SIGHUP stop cleanly, as SIGINT: the ordering buffer is
+    delivered and the pid file removed (1.0.8: killed). Started under
+    nohup, SIGHUP stays ignored
+  * Exit codes: 0 after a stop by a signal, `--version` or `--help`; 2 for
+    a usage or configuration error (no argument, a file missing or
+    unreadable, YAML, validation, an unwritable pid file); 1 when a child
+    or the sender ended on its own (1.0.8: 0 for all)
+  * A child or the sender that ends on its own stops the program, with the
+    final status written, the pid file removed and what the sender held
+    counted as dropped
+  * Warnings at start, the program still starts: an unknown key (by name),
+    an empty or repeated client name, `softlimit` not under `hardlimit`,
+    `deleteblock: 0`, and the ordering cases above
+  * The banner and `--help` show the version without a build date
+
+  Status file
+  * Every 1.0.8 key keeps its meaning. Added: `filtered`, `stuck`,
+    `failed` (the breakdown of `drop`, as rates and `total_*` counts),
+    `queue`, `stuck_targets`, `down_targets`, `since_start` (counts since
+    the start) and `version`
+  * Written to `<status>.tmp` and renamed, so a reader never sees half a
+    file; where that cannot be done, in place with one warning
+
+  Log
+  * Colours only when the stream is a terminal: log files and the journal
+    have no colour codes
+  * Each line is written whole in one call: lines of different threads are
+    no longer mixed
+  * A line that cannot be written (a closed pipe, a full disk) is dropped
+    and the program goes on (1.0.8: the thread panicked)
+
+  Reading the configuration (serde_norway instead of serde_yaml 0.8)
+  * An empty `password:` means no password (1.0.8 sent "~")
+  * `True`, `TRUE`, `False`, `FALSE` are booleans; `Null`, `NULL` on an
+    optional key mean the key is absent; CR-only line ends are accepted
+
+  Files that 1.0.8 started and 1.1.0 refuses
+  * Control characters in the file (U+0085, U+2028 and U+2029 that end a
+    value are line breaks instead, and cut the value there); a value at
+    column 0 on the line after its key; an empty `hostname:` or `mode:`
+    (never worked)
+  * A client `filter` that does not compile (1.0.8 started and its children
+    panicked)
+  * A value of the wrong type on a key name 1.0.8 ignored: `database`,
+    `username`, `connect_timeout`, `command_timeout`,
+    `filter_until_included`, `filter_replace_header`; a timeout above 0 and
+    below 0.001 s; `filter_until_included` or `filter_replace_header`
+    without `filter`, or `filter_replace` with `filter_replace_header`
+
+  Packaging
+  * redis crate 0.32.7 with native TLS; build-time, dict and thread_tryjoin
+    removed
+  * The crate holds only what builds and tests the program
+  * Snap on base core26
+
+ -- Juanmi Taboada <juanmi@juanmitaboada.com>  Mon, 16 Nov 2026 21:40:17 +0100
+
 rust-redismultiplexer (1.0.8-1) stable; urgency=medium
 
   * Queuer waits on its channel instead of polling every millisecond (throughput)

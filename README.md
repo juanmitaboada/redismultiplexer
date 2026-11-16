@@ -279,3 +279,7 @@ clients:
     filter_limit: 100                   # optional
     filter_replace: ""                  # optional
 ```
+
+## License
+
+Copyright 2022-2026 Juanmi Taboada. Licensed under the Apache License 2.0 (LICENSE).
