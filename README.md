@@ -137,15 +137,15 @@ Each of this queues you just made are still in the same server, so you would use
 
 ## Testing and benchmarking
 
-Unit tests live in `src/main.rs`; integration tests under `tests/` start the
+Unit tests live in `src/tests.rs`; integration tests under `tests/` start the
 real binary against a Redis server given by `RM_TEST_REDIS_URL` (default
-`redis://127.0.0.1:6379`, database 0) and use keys under `rmtest:`. They
-need a release build for now, because in debug builds a client without limits
-hits an integer underflow check in `can_send`:
+`redis://127.0.0.1:6379`, database 0) and use keys under `rmtest:`. They run in
+release and in debug builds (debug has the overflow checks on):
 
 ```sh
 redis-server --port 6390 --save '' --appendonly no &
 RM_TEST_REDIS_URL=redis://127.0.0.1:6390 cargo test --release
+RM_TEST_REDIS_URL=redis://127.0.0.1:6390 cargo test
 ```
 
 `bench/` holds a black-box throughput bench (Python 3.11+, standard library

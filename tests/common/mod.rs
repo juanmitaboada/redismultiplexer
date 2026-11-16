@@ -137,11 +137,6 @@ pub struct Ctx {
 
 impl Ctx {
     pub fn new(test: &str) -> Ctx {
-        // A-C4: in debug builds an unlimited client panics on its second package
-        // (src/main.rs, can_send: `client.packages -= 1`). Remove this guard in M3.
-        if cfg!(debug_assertions) {
-            panic!("integration tests need a release build until A-C4 is fixed (M3): run `cargo test --release`");
-        }
         let ep = Endpoint::from_env();
         let client = redis::Client::open(ep.url.as_str())
             .unwrap_or_else(|e| panic!("{}='{}' is not a valid Redis URL: {}", ENV_URL, ep.url, e));
