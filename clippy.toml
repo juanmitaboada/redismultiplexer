@@ -1,0 +1,6 @@
+# Every line the program writes goes through src/debugger.rs (M3-j): one write per line,
+# a failed write never panics. Only that module may take the process's streams.
+disallowed-methods = [
+    { path = "std::io::stdout", reason = "write through debugger::log (M3-j, M3R-36)" },
+    { path = "std::io::stderr", reason = "write through debugger::log (M3-j, M3R-36)" },
+]

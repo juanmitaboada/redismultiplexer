@@ -33,6 +33,8 @@
     clippy::useless_conversion,
     clippy::useless_format
 )]
+// Nothing writes to stdout or stderr but the logger (src/debugger.rs; with clippy.toml)
+#![cfg_attr(not(test), deny(clippy::print_stdout, clippy::print_stderr))]
 
 // use std::mem;
 use regex::bytes::Regex;
@@ -40,7 +42,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::borrow::Cow;
 use std::cmp;
-use std::io::{self, stderr, stdout, Write};
+use std::io::{self, Write};
 use std::process;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
@@ -702,7 +704,7 @@ fn main() {
     let code = run();
     // process::exit runs no destructors: everything was dropped inside run() (the pid file
     // removed); only stdout may hold a partial line
-    let _ = stdout().flush();
+    debugger::flush();
     process::exit(code);
 }
 
@@ -716,7 +718,7 @@ fn run() -> i32 {
         // Check if version is requested
         if (args[1] == "version") || (args[1] == "--version") {
             // Answer with our version
-            println!("{} v{}", PROGRAM_NAME, VERSION);
+            plain(stdout(), format_args!("{} v{}", PROGRAM_NAME, VERSION));
             EXIT_OK
         } else if (args[1] == "help") || (args[1] == "--help") || (args[1] == "-h") {
             // Welcome
@@ -750,7 +752,7 @@ fn run() -> i32 {
             print_debug!(PROGRAM_NAME, stderr(), COLOR_CYAN, COLOR_NOHEAD, "");
 
             // Answer with out version
-            println!("");
+            plain(stdout(), format_args!(""));
             EXIT_OK
         } else {
             // Welcome
@@ -2149,6 +2151,9 @@ fn child(
     let source_endpoint =
         Endpoint::source(&config).named(connection_name(&config.name, "-", &format!("src{}", id)));
 
+    // The rate-limited warnings of packages that cannot be ordered (TS_MISSING, TS_UNPARSED)
+    let mut repeats = [Repeated::default(), Repeated::default()];
+
     // Prepare the retention data
     while keepworking {
         // Stopped while (re)connecting: a worker holds nothing between packages
@@ -2211,14 +2216,20 @@ fn child(
                                                         None
                                                     }
                                                     Err(warning) => {
-                                                        print_debug!(
-                                                            PROGRAM_NAME,
-                                                            stderr(),
-                                                            COLOR_YELLOW,
-                                                            0,
-                                                            "{}",
-                                                            warning
-                                                        );
+                                                        let kind =
+                                                            usize::from(warning == TS_UNPARSED);
+                                                        if let Some(line) = repeats[kind]
+                                                            .hit(warning, Instant::now())
+                                                        {
+                                                            print_debug!(
+                                                                PROGRAM_NAME,
+                                                                stderr(),
+                                                                COLOR_YELLOW,
+                                                                0,
+                                                                "{}",
+                                                                line
+                                                            );
+                                                        }
                                                         Some(raw_bdata)
                                                     }
                                                 }
@@ -2303,6 +2314,14 @@ fn child(
         }
     }
 
+    // The warnings counted and not printed yet: one line each, from the thread's own exit
+    // path (a thread that panics loses them, declared)
+    for (repeat, warning) in repeats.iter_mut().zip([TS_MISSING, TS_UNPARSED]) {
+        if let Some(line) = repeat.left(warning) {
+            print_debug!(PROGRAM_NAME, stderr(), COLOR_YELLOW, 0, "{}", line);
+        }
+    }
+
     #[cfg(feature = "debug")]
     print_debug!(PROGRAM_NAME, stdout(), COLOR_BLUE, 0, "Child {}: Ends", id);
 }
@@ -2364,88 +2383,7 @@ fn statistics(
     // Show statistics
     // The final call can come right after a periodic one: keep the rates finite
     let diff: f64 = (((get_current_time_with_ms() - lasttime) as f64) / 1000.0).max(0.001);
-    print_debug!(
-        PROGRAM_NAME,
-        stdout(),
-        COLOR_BLUE,
-        COLOR_NOTAIL,
-        "{} - ",
-        name
-    );
-    print_debug!(
-        PROGRAM_NAME,
-        stdout(),
-        COLOR_CYAN,
-        COLOR_NOHEAD_NOTAIL,
-        "Incoming: {:.1} regs/sec",
-        (incoming as f64) / diff
-    );
-    print_debug!(
-        PROGRAM_NAME,
-        stdout(),
-        COLOR_WHITE,
-        COLOR_NOHEAD_NOTAIL,
-        " | "
-    );
-    if ordered.is_some() {
-        print_debug!(
-            PROGRAM_NAME,
-            stdout(),
-            COLOR_GREEN,
-            COLOR_NOHEAD_NOTAIL,
-            "Queue: {} regs",
-            ordered.map_or(0, |b| b.len())
-        );
-        print_debug!(
-            PROGRAM_NAME,
-            stdout(),
-            COLOR_WHITE,
-            COLOR_NOHEAD_NOTAIL,
-            " | "
-        );
-    }
-    print_debug!(
-        PROGRAM_NAME,
-        stdout(),
-        COLOR_GREEN,
-        COLOR_NOHEAD_NOTAIL,
-        "Outgoing: {:.1} regs/sec",
-        (outgoing as f64) / diff
-    );
-    print_debug!(
-        PROGRAM_NAME,
-        stdout(),
-        COLOR_WHITE,
-        COLOR_NOHEAD_NOTAIL,
-        " | "
-    );
-    print_debug!(
-        PROGRAM_NAME,
-        stdout(),
-        COLOR_RED,
-        COLOR_NOHEAD_NOTAIL,
-        "Dropped: {:.1} regs/sec",
-        (dropped as f64) / diff
-    );
-    if deleted > 0 {
-        print_debug!(
-            PROGRAM_NAME,
-            stdout(),
-            COLOR_WHITE,
-            COLOR_NOHEAD_NOTAIL,
-            " | "
-        );
-        print_debug!(
-            PROGRAM_NAME,
-            stdout(),
-            COLOR_YELLOW,
-            COLOR_NOHEAD_NOTAIL,
-            "Deleted: {:.1} regs/sec",
-            (deleted as f64) / diff
-        );
-    }
-
-    // Show stuck clients
+    // Stuck clients
     let stucks: Vec<String> = stuck_clients(stats, clients.len())
         .into_iter()
         .map(|c| {
@@ -2453,16 +2391,65 @@ fn statistics(
             format!("{}:{}", client.name, client.channel)
         })
         .collect();
-    if stucks.len() > 0 {
-        print_debug!(
-            PROGRAM_NAME,
-            stdout(),
-            COLOR_YELLOW,
-            COLOR_NOHEAD_NOTAIL,
-            "  -> Stucked: [ {} ]",
-            stucks.join(", ")
+
+    // One line, built whole and written in one call (M3-j: today's text, colour by part)
+    emit(stdout(), |line, on| {
+        if on {
+            line.extend_from_slice(COLOR_BLUE);
+        }
+        head(line);
+        let _ = write!(line, "{} - ", name);
+        if on {
+            line.extend_from_slice(COLOR_CLOSE);
+        }
+        let rate = |n: u64| (n as f64) / diff;
+        part(
+            line,
+            on,
+            COLOR_CYAN,
+            format_args!("Incoming: {:.1} regs/sec", rate(incoming)),
         );
-    }
+        part(line, on, COLOR_WHITE, format_args!(" | "));
+        if let Some(buffer) = ordered {
+            part(
+                line,
+                on,
+                COLOR_GREEN,
+                format_args!("Queue: {} regs", buffer.len()),
+            );
+            part(line, on, COLOR_WHITE, format_args!(" | "));
+        }
+        part(
+            line,
+            on,
+            COLOR_GREEN,
+            format_args!("Outgoing: {:.1} regs/sec", rate(outgoing)),
+        );
+        part(line, on, COLOR_WHITE, format_args!(" | "));
+        part(
+            line,
+            on,
+            COLOR_RED,
+            format_args!("Dropped: {:.1} regs/sec", rate(dropped)),
+        );
+        if deleted > 0 {
+            part(line, on, COLOR_WHITE, format_args!(" | "));
+            part(
+                line,
+                on,
+                COLOR_YELLOW,
+                format_args!("Deleted: {:.1} regs/sec", rate(deleted)),
+            );
+        }
+        if !stucks.is_empty() {
+            part(
+                line,
+                on,
+                COLOR_YELLOW,
+                format_args!("  -> Stucked: [ {} ]", stucks.join(", ")),
+            );
+        }
+    });
 
     // Write statistics: every 1.0.8 key with its meaning, then the breakdown of `drop`,
     // the targets stuck and down, the counts since the start (M3-e = ea)
@@ -2516,9 +2503,6 @@ fn statistics(
             );
         }
     }
-
-    // Show tail
-    print_debug!(PROGRAM_NAME, stdout(), COLOR_WHITE, COLOR_NOHEAD, "");
 }
 
 /// Set once the status file had to be written in place (one warning, D4d-4 = a)
@@ -3578,11 +3562,57 @@ fn ordering_ts(re: &Regex, limit: Option<usize>, data: &[u8]) -> Result<u128, &'
             std::str::from_utf8(parsed_ts)
                 .ok()
                 .and_then(|s| s.parse::<u128>().ok())
-                .ok_or(
-                    "Found a package with ordering information but 'ts' couldn't be parsed to u128",
-                )
+                .ok_or(TS_UNPARSED)
         }
-        None => Err("Found a package without ordering information"),
+        None => Err(TS_MISSING),
+    }
+}
+
+/// The two warnings of a package that cannot be ordered (it is delivered at once)
+const TS_MISSING: &str = "Found a package without ordering information";
+const TS_UNPARSED: &str =
+    "Found a package with ordering information but 'ts' couldn't be parsed to u128";
+
+/// A warning that can come once per package: the first one is printed, then at most one
+/// line per REPEAT_WINDOW (M3-j = ja, plan 2.8). A line stands for the packages since the
+/// line before it: the warning alone is one package, "<warning> (N since the last line)"
+/// is N; so the lines of a thread add up to every such package it met.
+#[derive(Debug, Default)]
+struct Repeated {
+    last: Option<Instant>,
+    more: u64, // met since the last line, not printed
+}
+
+impl Repeated {
+    /// One more at `now`: the line to print, if one is due (it counts this one too)
+    fn hit(&mut self, warning: &str, now: Instant) -> Option<String> {
+        match self.last {
+            Some(at) if now.saturating_duration_since(at) < REPEAT_WINDOW => {
+                self.more += 1;
+                None
+            }
+            _ => {
+                self.last = Some(now);
+                Some(repeated_line(warning, std::mem::take(&mut self.more) + 1))
+            }
+        }
+    }
+
+    /// The line for those met since the last line, when the thread ends (none if none)
+    fn left(&mut self, warning: &str) -> Option<String> {
+        match std::mem::take(&mut self.more) {
+            0 => None,
+            more => Some(format!("{} ({} since the last line)", warning, more)),
+        }
+    }
+}
+
+/// A rate-limited warning's line for `count` packages: the warning alone for one
+fn repeated_line(warning: &str, count: u64) -> String {
+    if count == 1 {
+        warning.to_string()
+    } else {
+        format!("{} ({} since the last line)", warning, count)
     }
 }
 

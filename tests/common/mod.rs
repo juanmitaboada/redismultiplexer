@@ -11,6 +11,7 @@ use redis::Commands;
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
+use std::os::fd::FromRawFd;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -303,7 +304,17 @@ impl Ctx {
         self.spawn_cmd(Command::new("sh").args(["-c", script, bin()]).arg(config))
     }
 
+    /// As spawn, with stdout or stderr a pipe whose reader is already gone (M3R-36): every
+    /// write to it fails with EPIPE. The other stream goes to its file as usual.
+    pub fn spawn_closed(&self, config: &Path, closed: Closed) -> Proc {
+        self.spawn_streams(Command::new(bin()).arg(config), Some(closed))
+    }
+
     fn spawn_cmd(&self, cmd: &mut Command) -> Proc {
+        self.spawn_streams(cmd, None)
+    }
+
+    fn spawn_streams(&self, cmd: &mut Command, closed: Option<Closed>) -> Proc {
         let out = self.dir.join("stdout.log");
         let err = self.dir.join("stderr.log");
         // The program keeps an inherited SIG_IGN for SIGHUP (M3F-14), so a suite started
@@ -316,10 +327,17 @@ impl Ctx {
                 Ok(())
             });
         }
+        let stream = |path: &Path, which: Closed| {
+            if closed == Some(which) {
+                closed_pipe()
+            } else {
+                Stdio::from(fs::File::create(path).unwrap())
+            }
+        };
         let child = cmd
             .stdin(Stdio::null())
-            .stdout(fs::File::create(&out).unwrap())
-            .stderr(fs::File::create(&err).unwrap())
+            .stdout(stream(&out, Closed::Stdout))
+            .stderr(stream(&err, Closed::Stderr))
             .spawn()
             .expect("failed to start redismultiplexer");
         Proc {
@@ -356,6 +374,26 @@ impl Drop for Ctx {
             let _: Result<i64, _> = self.con.del(self.keys.clone());
         }
         let _ = fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// Which stream of the program has no reader (spawn_closed)
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Closed {
+    Stdout,
+    Stderr,
+}
+
+/// A pipe whose read end is closed before the program starts: a write to it fails with
+/// EPIPE (the Rust runtime ignores SIGPIPE), never blocks
+pub fn closed_pipe() -> Stdio {
+    let mut fds = [0; 2];
+    // SAFETY: pipe() fills two descriptors this process owns; the read end is closed at once
+    // and the write end is handed to Stdio, which closes it
+    unsafe {
+        assert_eq!(libc::pipe(fds.as_mut_ptr()), 0, "pipe() failed");
+        libc::close(fds[0]);
+        Stdio::from(std::os::fd::OwnedFd::from_raw_fd(fds[1]))
     }
 }
 

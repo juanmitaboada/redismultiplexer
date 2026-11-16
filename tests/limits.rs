@@ -11,19 +11,26 @@ use std::time::Duration;
 
 const LIMITS: &str = "    timelimit: 1\n    checklimit: 1\n    softlimit: 5\n    hardlimit: 10\n";
 
-/// Messages `<id> - t0 :: <channel> <word> (Len: n)` printed by the workers (ids below
-/// `children`; the sender's id is `children`). Counted by message, not by line: a line
-/// is written in several pieces, so threads printing at once can put two messages, or a
-/// colour code of another, on one line. The id is the run of digits right before " - t0".
+/// Lines `<date> RedisMultiplexer: <id> - t0 :: <channel> <word> (Len: n)` printed by the
+/// workers (ids below `children`; the sender's id is `children`). Counted by line: a line
+/// is written whole in one call (M3-j), so each holds one message; asserted here.
 fn worker_lines(stderr: &str, word: &str, children: u16) -> usize {
-    let at: Vec<usize> = stderr.match_indices(" - t0 :: ").map(|(i, _)| i).collect();
-    at.iter()
-        .enumerate()
-        .filter(|&(k, &i)| {
-            let end = at.get(k + 1).copied().unwrap_or(stderr.len());
-            let msg = &stderr[i..end];
-            let said = msg.find('!').is_some_and(|b| msg[..=b].ends_with(word));
-            let head = &stderr[..i];
+    stderr
+        .lines()
+        .filter(|line| {
+            let Some(i) = line.find(" - t0 :: ") else {
+                return false;
+            };
+            assert_eq!(
+                line.matches(" - t0 :: ").count(),
+                1,
+                "two messages on one line: {}",
+                line
+            );
+            let said = line[i..]
+                .find('!')
+                .is_some_and(|b| line[i..i + b + 1].ends_with(word));
+            let head = &line[..i];
             let start = head
                 .rfind(|c: char| !c.is_ascii_digit())
                 .map_or(0, |d| d + 1);

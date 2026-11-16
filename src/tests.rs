@@ -3520,3 +3520,103 @@ fn spreader_carries_only_to_targets_that_wrote_nothing_later() {
     );
     assert_eq!(late(&got[2]), 0, "t2: {:?}", got[2]);
 }
+
+#[test]
+fn repeated_warning_prints_once_per_window_and_counts_the_rest() {
+    let t0 = Instant::now();
+    let mut r = Repeated::default();
+    let w = TS_MISSING;
+    // The first at once, then nothing for REPEAT_WINDOW
+    assert_eq!(r.hit(w, t0).as_deref(), Some(w));
+    for k in 1..1000u32 {
+        assert_eq!(r.hit(w, t0 + Duration::from_millis(u64::from(k))), None);
+    }
+    // After the window: one line for the 999 not printed and this one
+    let line = r.hit(w, t0 + REPEAT_WINDOW).unwrap();
+    assert_eq!(line, format!("{} (1000 since the last line)", w));
+    // A line due with nothing kept back is the warning alone
+    assert_eq!(r.hit(w, t0 + REPEAT_WINDOW * 3).as_deref(), Some(w));
+    assert_eq!(r.left(w), None);
+    // Those kept back when the thread ends: one line with their count
+    r.hit(w, t0 + REPEAT_WINDOW * 3 + Duration::from_millis(1));
+    r.hit(w, t0 + REPEAT_WINDOW * 3 + Duration::from_millis(2));
+    assert_eq!(r.left(w), Some(format!("{} (2 since the last line)", w)));
+    assert_eq!(r.left(w), None);
+}
+
+#[test]
+fn repeated_warnings_of_two_kinds_do_not_share_a_count() {
+    let t0 = Instant::now();
+    let mut kinds = [Repeated::default(), Repeated::default()];
+    assert!(kinds[0].hit(TS_MISSING, t0).is_some());
+    assert!(kinds[1].hit(TS_UNPARSED, t0).is_some());
+    assert!(kinds[0].hit(TS_MISSING, t0).is_none());
+    assert_eq!(kinds[1].left(TS_UNPARSED), None);
+    assert_eq!(
+        kinds[0].left(TS_MISSING),
+        Some(format!("{} (1 since the last line)", TS_MISSING))
+    );
+}
+
+#[test]
+fn a_line_is_built_whole_with_colours_only_when_asked() {
+    let mut on = Vec::new();
+    one_colour(
+        &mut on,
+        true,
+        COLOR_RED,
+        0,
+        format_args!("t0 :: {} stuck!", "dst"),
+    );
+    assert!(
+        on.starts_with(COLOR_RED),
+        "{:?}",
+        String::from_utf8_lossy(&on)
+    );
+    assert!(
+        on.ends_with(b"t0 :: dst stuck!\x1B[1;0m"),
+        "{:?}",
+        String::from_utf8_lossy(&on)
+    );
+    assert_eq!(
+        on.windows(18)
+            .filter(|w| w == b"RedisMultiplexer: ")
+            .count(),
+        1
+    );
+    let mut off = Vec::new();
+    one_colour(
+        &mut off,
+        false,
+        COLOR_RED,
+        0,
+        format_args!("t0 :: {} stuck!", "dst"),
+    );
+    assert!(!off.contains(&0x1B), "{:?}", String::from_utf8_lossy(&off));
+    assert!(off.ends_with(b"RedisMultiplexer: t0 :: dst stuck!"));
+    // The same text without the codes
+    let stripped: Vec<u8> = String::from_utf8_lossy(&on)
+        .replace("\x1B[1;31m", "")
+        .replace("\x1B[1;0m", "")
+        .into_bytes();
+    assert_eq!(stripped, off);
+    // No head
+    let mut bare = Vec::new();
+    one_colour(
+        &mut bare,
+        false,
+        COLOR_CYAN,
+        COLOR_NOHEAD,
+        format_args!("Usage"),
+    );
+    assert_eq!(bare, b"Usage");
+    // A part of a line: its colour, its text, the closing code
+    let mut p = Vec::new();
+    part(&mut p, true, COLOR_WHITE, format_args!(" | "));
+    assert_eq!(
+        p,
+        [COLOR_WHITE.as_slice(), b" | ", COLOR_CLOSE.as_slice()].concat()
+    );
+    part(&mut p, false, COLOR_WHITE, format_args!(" | "));
+    assert!(p.ends_with(b"\x1B[1;0m | "));
+}

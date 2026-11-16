@@ -28,6 +28,9 @@ pub const TARGET_BACKOFF_MAX: Duration = Duration::from_secs(5);
 // packages and this many bytes of them per chunk; a larger package goes alone
 pub const CHUNK_PACKAGES: usize = 1000;
 pub const CHUNK_BYTES: usize = 4 << 20;
+// A warning that can come once per package is printed at most once per this time, per
+// thread and kind, with the count of the others (M3-j = ja, plan 2.8)
+pub const REPEAT_WINDOW: Duration = Duration::from_secs(10);
 
 // Autofields
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
