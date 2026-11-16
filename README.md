@@ -43,10 +43,17 @@ Inside the `clients` entry of the YAML configuration:
 Every configuration will have
 
 - `name`: will be used on the screen when RedisMultiplexer has to show some message on the screen
-- `hostname`: hostname of the Redis server
-- `post`: post number of the Redis server
-- `password`: password of the Redis server
+- `hostname`: hostname of the Redis server (an IPv6 address may be written `[::1]`)
+- `port`: port number of the Redis server
+- `password`: password of the Redis server; empty for none
 - `channel`: name of queue to process
+- `username` (optional): the Redis 6 ACL user; empty or absent for none
+- `database` (optional): the database selected after connecting; 0 when absent
+- `ssl` (optional): `true` connects with TLS, checking the server's certificate against the system's trusted ones; `false` (default) plain TCP
+- `connect_timeout` (optional): seconds to wait for a connection; 2 when absent, 0 for no limit (the system's), otherwise at least 0.001
+- `command_timeout` (optional): seconds to wait for a reply, and for a write to go out; 5 when absent, 0 for no limit, otherwise at least 0.001. The source's reads wait one second more (a read waits up to 1 s for a package)
+
+Each connection is named with `CLIENT SETNAME redismultiplexer:<source>:<target>:<role>` (characters a name may not hold become `_`); a server that refuses the command is used without the name.
 
 ### Filters are optional:
 
@@ -104,6 +111,12 @@ ordering_buffer_time: 30
 ordering_limit: 200
 ```
 
+What ordering guarantees:
+- A package is held `ordering_buffer_time` seconds from its arrival, then released in `ts` order (equal `ts` in arrival order). A held package with a lower `ts` holds back the ones behind it, so the order holds among the packages the buffer has at once: one that arrives after a later `ts` was released goes out after it.
+- A package without a match, or whose `ts` is not a number that fits u128, is delivered at once, without waiting, and a warning says so (see Log).
+- With ordering, one sender thread delivers for every child. It writes the released packages to each target in chunks (up to 1000 packages or 4 MiB, a larger package alone), pipelined, and each target gets its packages in release order.
+- In `spreader` mode the packages are shared as the round robin would share them one by one. When a target refuses in its replies (an error, no reply, the connection lost), what it refused goes to another target. The order at that target can then break once per failure event, by at most the packages refused in that chunk, and the shares can differ from the round robin's in that chunk. A target that answers errors to every package of a chunk is held back: it is offered one package per chunk until it takes one, and it is back to its share at most one chunk later.
+
 ## How all of this works
 
 ### Example 1: forwarding packages between server
@@ -134,6 +147,54 @@ Now let's imagine that one of the queues will be used to teach the same ML with 
 But let's go farther, you will need a test data and a learning data in disjoint groups so learning system won't learn from test data and we can use test data for prediction to test how good the ML system is learning. You can split data in percentages, lets say 10% test / 90% learning. You would use a RedisMultiplexer in `spreader` mode to 10 different clients, 1 of those clients will be the testing queue while the other 9 clients will be the same learning queue. Still you may would like another RedisMultiplexer as a forwarder to reorder data.
 
 Each of this queues you just made are still in the same server, so you would use one RedisMultiplexer by each of those queues to put data out from that server to another remote server, in this way you would be using RedisMultiplexer as a rentention system in case there are network issues.
+
+## Running
+
+```sh
+redismultiplexer <path_to_config.yaml>
+redismultiplexer <name> systemd     # /etc/redismultiplexer/<name>.yaml, pid and status in /run/redismultiplexer/
+redismultiplexer --version          # also: version
+redismultiplexer --help             # also: help, -h
+```
+
+At start the configuration is checked. A file that cannot be used (an unknown `mode`, no clients, a limit key without `hardlimit`, a filter option without `filter`, a timeout out of range, a regular expression that does not compile, among others) stops the program with exit code 2 and the reason. A key the program does not know is named in a warning and ignored; settings that work but are odd (`ordering_buffer_time` or `ordering_limit` without `ordering`, `ordering` without `ordering_buffer_time`, `ordering_buffer_time: 0`, `deleteblock: 0`, `softlimit` not under `hardlimit`, a client name empty or used twice) get a warning too, and the program starts.
+
+Signals: SIGINT, SIGTERM and SIGHUP stop the program cleanly. Started with SIGHUP ignored (as under `nohup`), it keeps ignoring it.
+
+The stop: each child finishes the package it holds (a read from the source waits at most a second), then, with ordering, the sender delivers everything the buffer holds, in order, and the pid file is removed. With a target that never answers, the stop takes at most one `command_timeout` for the chunk in flight, plus the delivery of what the buffer holds at the pipelined rate, plus one `command_timeout` for each reconnection to that target within that time: there is no bound that does not depend on what the buffer holds.
+
+Exit codes:
+- `0`: stopped by a signal, `--version`, `--help`
+- `1`: a thread ended on its own (a child or the sender); the others are stopped and what the buffer held is counted as dropped
+- `2`: the configuration cannot be read or used, or no argument was given
+
+## Status file
+
+With `status` set (or `systemd`), a JSON object is written every 10 seconds and at the stop. The file is replaced whole: the text goes to `<status>.tmp` beside it and is renamed over it, so a reader never sees half of it. A status path that is a symbolic link stays a link (the file it points to is replaced), and an existing file keeps its mode, owner and group. Where the file cannot be replaced (a directory the program may not write, for one), it is written in place, with one warning the first time.
+
+| Key | Meaning |
+|---|---|
+| `date` | when it was written (seconds since the epoch) |
+| `in`, `out`, `drop`, `deleted` | packages per second over the last interval: read from the source, delivered, dropped, deleted from target queues by `deleteblock` |
+| `total_in`, `total_out`, `total_drop`, `total_deleted` | the same, as counts over the last interval |
+| `filtered`, `stuck`, `failed` | the breakdown of `drop`, per second: no target accepted the package (the filters); every target that accepted it was stuck at its `hardlimit`; a target that accepted it could not take it (down, an error, no reply) |
+| `total_filtered`, `total_stuck`, `total_failed` | the same, as counts; they add up to `total_drop` |
+| `queue` | packages held in the ordering buffer (0 without ordering) |
+| `stuck_targets`, `down_targets` | `<name>:<channel>` of the targets stuck at their `hardlimit`, and of those without a connection |
+| `since_start` | `in`, `out`, `drop`, `deleted`, `filtered`, `stuck`, `failed` as counts since the start |
+| `version` | the program's version |
+
+A package that was not delivered counts once in `drop`: `failed` when a target that accepted it could not take it, else `stuck` when every target that accepted it was stuck, else `filtered`.
+
+## Log
+
+Each line is `<date> RedisMultiplexer: <message>`, written whole in one call. The banner, the start-up summary and a statistics line every 10 seconds go to stdout; errors and warnings go to stderr. Colours are used only when the stream is a terminal. A line that cannot be written (a closed pipe, a full disk) is dropped and the program goes on.
+
+A warning that can come once per package (a package that cannot be ordered) is printed the first time, then at most once every 10 seconds per thread and kind, as `<warning> (N since the last line)`, where N counts the packages since the line before; when the thread ends, the ones not printed yet get one last such line.
+
+## When a target fails
+
+A target that cannot be reached, closes its connection or does not answer within `command_timeout` is down: the threads go on without it and try to connect again in the background, after 1 second and then up to every 5 seconds. Packages are not kept for a target that is down. In `replicant` mode the other targets still get them; in `spreader` mode they go to the next target; a package no target could take is dropped and counted as `failed`. A target that answers an error keeps its connection, and the package it refused is handled the same way. A target stuck at its `hardlimit` is skipped the same way until its queue is under `softlimit` (or trimmed by `deleteblock`), and a package only stuck targets accepted counts as `stuck`.
 
 ## Testing and benchmarking
 
@@ -179,6 +240,11 @@ filter_replace: "ELL"                   # optional
 ordering: '.*"ts": *(?P<ts>\d+),.*#'    # optional
 ordering_buffer_time: 30                # optional
 ordering_limit: 200                     # optional
+username    : "app"                     # optional
+database    : 0                         # optional
+ssl         : false                     # optional
+connect_timeout: 2                      # optional
+command_timeout: 5                      # optional
 
 clients:
   - name        : "Target 1"
@@ -196,6 +262,8 @@ clients:
     filter_until_included: true         # optional
     filter_limit: 100                   # optional
     filter_replace: ""                  # optional
+    ssl         : true                  # optional
+    command_timeout: 1.5                # optional
   - name        : "DB2"
     hostname    : "127.0.0.1"
     port        : 6379

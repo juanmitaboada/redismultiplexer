@@ -308,11 +308,21 @@ fn yaml_readme_example() {
     let body = &readme[start..];
     let begin = body.find("```yaml\n").unwrap() + "```yaml\n".len();
     let end = begin + body[begin..].find("```").unwrap();
-    let c = parse_yaml(&body[begin..end]).unwrap();
+    let text = &body[begin..end];
+    // Every key of the example is one the program knows
+    assert_eq!(unknown_keys(text), Vec::<String>::new());
+    let c = parse_yaml(text).unwrap();
     assert_eq!(
         (c.name.as_str(), c.children, c.mode.as_str()),
         ("Source", 2, "replicant")
     );
+    assert_eq!((c.ssl, c.database), (Some(false), Some(0)));
+    assert_eq!(
+        (c.connect_timeout, c.command_timeout),
+        (Some(2.0), Some(5.0))
+    );
+    assert_eq!(c.clients[0].ssl, Some(true));
+    assert_eq!(c.clients[0].command_timeout, Some(1.5));
     assert_eq!(c.ordering_buffer_time, Some(30));
     assert_eq!(c.clients.len(), 2);
     assert_eq!(c.clients[0].filter.as_deref(), Some("^(1|3|5|7|9)#"));
