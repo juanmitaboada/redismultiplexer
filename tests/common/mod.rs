@@ -673,6 +673,8 @@ struct SlowState {
     llen_replies: Vec<u64>,
     /// LTRIM arguments received (key, start, stop)
     ltrims: Vec<(String, String, String)>,
+    /// RPUSH and LLEN in arrival order across all connections (one RPUSH per value)
+    commands: Vec<&'static str>,
 }
 
 /// What a SlowTarget does after it records an RPUSH (M3R-20: a push the target may have
@@ -742,6 +744,11 @@ impl SlowTarget {
     /// LTRIMs received so far: (key, start, stop)
     pub fn ltrims(&self) -> Vec<(String, String, String)> {
         self.shared.lock().unwrap().ltrims.clone()
+    }
+
+    /// RPUSH (one per value) and LLEN received so far, in arrival order
+    pub fn commands(&self) -> Vec<&'static str> {
+        self.shared.lock().unwrap().commands.clone()
     }
 
     /// Connections accepted so far
@@ -918,6 +925,8 @@ fn slow_target_serve(stream: TcpStream, delay: Duration, st: Arc<Mutex<SlowState
         }
         let reply = match cmd.as_str() {
             "RPUSH" => {
+                let values = args.len().saturating_sub(2);
+                g.commands.extend(std::iter::repeat_n("RPUSH", values));
                 g.pushed.extend(
                     args[2..]
                         .iter()
@@ -945,6 +954,7 @@ fn slow_target_serve(stream: TcpStream, delay: Duration, st: Arc<Mutex<SlowState
             }
             "LLEN" => {
                 g.llens += 1;
+                g.commands.push("LLEN");
                 let n = match g.llen_replies.len() {
                     0 => 0,
                     1 => g.llen_replies[0],
@@ -1029,6 +1039,46 @@ fn deaf_serve(stream: TcpStream) {
             if bulk(&mut r).is_none() {
                 return;
             }
+        }
+        if w.write_all(b"+OK\r\n").is_err() {
+            return;
+        }
+    }
+}
+
+/// A stand-in target like DeafTarget whose reading after the first RPUSH goes on at one
+/// byte a millisecond and never answers: a chunk larger than the socket buffers keeps its
+/// writer waiting while the target still reads (M3R-45)
+pub struct TrickleTarget {
+    pub port: u16,
+}
+
+impl TrickleTarget {
+    pub fn start() -> TrickleTarget {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                thread::spawn(move || trickle_serve(stream));
+            }
+        });
+        TrickleTarget { port }
+    }
+}
+
+fn trickle_serve(stream: TcpStream) {
+    let mut w = stream.try_clone().unwrap();
+    let mut r = BufReader::new(stream);
+    while let Some(args) = resp_request(&mut r) {
+        if args
+            .first()
+            .is_some_and(|c| c.eq_ignore_ascii_case(b"RPUSH"))
+        {
+            let mut byte = [0u8; 1];
+            while matches!(std::io::Read::read(&mut r, &mut byte), Ok(1)) {
+                thread::sleep(Duration::from_millis(1));
+            }
+            return;
         }
         if w.write_all(b"+OK\r\n").is_err() {
             return;

@@ -332,3 +332,38 @@ fn source_read_waits_for_blpop() {
         p.stderr()
     );
 }
+
+/// A chunk larger than the socket buffers to a target that keeps reading one byte a
+/// millisecond (M3R-45): the sender pipelines the chunk; the command timeout bounds the
+/// write although the target still reads, the healthy target gets every package, the
+/// stop is clean and the status counts every package
+#[test]
+fn write_timeout_bounds_a_chunk_to_a_slow_reader() {
+    let mut ctx = Ctx::new("write_timeout_chunk");
+    let src = ctx.key("src");
+    let t0 = ctx.key("t0");
+    let slow = TrickleTarget::start();
+    let clients = [
+        ctx.client_yaml_at("slow", "rmtest:slow", slow.port) + "    command_timeout: 0.5\n",
+        ctx.client_yaml("t0", &t0, ""),
+    ];
+    let cfg = ctx.config(&src, 1, "replicant", ORDERING_1S, &clients);
+    let mut p = ctx.spawn(&cfg);
+    // 500 packages of 64 KiB: a chunk (up to `ordering_limit`, 200) holds 12.5 MiB, above
+    // what loopback socket buffers hold
+    let n = 500;
+    let pad = "x".repeat(64 << 10);
+    let input: Vec<String> = (0..n).map(|i| format!("{}{}", seq_pkg(i), pad)).collect();
+    let start = Instant::now();
+    ctx.push(&src, &input);
+    ctx.wait_drained(&src, &[(&t0, n as usize)]);
+    let took = start.elapsed();
+    p.stop(&ctx.pid_file());
+    assert!(p.stderr().contains("Error while sending"), "{}", p.stderr());
+    let status: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(ctx.dir.join("rm.status")).unwrap()).unwrap();
+    let since = &status["since_start"];
+    assert_eq!(since["in"].as_u64(), Some(n), "{}", status);
+    assert_eq!(since["out"].as_u64(), Some(n), "{}", status);
+    eprintln!("\nchunk to a slow reader: drained in {:?}", took);
+}

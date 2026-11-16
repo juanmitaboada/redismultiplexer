@@ -98,6 +98,8 @@ fn status_breakdown(test: &str, cell: Cell) {
     {
         input.push(format!("{}{}", kind, seq_pkg(i as u64)));
     }
+    // 100 more for the root filter, so no two counts of the breakdown are equal
+    input.extend((800..900).map(|i| format!("x{}", seq_pkg(i))));
     ctx.push(&src, &input);
     let root = format!("filter: '^(k|s|d|b|e)'\n{}", cell.extra());
     let cfg = ctx.config(&src, cell.children, cell.mode(), &root, &clients);
@@ -123,7 +125,7 @@ fn status_breakdown(test: &str, cell: Cell) {
             n("stuck"),
             n("failed")
         ],
-        [800, 300, 500, 100, 100, 300],
+        [900, 300, 600, 200, 100, 300],
         "{}",
         status
     );
@@ -148,6 +150,25 @@ fn status_breakdown(test: &str, cell: Cell) {
         t("total_filtered") + t("total_stuck") + t("total_failed"),
         t("total_drop")
     );
+    // Each total is its own counter (M3R-39): the last interval's share of the run, its
+    // rate is that total over the interval, and a run inside one interval (the usual case
+    // here: the 10 s between writes) gives the counts since the start
+    let rate = |k: &str| status[k].as_f64().unwrap();
+    let one_interval = t("total_in") == n("in");
+    for k in ["filtered", "stuck", "failed"] {
+        let total = t(&format!("total_{}", k));
+        assert!(total <= n(k), "total_{} above the run's: {}", k, status);
+        let (lhs, rhs) = (rate(k) * t("total_in") as f64, rate("in") * total as f64);
+        assert!(
+            (lhs - rhs).abs() <= 1e-6 * lhs.max(1.0),
+            "{}: {}",
+            k,
+            status
+        );
+        if one_interval {
+            assert_eq!(total, n(k), "total_{}: {}", k, status);
+        }
+    }
 }
 
 matrix!(status_drop_breakdown, status_breakdown, 2);
@@ -200,6 +221,30 @@ fn status_queue_counts_the_held_packages() {
         "not every held package at the stop, in order"
     );
     assert_eq!(queue(), 0);
+}
+
+/// Where the status file cannot be replaced whole (a directory holds `<status>.tmp`) it is
+/// written in place with one warning, the first time only (D4d-4 = a, M3R-39): the write
+/// of the 10 s tick and the one of the stop (a package in between), one warning
+#[test]
+fn status_in_place_warning_once() {
+    let mut ctx = Ctx::new("status_in_place_once");
+    let src = ctx.key("src");
+    let t0 = ctx.key("t0");
+    std::fs::create_dir(ctx.dir.join("rm.status.tmp")).unwrap();
+    let cfg = ctx.config(&src, 1, "replicant", "", &[ctx.client_yaml("t0", &t0, "")]);
+    let mut p = ctx.spawn(&cfg);
+    let status = ctx.dir.join("rm.status");
+    ctx.wait_for("the first status write", |_| status.exists());
+    let first = std::fs::read_to_string(&status).unwrap();
+    // A package after it, so the stop's write differs from the first
+    ctx.push(&src, &[seq_pkg(1)]);
+    ctx.wait_drained(&src, &[(&t0, 1)]);
+    p.stop(&ctx.pid_file());
+    let last = std::fs::read_to_string(&status).unwrap();
+    assert_ne!(first, last, "no second write");
+    let warnings = p.stderr().matches("is written in place").count();
+    assert_eq!(warnings, 1, "{}", p.stderr());
 }
 
 /// Every target gets every package on every delivery path (project rule, M3R-12), in

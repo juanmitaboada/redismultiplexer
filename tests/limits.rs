@@ -432,3 +432,41 @@ fn hardlimit_alone() {
     want.extend(fresh);
     assert_eq!(ctx.list(&t0), want);
 }
+
+/// P4 = p4a through the binary (M3R-45): with ordering the sender pipelines a chunk, and a
+/// limits check that is due first writes and reads what is pending for that target, so
+/// each LLEN comes after every RPUSH planned before it. checklimit 1 checks every second
+/// package (the counter as in 1.0.8): the k-th LLEN (from 0) after at least 2k packages.
+/// One child, replicant: one sender, one target.
+#[test]
+fn ordering_limits_check_after_the_pending_packages() {
+    let mut ctx = Ctx::new("ordering_p4");
+    let src = ctx.key("src");
+    let target = SlowTarget::start(Duration::ZERO);
+    let key = ctx.key("t0");
+    let limits = "    timelimit: 3600\n    checklimit: 1\n    softlimit: 50\n    hardlimit: 100\n";
+    let client = format!("{}{}", ctx.client_yaml_at("t0", &key, target.port), limits);
+    let cfg = ctx.config(&src, 1, "replicant", ORDERING_1S, &[client]);
+    let mut p = ctx.spawn(&cfg);
+    let n = 300;
+    let batch: Vec<String> = (0..n).map(seq_pkg).collect();
+    ctx.push(&src, &batch);
+    ctx.wait_for("every package delivered", |_| target.count() == n as usize);
+    p.stop(&ctx.pid_file());
+    let seq = target.commands();
+    let mut pushed = 0;
+    let mut llens = 0;
+    for c in &seq {
+        if *c == "LLEN" {
+            assert!(
+                pushed >= 2 * llens,
+                "LLEN {llens} after only {pushed} RPUSH: {}",
+                p.stderr()
+            );
+            llens += 1;
+        } else {
+            pushed += 1;
+        }
+    }
+    assert!(llens >= n as usize / 2, "{llens} LLEN for {n} packages");
+}

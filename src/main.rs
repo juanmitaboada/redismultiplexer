@@ -3305,7 +3305,16 @@ fn spread_chunk(
     // Stable: those that refused in their replies last time first, each group in turn
     order.sort_by_key(|&t| !clients[t].failed_last);
     let mut left: Vec<(usize, usize)> = Vec::new();
+    // A pass after the first writes only what a refusal in the pass before carried, and a
+    // package goes at most once to each target: at most one pass per target plus the first
+    // (M3R-45: asserted in debug builds)
+    let mut passes = 0;
     loop {
+        passes += 1;
+        debug_assert!(
+            passes <= targets + 1,
+            "{passes} passes for {targets} targets"
+        );
         for &t in &order {
             if !clients[t].pending.is_empty() {
                 let (replies, error) = write_target(&mut clients[t], t, st);

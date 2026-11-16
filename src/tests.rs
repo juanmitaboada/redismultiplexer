@@ -1886,6 +1886,7 @@ channel: c
 children: 1
 mode: replicant
 colour: blue
+hardlimit: 10
 clients:
   - name: t0
     hostname: h
@@ -1893,6 +1894,7 @@ clients:
     password: ''
     channel: d
     filter_untill: '#'
+    hardlimit: 10
   - name: 7
     hostname: h
     port: 1
@@ -1905,6 +1907,8 @@ clients:
         unknown_keys(yaml),
         vec![
             "Unknown key 'colour' at the root of the configuration: ignored".to_string(),
+            // A limits key is a client's: at the root it is unknown (M3R-39)
+            "Unknown key 'hardlimit' at the root of the configuration: ignored".to_string(),
             "Unknown key 'filter_untill' in client 't0': ignored".to_string(),
             "Unknown key 'x' in client '#2': ignored".to_string(),
         ]
@@ -1912,7 +1916,7 @@ clients:
     // An unquoted number on a text key reads as text (as 1.0.8) and is not a warning
     let yaml = yaml.replace("password: ''\nchannel: c", "password: 1234\nchannel: c");
     assert_eq!(parse_yaml(&yaml).unwrap().password, "1234");
-    assert_eq!(unknown_keys(&yaml).len(), 3);
+    assert_eq!(unknown_keys(&yaml).len(), 4);
     // Text the untyped read cannot take: no warnings, nothing else
     assert!(unknown_keys("[1, 2").is_empty());
 }
@@ -2377,6 +2381,19 @@ fn status_file_written_in_place_when_it_cannot_be_replaced() {
     write_status(&path, b"new").unwrap();
     assert_eq!(fs::read_to_string(&path).unwrap(), "new");
     assert!(STATUS_IN_PLACE.load(Ordering::Relaxed));
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn status_temporary_file_is_removed_when_the_replace_fails() {
+    // M3R-39: the temporary file is made and the rename fails (the status path is a
+    // directory): the error is returned and no `<status>.tmp` is left behind
+    let dir = scratch_dir("status_tmp_left");
+    let path = dir.join("rm.status");
+    fs::create_dir(&path).unwrap();
+    fs::write(path.join("inside"), "x").unwrap();
+    assert!(write_replacing(&path, b"new").is_err());
+    assert!(fs::symlink_metadata(dir.join("rm.status.tmp")).is_err());
     fs::remove_dir_all(&dir).unwrap();
 }
 
@@ -3128,14 +3145,26 @@ fn shares_run(
     bad: Option<(usize, Fails)>,
     chunked: bool,
 ) -> (Vec<Vec<Vec<u8>>>, Counts) {
+    shares_run_with(pool, filters, bad.as_slice(), chunked)
+}
+
+/// As shares_run, with any number of failing targets (M3R-47: a held-back target beside a
+/// stuck and a never-answering one)
+fn shares_run_with(
+    pool: &[Vec<(u16, Record)>],
+    filters: &[Option<&str>],
+    bads: &[(usize, Fails)],
+    chunked: bool,
+) -> (Vec<Vec<Vec<u8>>>, Counts) {
+    let kind = |t: usize| bads.iter().find(|(b, _)| *b == t).map(|&(_, k)| k);
     // The stand-ins are reused from case to case (a fresh set each time runs out of file
     // descriptors): pool[t] holds one per answer, in the order of SHARE_ANSWERS
-    let answer = |t: usize| match bad {
-        Some((b, Fails::Stuck)) if b == t => 1,
-        Some((b, Fails::Errors)) if b == t => 2,
-        Some((b, Fails::Closes)) if b == t => 3,
-        Some((b, Fails::Mute)) if b == t => 4,
-        Some((b, Fails::ErrorsFirst)) if b == t => 5,
+    let answer = |t: usize| match kind(t) {
+        Some(Fails::Stuck) => 1,
+        Some(Fails::Errors) => 2,
+        Some(Fails::Closes) => 3,
+        Some(Fails::Mute) => 4,
+        Some(Fails::ErrorsFirst) => 5,
         _ => 0,
     };
     let stands: Vec<(u16, Record)> = (0..filters.len())
@@ -3145,20 +3174,23 @@ fn shares_run(
         rec.lock().unwrap().clear();
     }
     let mut ports: Vec<u16> = stands.iter().map(|(p, _)| *p).collect();
-    let mut closed = None;
-    if let Some((b, Fails::Down)) = bad {
-        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        ports[b] = l.local_addr().unwrap().port();
-        closed = Some(l);
+    let mut closed = Vec::new();
+    for (t, port) in ports.iter_mut().enumerate() {
+        if kind(t) == Some(Fails::Down) {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            *port = l.local_addr().unwrap().port();
+            closed.push(l);
+        }
     }
     let mut c = chunk_config("spreader", &ports);
     for t in c.clients.iter_mut() {
         t.command_timeout = Some(0.2);
     }
-    if let Some((b, Fails::Stuck)) = bad {
-        let t = &mut c.clients[b];
-        (t.timelimit, t.checklimit, t.softlimit, t.hardlimit) =
-            (Some(3600), Some(7), Some(50), Some(100));
+    for (b, t) in c.clients.iter_mut().enumerate() {
+        if kind(b) == Some(Fails::Stuck) {
+            (t.timelimit, t.checklimit, t.softlimit, t.hardlimit) =
+                (Some(3600), Some(7), Some(50), Some(100));
+        }
     }
     let mut links: Vec<RedisLink> = c
         .clients
@@ -3170,7 +3202,7 @@ fn shares_run(
         })
         .collect();
     for (t, l) in links.iter_mut().enumerate() {
-        if !matches!(bad, Some((b, Fails::Down)) if b == t) {
+        if kind(t) != Some(Fails::Down) {
             assert!(ensure_link(1, l), "not connected");
         }
     }
@@ -3191,6 +3223,11 @@ fn shares_run(
         stands.iter().map(|(_, rec)| pushed_to(rec)).collect(),
         counts,
     )
+}
+
+/// The number of a package (`pkgNNNN`)
+fn number(p: &[u8]) -> usize {
+    std::str::from_utf8(&p[3..]).unwrap().parse().unwrap()
 }
 
 /// Packages that reached a target after a later one
@@ -3650,4 +3687,183 @@ fn a_line_is_built_whole_with_colours_only_when_asked() {
     );
     part(&mut p, false, COLOR_WHITE, format_args!(" | "));
     assert!(p.ends_with(b"\x1B[1;0m | "));
+}
+
+/// M3R-47: a held-back target (errors to everything) beside two other failing ones and
+/// two healthy ones, 5 targets, the held-back target at each place with each client filter
+/// and one healthy target filtered in turn. Two healthy targets keep the rotation
+/// observable (with one, it takes every package whatever the cursor says). After the chunks
+/// of the failure events (the first two) each target that takes packages gets exactly what
+/// the workers' rotation gives it: the hold-back and the resync take a stuck target, a lost
+/// link and a filter as 1.0.8 does. A refusing target is not compared (a held-back one gets
+/// one probe per chunk where 1.0.8 offered it every package, declared, and that is
+/// asserted), but no target gets a package its filter refuses, and the counts match. A
+/// target that errors to the first packages only is released at the end of the second
+/// chunk or the third and compared like the others from the fourth.
+fn hold_back_beside(roles: [Fails; 3]) -> usize {
+    const TARGETS: usize = 5;
+    let pool = shares_pool(TARGETS);
+    // A target fixed at package 80 (the second chunk) comes back to its share up to one
+    // chunk later (declared): compared from the fourth chunk
+    let settled = if roles[0] == Fails::ErrorsFirst { 3 } else { 2 } * SHARE_CHUNK;
+    let mut cases = 0;
+    for at in 0..TARGETS {
+        let others: Vec<usize> = (1..TARGETS).map(|k| (at + k) % TARGETS).collect();
+        for (k, f) in SHARE_FILTERS.iter().enumerate() {
+            let mut filters = [None; TARGETS];
+            filters[at] = *f;
+            // One of the healthy targets (others[2], others[3]) filtered, by turns
+            filters[others[2 + k % 2]] = SHARE_FILTERS[(k + 1) % 4];
+            let bads = [(at, roles[0]), (others[0], roles[1]), (others[1], roles[2])];
+            let (old, old_counts) = shares_run_with(&pool, &filters, &bads, false);
+            let (new, new_counts) = shares_run_with(&pool, &filters, &bads, true);
+            let what = format!("{filters:?} {bads:?}");
+            for (t, got) in new.iter().enumerate() {
+                if let Some(re) = filters[t] {
+                    let re = regex::bytes::Regex::new(re).unwrap();
+                    assert!(
+                        got.iter().all(|p| re.is_match(p)),
+                        "target {t} got a package its filter refuses: {what}"
+                    );
+                }
+            }
+            // A target held back for good gets one probe per chunk from the second on
+            if roles[0] == Fails::Errors {
+                for ch in 1..SHARE_PACKAGES / SHARE_CHUNK {
+                    let probes = new[at]
+                        .iter()
+                        .filter(|p| number(p) / SHARE_CHUNK == ch)
+                        .count();
+                    assert_eq!(probes, 1, "probes in chunk {ch}: {what}");
+                }
+            }
+            let refusing = |t: usize| {
+                bads.iter().any(|&(b, k)| {
+                    b == t && matches!(k, Fails::Errors | Fails::Mute | Fails::Closes)
+                })
+            };
+            for t in (0..TARGETS).filter(|&t| !refusing(t)) {
+                assert_eq!(
+                    from_package(&new[t], settled),
+                    from_package(&old[t], settled),
+                    "target {t} after the event chunks: {what}"
+                );
+            }
+            assert_eq!(new_counts, old_counts, "counts: {what}");
+            cases += 1;
+        }
+    }
+    cases
+}
+
+#[test]
+fn spreader_hold_back_beside_a_stuck_and_a_silent_target() {
+    let n = hold_back_beside([Fails::Errors, Fails::Stuck, Fails::Mute]);
+    eprintln!("\nhold-back beside stuck and mute: {n} cases");
+}
+
+#[test]
+fn spreader_release_beside_a_down_and_a_closing_target() {
+    let n = hold_back_beside([Fails::ErrorsFirst, Fails::Down, Fails::Closes]);
+    eprintln!("\nrelease beside down and closing: {n} cases");
+}
+
+#[test]
+fn spreader_release_beside_a_stuck_and_a_silent_target() {
+    let n = hold_back_beside([Fails::ErrorsFirst, Fails::Stuck, Fails::Mute]);
+    eprintln!("\nrelease beside stuck and mute: {n} cases");
+}
+
+#[test]
+fn spreader_hold_back_beside_a_down_and_a_stuck_target() {
+    let n = hold_back_beside([Fails::Errors, Fails::Down, Fails::Stuck]);
+    eprintln!("\nhold-back beside down and stuck: {n} cases");
+}
+
+#[test]
+fn spreader_does_not_hold_back_a_target_that_never_answered_or_closed() {
+    // M3R-47, mutant 7: only a target that answered errors to all of its chunk with its
+    // link kept is held back. One that never answered (or whose link went) is down, not
+    // held back: when it comes back it gets its share, not one probe per chunk
+    for answer in [Answer::Never, Answer::Close] {
+        let (good, _) = recording_target(Answer::Int);
+        let (bad, _) = recording_target(answer);
+        let (later, later_rec) = recording_target(Answer::Int);
+        let mut c = chunk_config("spreader", &[good, bad, good]);
+        for t in c.clients.iter_mut() {
+            t.command_timeout = Some(0.2);
+        }
+        let mut links: Vec<RedisLink> = c
+            .clients
+            .iter()
+            .map(|t| new_link(1, &c, t, &None))
+            .collect();
+        for l in links.iter_mut() {
+            assert!(ensure_link(1, l), "not connected");
+        }
+        let (mut counts, mut cursor) = (Counts::default(), 0);
+        let packages = packages_n(3 * SHARE_CHUNK);
+        let mut chunks = packages.chunks(SHARE_CHUNK);
+        deliver_chunk(
+            1,
+            &None,
+            &c,
+            &mut links,
+            &mut cursor,
+            chunks.next().unwrap(),
+            &mut counts,
+        );
+        assert!(links[1].link.is_none(), "{answer:?}: the link is kept");
+        assert!(!links[1].held_back, "{answer:?}: held back");
+        // It comes back (another stand-in on its place), answering
+        let mut back = c.clients[1].clone();
+        back.port = later;
+        links[1].endpoint = new_link(1, &c, &back, &None).endpoint;
+        links[1].retry_at = None;
+        assert!(ensure_link(1, &mut links[1]), "not connected again");
+        for chunk in chunks {
+            deliver_chunk(1, &None, &c, &mut links, &mut cursor, chunk, &mut counts);
+        }
+        let got = pushed_to(&later_rec).len();
+        assert!(
+            got >= 2 * SHARE_CHUNK / 3 - 1,
+            "{answer:?}: {got} packages in two chunks once back"
+        );
+    }
+}
+
+#[test]
+fn spreader_breaks_the_order_at_most_once_per_failure_event() {
+    // M3R-45, plan 9.11.13 part 4 ("once per failure event"): two targets each answer
+    // errors in a run of their own (two events, apart), each place of the turn; the order
+    // breaks at most twice over all targets, every package delivered once
+    let mut seen = 0;
+    for first in 0..3 {
+        let second = (first + 1) % 3;
+        let mut answers = [Answer::Int; 3];
+        answers[first] = Answer::ErrorIn(30, 60);
+        answers[second] = Answer::ErrorIn(120, 150);
+        let sent = spread_answers(&answers, &[None, None, None], 8, 30);
+        // What each target kept: a stand-in records the RPUSHes it refused too
+        let got: Vec<Vec<Vec<u8>>> = sent
+            .iter()
+            .zip(answers)
+            .map(|(list, a)| {
+                let refused = |p: &Vec<u8>| {
+                    matches!(a, Answer::ErrorIn(from, to) if (from..to).contains(&number(p)))
+                };
+                list.iter().filter(|p| !refused(p)).cloned().collect()
+            })
+            .collect();
+        let mut all = got.concat();
+        all.sort();
+        assert!(
+            all == packages_from(0, 240),
+            "{answers:?}: not every package once"
+        );
+        let total: usize = got.iter().map(|g| breaks(g)).sum();
+        assert!(total <= 2, "{answers:?}: {total} breaks");
+        seen += total;
+    }
+    eprintln!("\nbreaks over the three placements: {seen}");
 }
