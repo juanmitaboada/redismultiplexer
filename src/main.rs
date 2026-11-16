@@ -1671,6 +1671,9 @@ struct OrderState {
     heap: BinaryHeap<Reverse<Held>>,
     seq: u64,
     finish: bool, // no more packages will come: release everything
+    // Released to the sender and not counted yet (M3R-41): if the sender dies these are
+    // counted with what the buffer still holds
+    in_hand: u64,
 }
 
 /// The ordering buffer: every child puts timestamped packages in it, one sender takes them
@@ -1694,12 +1697,20 @@ impl OrderBuffer {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Empties the buffer when its sender is gone: how many packages it held
+    /// Empties the buffer when its sender is gone: how many packages it held, and those the
+    /// sender had taken and not counted (M3R-41; D5-2 = a)
     fn abandon(&self) -> u64 {
         let mut st = self.lock();
-        let n = st.heap.len() as u64;
+        let n = st.heap.len() as u64 + st.in_hand;
         st.heap.clear();
+        st.in_hand = 0;
         n
+    }
+
+    /// The sender counted `n` of the packages it took
+    fn counted(&self, n: usize) {
+        let mut st = self.lock();
+        st.in_hand = st.in_hand.saturating_sub(n as u64);
     }
 
     /// Hold a package. The sender is woken only when the buffer was empty: otherwise it
@@ -1752,6 +1763,7 @@ fn release(st: &mut OrderState, now: Instant, hold: Duration) -> Vec<Vec<u8>> {
             break;
         }
     }
+    st.in_hand += out.len() as u64;
     out
 }
 
@@ -1839,6 +1851,8 @@ fn sender(
                     );
                     flush = Some((Instant::now(), held, 0, 0));
                 }
+                // Counted chunk by chunk, so a sender that dies leaves in the buffer's count
+                // only what it had not counted yet (M3R-41)
                 for chunk in chunks(&batch, CHUNK_PACKAGES) {
                     deliver_chunk(
                         id,
@@ -1849,16 +1863,20 @@ fn sender(
                         chunk,
                         &mut counts,
                     );
+                    if let Some((_, _, delivered, dropped)) = flush.as_mut() {
+                        *delivered += counts.outgoing;
+                        *dropped += counts.dropped;
+                    }
+                    report(worker_slot(&stats, id), &clients, &mut counts);
+                    buffer.counted(chunk.len());
                 }
             }
             // Nothing for a second: the idle path, as a worker's
-            None => refresh(id, &mut clients, &mut counts.deleted),
+            None => {
+                refresh(id, &mut clients, &mut counts.deleted);
+                report(worker_slot(&stats, id), &clients, &mut counts);
+            }
         }
-        if let Some((_, _, delivered, dropped)) = flush.as_mut() {
-            *delivered += counts.outgoing;
-            *dropped += counts.dropped;
-        }
-        report(worker_slot(&stats, id), &clients, &mut counts);
     });
     if let Some((since, held, delivered, dropped)) = flush {
         print_debug!(

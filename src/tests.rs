@@ -2174,17 +2174,45 @@ fn supervise_a_worker_that_dies_holding_the_buffer() {
 
 #[test]
 fn supervise_a_sender_that_dies_leaves_the_buffer_counted() {
-    // The workers are stopped and joined; what the buffer holds is abandoned, counted.
-    // The batch the sender had taken when it died is lost with it (not in the buffer)
+    // The workers are stopped and joined; what the buffer holds is abandoned, counted, and
+    // so is the batch the sender had taken and not counted when it died while running
+    // (M3R-41): every package pushed is abandoned
     let (ending, pushed, delivered) = supervised([None, None], false, true, None);
     assert!(ending.died);
     assert_eq!(delivered, 0);
-    assert!(
-        ending.abandoned > 0 && ending.abandoned < pushed,
-        "{:?} of {}",
-        ending,
-        pushed
-    );
+    assert!(pushed > 0);
+    assert_eq!(ending.abandoned, pushed, "{:?} of {}", ending, pushed);
+}
+
+#[test]
+fn a_sender_that_dies_in_the_stop_flush_leaves_what_it_held_counted() {
+    // M3R-41: at the stop finish() releases everything, so the sender's batch is the whole
+    // buffer. It counts chunk by chunk; a death after the first chunk leaves the other two
+    // chunks counted as abandoned, not lost from every count
+    let buffer = Arc::new(OrderBuffer::new());
+    for n in 0..3000u32 {
+        buffer.push(u128::from(n), n.to_be_bytes().to_vec(), Instant::now());
+    }
+    buffer.finish();
+    let delivered = Arc::new(AtomicU64::new(0));
+    let (b, d) = (buffer.clone(), delivered.clone());
+    let sender = thread::spawn(move || {
+        send_ordered(&b, Duration::from_secs(3600), |turn| {
+            if let Some(batch) = turn {
+                for chunk in chunks(&batch, CHUNK_PACKAGES) {
+                    if d.load(Ordering::Relaxed) > 0 {
+                        panic!("test sender dies in the flush");
+                    }
+                    d.fetch_add(chunk.len() as u64, Ordering::Relaxed);
+                    b.counted(chunk.len());
+                }
+            }
+        })
+    });
+    assert!(sender.join().is_err());
+    assert_eq!(delivered.load(Ordering::Relaxed), 1000);
+    assert_eq!(buffer.abandon(), 2000);
+    assert_eq!(buffer.abandon(), 0);
 }
 
 #[test]
