@@ -470,3 +470,34 @@ fn ordering_limits_check_after_the_pending_packages() {
     }
     assert!(llens >= n as usize / 2, "{llens} LLEN for {n} packages");
 }
+
+/// With ordering the sender reports its targets' state on its idle turn too (M3R-50 =
+/// R50a): a target only the sender found stuck (only packages with a ts, which the
+/// workers never deliver) and that it freed while the source was idle is not left in the
+/// status file's `stuck_targets`; without that report the sender's last word on it is the
+/// "stuck" of its last chunk
+#[test]
+fn sender_reports_on_its_idle_turn() {
+    let mut ctx = Ctx::new("senderidle");
+    let src = ctx.key("src");
+    let t0 = ctx.key("t0");
+    ctx.push(&t0, &packages("old", 10));
+    let limits = "    timelimit: 3600\n    checklimit: 1000\n    softlimit: 5\n    hardlimit: 10\n";
+    let clients = [ctx.client_yaml("t0", &t0, limits)];
+    let cfg = ctx.config(&src, 1, "replicant", ORDERING_1S, &clients);
+    let mut p = ctx.spawn(&cfg);
+    ctx.push(&src, &(0..5).map(seq_pkg).collect::<Vec<String>>());
+    ctx.wait_for("the sender found it stuck", |c| {
+        c.llen(&src) == 0 && sender_lines(&p.stderr(), "stuck!", 1) > 0
+    });
+    assert_eq!(worker_lines(&p.stderr(), "stuck!", 1), 0, "{}", p.stderr());
+    ctx.ltrim(&t0, 8, -1);
+    ctx.wait_for("the sender freed it while idle", |_| {
+        sender_lines(&p.stderr(), "freed!", 1) > 0
+    });
+    p.stop(&ctx.pid_file());
+    let status: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(ctx.dir.join("rm.status")).unwrap()).unwrap();
+    assert_eq!(status["stuck_targets"], serde_json::json!([]), "{}", status);
+    assert_eq!(status["since_start"]["in"], 5, "{}", status);
+}
