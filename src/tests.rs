@@ -3877,3 +3877,97 @@ fn spreader_breaks_the_order_at_most_once_per_failure_event() {
     }
     eprintln!("\nbreaks over the three placements: {seen}");
 }
+
+// --- conclude and remove_pid: the end of a run (M3R-48 = R48a) ---
+
+/// Runs `conclude` over two workers and the sender's slot (2), with 10 packages in and
+/// out counted by worker 0; returns the exit status and the status file it wrote
+fn concluded(test: &str, ending: Ending) -> (i32, serde_json::Value) {
+    let dir = scratch_dir(test);
+    let status = dir.join("rm.status");
+    let clients = vec![client("t0", "q:t0")];
+    let stats = stats_slots(3, clients.len());
+    worker_slot(&stats, 0).add(&Counts {
+        incoming: 10,
+        outgoing: 10,
+        ..Counts::default()
+    });
+    let mut since_start = Counts::default();
+    let code = conclude(
+        &ending,
+        2,
+        "src",
+        None,
+        &clients,
+        &stats,
+        &Some(status.to_string_lossy().into_owned()),
+        get_current_time_with_ms() - 1000,
+        &mut since_start,
+    );
+    let written = serde_json::from_slice(&fs::read(&status).unwrap()).unwrap();
+    fs::remove_dir_all(&dir).unwrap();
+    (code, written)
+}
+
+#[test]
+fn conclude_a_dead_thread_exits_one_with_the_abandoned_counted() {
+    let (code, s) = concluded(
+        "conclude_dead",
+        Ending {
+            died: true,
+            abandoned: 7,
+        },
+    );
+    assert_eq!(code, EXIT_FAILED);
+    for key in ["total_drop", "total_failed"] {
+        assert_eq!(s[key], 7, "{key}");
+    }
+    for key in ["drop", "failed"] {
+        assert_eq!(s["since_start"][key], 7, "since_start {key}");
+    }
+    assert_eq!(s["since_start"]["in"], 10);
+    assert_eq!(s["since_start"]["out"], 10);
+}
+
+#[test]
+fn conclude_a_dead_thread_with_nothing_held_still_exits_one() {
+    let (code, s) = concluded(
+        "conclude_dead_empty",
+        Ending {
+            died: true,
+            abandoned: 0,
+        },
+    );
+    assert_eq!(code, EXIT_FAILED);
+    assert_eq!(s["total_drop"], 0);
+    assert_eq!(s["since_start"]["in"], 10);
+}
+
+#[test]
+fn conclude_a_stop_exits_zero_with_the_counts_unchanged() {
+    let (code, s) = concluded(
+        "conclude_stop",
+        Ending {
+            died: false,
+            abandoned: 0,
+        },
+    );
+    assert_eq!(code, EXIT_OK);
+    assert_eq!(s["total_drop"], 0);
+    assert_eq!(s["total_failed"], 0);
+    assert_eq!(s["since_start"]["out"], 10);
+}
+
+#[test]
+fn remove_pid_removes_the_file_and_only_warns_when_it_is_gone() {
+    let dir = scratch_dir("remove_pid");
+    let pid = dir.join("rm.pid");
+    fs::write(&pid, "1").unwrap();
+    let pidfile = Some(pid.to_string_lossy().into_owned());
+    remove_pid(&pidfile);
+    assert!(!pid.exists());
+    // Gone already: a warning, no panic
+    remove_pid(&pidfile);
+    remove_pid(&None);
+    fs::remove_dir_all(&dir).unwrap();
+}

@@ -676,6 +676,63 @@ fn supervise(
     Ending { died, abandoned }
 }
 
+/// The end of a run, once `supervise` returned: what the buffer held when its sender died
+/// is counted as dropped and failed in the sender's slot (S4-5 = a), the last status is
+/// written with everything counted since the last line, the flush and any drop at the
+/// stop included (M3R-12), and the exit status follows from the `Ending`
+#[allow(clippy::too_many_arguments)] // statistics' own arguments plus the Ending and the sender's slot
+fn conclude(
+    ending: &Ending,
+    sender_slot: u16,
+    name: &str,
+    ordered: Option<&OrderBuffer>,
+    clients: &[ClientConfig],
+    stats: &[WorkerStats],
+    statusfile: &Option<String>,
+    lasttime: u128,
+    since_start: &mut Counts,
+) -> i32 {
+    if ending.abandoned > 0 {
+        worker_slot(stats, sender_slot).add(&Counts {
+            dropped: ending.abandoned,
+            failed: ending.abandoned,
+            ..Counts::default()
+        });
+    }
+    statistics(
+        name,
+        ordered,
+        clients,
+        stats,
+        statusfile,
+        lasttime,
+        since_start,
+    );
+    print_debug!(PROGRAM_NAME, stdout(), COLOR_GREEN, 0, "Program finished!");
+    if ending.died {
+        EXIT_FAILED
+    } else {
+        EXIT_OK
+    }
+}
+
+/// Removes the pid file, if one was set; a failure only warns
+fn remove_pid(pidfile: &Option<String>) {
+    if let Some(pid) = pidfile {
+        fs::remove_file(pid).unwrap_or_else(|why| {
+            print_debug!(
+                PROGRAM_NAME,
+                stderr(),
+                COLOR_YELLOW,
+                0,
+                "Couldn't delete PID at {}: {}",
+                pid,
+                why
+            ); // why.kind() shows the basic error
+        });
+    }
+}
+
 /// Main module will manage the basics from this program
 fn main() {
     let code = run();
@@ -949,19 +1006,9 @@ fn run() -> i32 {
                             }
                         });
 
-                        // What the buffer held when its sender died is lost: dropped, counted
-                        // in the sender's slot so it reaches the status file (S4-5 = a)
-                        if ending.abandoned > 0 {
-                            worker_slot(&stats, inconfig.children).add(&Counts {
-                                dropped: ending.abandoned,
-                                failed: ending.abandoned,
-                                ..Counts::default()
-                            });
-                        }
-
-                        // What was counted since the last line, the flush and any drop at the
-                        // stop included, still reaches the status file (M3R-12)
-                        statistics(
+                        code = conclude(
+                            &ending,
+                            inconfig.children,
                             &inconfig.name,
                             ordered.as_deref(),
                             &inconfig.clients,
@@ -970,25 +1017,9 @@ fn run() -> i32 {
                             lasttime,
                             &mut since_start,
                         );
-
-                        print_debug!(PROGRAM_NAME, stdout(), COLOR_GREEN, 0, "Program finished!");
-                        code = if ending.died { EXIT_FAILED } else { EXIT_OK };
                     }
 
-                    // Remove pid
-                    if let Some(pid) = &pidfile {
-                        fs::remove_file(pid).unwrap_or_else(|why| {
-                            print_debug!(
-                                PROGRAM_NAME,
-                                stderr(),
-                                COLOR_YELLOW,
-                                0,
-                                "Couldn't delete PID at {}: {}",
-                                pid,
-                                why
-                            ); // why.kind() shows the basic error
-                        });
-                    }
+                    remove_pid(&pidfile);
                 }
             }
             code
