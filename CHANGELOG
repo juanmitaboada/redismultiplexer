@@ -23,6 +23,7 @@ rust-redismultiplexer (1.1.0-1) stable; urgency=medium
   * `filter_replace_header`: replace the whole header with a literal text
   * Keys 1.0.8 ignored now act: a file that already had `database: 1`
     now delivers to database 1
+  * `hostname` takes an IPv6 address written `::1` or `[::1]`
 
   Failures
   * A target that cannot be reached, closes or does not answer within
@@ -39,7 +40,10 @@ rust-redismultiplexer (1.1.0-1) stable; urgency=medium
     their connect plus command timeout, before it reads the source
   * While the source is idle each connected target gets a PING once a
     second instead of an LLEN, so a target restarted at night is connected
-    again before the next packages; an error reply to it keeps the link
+    again before the next packages; an error reply to it keeps the link.
+    A target that stops answering after its handshake holds that thread
+    (with ordering, the sender) up to its `command_timeout` once per
+    reconnection, and with ordering a package due meanwhile waits that long
   * Every connection is named with CLIENT SETNAME; no CLIENT SETINFO
   * With ordering, a target whose replies fail prints one error line per
     flush, not one per package
@@ -49,7 +53,7 @@ rust-redismultiplexer (1.1.0-1) stable; urgency=medium
     target refuses in its replies (an error reply, no reply, its connection
     lost while a chunk is written), what it refused goes to the next target
     that takes it: the shares of that chunk can differ from 1.0.8's by up to
-    those packages (at most the target's share of one chunk), and the order
+    those packages, and the order
     at a target can break once per failure event, by at most the packages
     refused in that chunk; with client filters that depend on the package's
     place in the stream, the split after such an event can settle in
@@ -80,6 +84,9 @@ rust-redismultiplexer (1.1.0-1) stable; urgency=medium
     monotonic clock in milliseconds (1.0.8: between T and T + 1 s); equal
     ts leave in arrival order (1.0.8: by payload bytes)
   * `ordering_buffer_time: 0` is read as 1 s, with a warning
+  * The buffer is in memory and nothing holds the children back: with a
+    target slower than the source it grows faster than with 1.0.8, for as
+    long as that lasts, and the stop takes the time to deliver it
   * No combination of `ordering`, `ordering_buffer_time` and
     `ordering_limit` is an error any more; the odd ones get a warning
   * "without ordering information" and "couldn't be parsed" warnings are

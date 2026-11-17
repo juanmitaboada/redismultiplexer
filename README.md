@@ -1,4 +1,4 @@
-<p align="center"><picture><source media="(prefers-color-scheme: dark)" srcset="docs/images/brand/redismultiplexer-header-dark.svg"><img alt="RedisMultiplexer - moves queue packages between Redis and KeyDB servers" src="docs/images/brand/redismultiplexer-header-light.svg" width="880"></picture></p>
+<p align="center"><picture><source media="(prefers-color-scheme: dark)" srcset="https://github.com/juanmitaboada/redismultiplexer/raw/HEAD/docs/images/brand/redismultiplexer-header-dark.svg?sanitize=true"><img alt="RedisMultiplexer - moves queue packages between Redis and KeyDB servers" src="docs/images/brand/redismultiplexer-header-light.svg" width="880"></picture></p>
 
 # RedisMultiplexer
 
@@ -50,7 +50,7 @@ Inside the `clients` entry of the YAML configuration:
 Every configuration will have
 
 - `name`: will be used on the screen when RedisMultiplexer has to show some message on the screen
-- `hostname`: hostname of the Redis server (an IPv6 address may be written `[::1]`)
+- `hostname`: hostname of the Redis server (an IPv6 address may be written `::1` or `[::1]`)
 - `port`: port number of the Redis server
 - `password`: password of the Redis server; empty for none
 - `channel`: name of queue to process
@@ -121,6 +121,7 @@ ordering_limit: 200
 What ordering guarantees:
 - A package is held `ordering_buffer_time` seconds from its arrival, then released in `ts` order (equal `ts` in arrival order). A held package with a lower `ts` holds back the ones behind it, so the order holds among the packages the buffer has at once: one that arrives after a later `ts` was released goes out after it.
 - A package without a match, or whose `ts` is not a number that fits u128, is delivered at once, without waiting, and a warning says so (see Log).
+- The buffer is in memory and nothing holds the children back: with a target slower than the source it grows for as long as that lasts, and the stop takes the time to deliver it.
 - With ordering, one sender thread delivers for every child. It writes the released packages to each target in chunks (up to 1000 packages or 4 MiB, a larger package alone), pipelined, and each target gets its packages in release order.
 - In `spreader` mode the packages are shared as the round robin would share them one by one. When a target refuses in its replies (an error, no reply, the connection lost), what it refused goes to another target. The order at that target can then break once per failure event, by at most the packages refused in that chunk, and the shares can differ from the round robin's in that chunk. A target that answers errors to every package of a chunk is held back: it is offered one package per chunk until it takes one, and it is back to its share at most one chunk later.
 
@@ -202,6 +203,12 @@ A warning that can come once per package (a package that cannot be ordered) is p
 ## When a target fails
 
 A target that cannot be reached, closes its connection or does not answer within `command_timeout` is down: the threads go on without it and try to connect again in the background, after 1 second and then up to every 5 seconds. Packages are not kept for a target that is down. In `replicant` mode the other targets still get them; in `spreader` mode they go to the next target; a package no target could take is dropped and counted as `failed`. A target that answers an error keeps its connection, and the package it refused is handled the same way. A target stuck at its `hardlimit` is skipped the same way until its queue is under `softlimit` (or trimmed by `deleteblock`), and a package only stuck targets accepted counts as `stuck`.
+
+While the source is idle each thread sends every connected target a PING once a second (with ordering, the sender too), so a target restarted meanwhile is connected again before the next packages. A target that stops answering after its handshake holds that thread up to its `command_timeout` once per reconnection, and with ordering a package that becomes due meanwhile waits that long.
+
+## Redis Cluster
+
+RedisMultiplexer does not follow cluster redirects (MOVED, ASK). Against a Redis Cluster, address every queue, the source and each target, at the master that owns its key's slot (`redis-cli cluster keyslot <key>`, `redis-cli cluster nodes`); each connection then works as with a standalone server. A source on the wrong node answers MOVED: nothing is popped and nothing is lost, with one error line per second and child. A target on the wrong node, or whose slot moves to another node while running, refuses every package: in `spreader` mode the other targets take them; in `replicant` mode that target misses every copy, and the counts still show a package delivered when another target took it; a package no target takes is dropped and counted as `failed`. Each refusal logs one line, and nothing recovers until the configuration is changed and the program restarted. Not tried: replicas and failover, KeyDB's cluster mode, TLS and ACL users on cluster nodes.
 
 ## Testing and benchmarking
 
