@@ -1,3 +1,5 @@
+<p align="center"><picture><source media="(prefers-color-scheme: dark)" srcset="docs/images/brand/redismultiplexer-header-dark.svg"><img alt="RedisMultiplexer - moves queue packages between Redis and KeyDB servers" src="docs/images/brand/redismultiplexer-header-light.svg" width="880"></picture></p>
+
 # RedisMultiplexer
 
 [![CI](https://github.com/juanmitaboada/redismultiplexer/actions/workflows/rust.yml/badge.svg?branch=main)](https://github.com/juanmitaboada/redismultiplexer/actions/workflows/rust.yml)
