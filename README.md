@@ -1,7 +1,12 @@
 # RedisMultiplexer
 
 [![CI](https://github.com/juanmitaboada/redismultiplexer/actions/workflows/rust.yml/badge.svg?branch=main)](https://github.com/juanmitaboada/redismultiplexer/actions/workflows/rust.yml)
+[![crates.io](https://img.shields.io/crates/v/redismultiplexer)](https://crates.io/crates/redismultiplexer)
+[![Snap Store](https://img.shields.io/snapcraft/v/redismultiplexer/latest/stable)](https://snapcraft.io/redismultiplexer)
+[![License](https://img.shields.io/badge/license-Apache%202.0-yellow)](LICENSE)
 [![Quality Gate](https://sonarcloud.io/api/project_badges/measure?project=juanmitaboada_redismultiplexer&metric=alert_status)](https://sonarcloud.io/summary/new_code?id=juanmitaboada_redismultiplexer)
+[![Coverage](https://sonarcloud.io/api/project_badges/measure?project=juanmitaboada_redismultiplexer&metric=coverage)](https://sonarcloud.io/summary/overall?id=juanmitaboada_redismultiplexer)
+[![Security Rating](https://sonarcloud.io/api/project_badges/measure?project=juanmitaboada_redismultiplexer&metric=security_rating)](https://sonarcloud.io/summary/overall?id=juanmitaboada_redismultiplexer)
 
 This is a program to transfer data from queues (push/pop) between different Redis server
 
