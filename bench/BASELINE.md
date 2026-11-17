@@ -247,3 +247,163 @@ that fix is about).
 - 1.0.8 uses about 40 MiB peak RSS with ordering at this rate (the 1 s
   ordering buffer holds about 40000 packages); 7-9 MiB otherwise.
 - Stop time after SIGINT is still 2-4 s (fixed sleeps in the shutdown path).
+
+# 1.1.0
+
+Release 1.1.0: no queuer (each child delivers its own packages without
+ordering; one sender delivers ordered packages for every child, pipelined),
+packages as bytes, filters compiled once, per-target failure handling,
+a logger that writes each line in one call. 1.0.8 and 1.1.0 were measured on the
+same day, on the same machine, with the same harness, interleaved; the 1.0.7
+and 1.0.8 tables above stay as they were.
+
+## Environment
+
+As for 1.0.7 above (same laptop, Redis 8.0.5 on 127.0.0.1:6390 without
+persistence), rustc 1.99.1. Binaries: 1.0.8 from the tag v1.0.8 (b5f2b11) and
+1.1.0 from the `release: 1.1.0` commit, both `cargo build --locked --release`;
+for the last table also main before 1.1.0 (0a38bbf, the 1.1.0 code without the
+last two stages). The program was pinned to cores 0-3 and the harness (with the
+delay proxy and the feeder of `fast_ordering_remote`) to cores 4-11, the
+machine otherwise idle. Date: 2026-11-17.
+
+## How it was measured
+
+The builds were run in turns, the first build of each round alternating, with a
+check before every run that no other client was connected to the Redis:
+
+```sh
+# one run; <selection> as below, <build> 1.0.8 or 1.1.0
+taskset -c 4-11 python3 bench/rmbench.py run <selection> --label rust-<build> \
+    --cmd 'taskset -c 0-3 <binary> {config}' \
+    --redis redis://127.0.0.1:6390 --results <dir>
+# fast: --tag fast, 5 rounds
+# deep: --tag quick --scale 30 --max-bytes 2147483648 --timeout 600, 3 rounds
+# q_base.c8: --scenario q_base.c8 --scale 60 (same limits), 3 rounds
+# full: --tag full, 3 rounds
+# fast.c1 against main: --scenario fast.c1, 10 rounds, three builds
+```
+
+Every run of every build ended `ok` with 0 missing packages (58 runs). With
+ordering the msg/s columns count the packages delivered to the targets in the
+time box (the harness has counted that way since `fast_ordering_remote` was
+added); the ordering figures of the 1.0.7 and 1.0.8 sections above counted the
+packages popped from the source. CPU per package is the program's user plus
+system time over the packages delivered. `fast_ordering_remote` is fed at 6000
+packages per second to a target 1 ms away; 1.1.0 keeps up with the feed and
+drains before the time box ends, so its figure is a lower bound.
+
+## fast (median of 5, range in brackets)
+
+| scenario | 1.0.8 msg/s | 1.1.0 msg/s | 1.1.0/1.0.8 | CPU us/pkg 1.0.8 | CPU us/pkg 1.1.0 | missing (worst) |
+|---|---|---|---|---|---|---|
+| fast.c1 | 32286 (30849-33533) | 44260 (40918-46701) | 1.37 | 17.1 | 11.9 | 0 |
+| fast.c2 | 56121 (54749-58518) | 75170 (73113-75758) | 1.34 | 22.2 | 15.0 | 0 |
+| fast.c8 | 68839 (67277-70160) | 85963 (80250-87211) | 1.25 | 24.6 | 14.4 | 0 |
+| fast_fanout | 55984 (55193-57576) | 72374 (66456-75140) | 1.29 | 22.1 | 15.4 | 0 |
+| fast_ordering | 45517 (43260-45732) | 85944 (81620-87870) | 1.89 | 22.1 | 10.9 | 0 |
+| fast_filter | 57736 (56396-58888) | 93924 (90622-95477) | 1.63 | 45.8 | 23.0 | 0 |
+| fast_limits | 55576 (54624-56266) | 71925 (71027-73059) | 1.29 | 22.2 | 15.4 | 0 |
+| fast_ordering_remote | 1554 (971-1584) | 6004 (5992-6012) | 3.86 | 64.4 | 15.2 | 0 |
+
+## deep: quick at scale 30 (median of 3, range in brackets)
+
+| scenario | 1.0.8 msg/s | 1.1.0 msg/s | 1.1.0/1.0.8 | CPU us/pkg 1.0.8 | CPU us/pkg 1.1.0 | missing (worst) |
+|---|---|---|---|---|---|---|
+| q_base.c1 | 33700 (31891-33702) | 42594 (40825-43354) | 1.26 | 17.8 | 11.6 | 0 |
+| q_base.c2 | 56387 (56016-58350) | 77549 (74817-78018) | 1.38 | 22.0 | 14.4 | 0 |
+| q_base.c8 | 70793 (70068-72049) | 82943 (82454-83164) | 1.17 | 24.4 | 14.9 | 0 |
+| q_fanout | 56926 (55945-57109) | 76478 (76310-77038) | 1.34 | 21.6 | 14.6 | 0 |
+| q_limits | 57275 (57008-57381) | 76310 (73247-76722) | 1.33 | 21.6 | 14.5 | 0 |
+| q_payload4k | 51092 (50630-52674) | 67509 (56607-70044) | 1.32 | 23.0 | 16.0 | 0 |
+| q_ordering | 35457 (34710-36129) | 70420 (69422-71398) | 1.99 | 20.9 | 11.9 | 0 |
+| q_filter.froot | 60865 (60460-61160) | 97209 (87904-98464) | 1.60 | 43.9 | 22.0 | 0 |
+| q_filter.fclient | 55908 (55044-56860) | 97792 (95283-97984) | 1.75 | 48.5 | 21.8 | 0 |
+| q_mixed_plain.i0 | 23246 (22943-23800) | 29956 (27902-30239) | 1.29 | 25.7 | 14.4 | 0 |
+| q_mixed_plain.i1 | 23249 (22485-23802) | 29368 (29237-30496) | 1.26 | 26.1 | 14.5 | 0 |
+| q_mixed_plain.i2 | 23052 (22910-23288) | 28005 (27380-29214) | 1.21 | 26.3 | 14.8 | 0 |
+| q_mixed_plain | 69145 (67451-69739) | 84002 (82127-87624) | 1.21 | 26.0 | 14.6 | 0 |
+| q_mixed.i0 | 18268 (18250-18325) | 23807 (23620-23953) | 1.30 | 27.5 | 15.6 | 0 |
+| q_mixed.i1 | 18280 (18274-18292) | 23809 (23698-23955) | 1.30 | 27.9 | 15.7 | 0 |
+| q_mixed.i2 | 14259 (14166-14266) | 22007 (21882-22068) | 1.54 | 28.8 | 14.2 | 0 |
+| q_mixed.i3 | 20801 (20791-20860) | 23021 (22952-23156) | 1.11 | 62.9 | 24.7 | 0 |
+| q_mixed | 57033 (56660-57059) | 88015 (87514-88260) | 1.54 | 33.0 | 16.5 | 0 |
+
+## q_base.c8 at scale 60 (median of 3, range in brackets)
+
+| scenario | 1.0.8 msg/s | 1.1.0 msg/s | 1.1.0/1.0.8 | CPU us/pkg 1.0.8 | CPU us/pkg 1.1.0 | missing (worst) |
+|---|---|---|---|---|---|---|
+| q_base.c8 | 72840 (72735-73337) | 83354 (81240-86897) | 1.14 | 23.4 | 15.0 | 0 |
+
+## full (median of 3, range in brackets)
+
+| scenario | 1.0.8 msg/s | 1.1.0 msg/s | 1.1.0/1.0.8 | CPU us/pkg 1.0.8 | CPU us/pkg 1.1.0 | missing (worst) |
+|---|---|---|---|---|---|---|
+| payload.p64.c1 | 34798 (30590-35881) | 47224 (46223-47320) | 1.36 | 21.0 | 10.8 | 0 |
+| payload.p64.c2 | 59081 (59004-60837) | 77798 (67161-80898) | 1.32 | 22.0 | 13.6 | 0 |
+| payload.p64.c4 | 74766 (74749-74944) | 92439 (84376-92624) | 1.24 | 24.6 | 13.0 | 0 |
+| payload.p64.c8 | 74579 (74476-77510) | 87896 (84590-92095) | 1.18 | 24.5 | 13.4 | 0 |
+| payload.p200.c1 | 36522 (35984-37258) | 46249 (45245-48556) | 1.27 | 20.3 | 11.1 | 0 |
+| payload.p200.c2 | 57246 (55755-58995) | 78045 (72087-80809) | 1.36 | 22.4 | 13.9 | 0 |
+| payload.p200.c4 | 72039 (72014-74693) | 88209 (88061-88440) | 1.22 | 24.6 | 13.6 | 0 |
+| payload.p200.c8 | 77352 (74290-77368) | 87749 (83802-91843) | 1.13 | 24.5 | 13.8 | 0 |
+| payload.p4096.c1 | 33020 (32918-34086) | 42253 (38098-43158) | 1.28 | 22.2 | 12.6 | 0 |
+| payload.p4096.c2 | 53989 (53881-54107) | 69504 (69262-71784) | 1.29 | 24.2 | 14.4 | 0 |
+| payload.p4096.c4 | 66814 (64686-66845) | 74608 (71934-77521) | 1.12 | 26.6 | 14.7 | 0 |
+| payload.p4096.c8 | 68849 (68774-69019) | 74009 (73992-80236) | 1.07 | 27.1 | 14.8 | 0 |
+| payload64k.c1 | 11396 (9746-12946) | 16133 (14975-16171) | 1.42 | 84.5 | 33.0 | 0 |
+| payload64k.c2 | 17623 (16204-19441) | 21398 (17543-21472) | 1.21 | 92.0 | 41.0 | 0 |
+| payload64k.c4 | 19328 (19323-21426) | 23999 (21286-24007) | 1.24 | 101.5 | 46.0 | 0 |
+| payload64k.c8 | 21086 (19120-21162) | 21201 (21060-23852) | 1.01 | 110.0 | 51.5 | 0 |
+| fanout.c1.mreplicant.n1 | 35368 (33618-38817) | 46228 (43246-48559) | 1.31 | 21.1 | 11.4 | 0 |
+| fanout.c1.mreplicant.n3 | 18945 (18765-20250) | 23420 (22109-23983) | 1.24 | 10.1 | 7.7 | 0 |
+| fanout.c1.mspreader.n1 | 31072 (30554-31563) | 45148 (42256-45151) | 1.45 | 20.3 | 10.9 | 0 |
+| fanout.c1.mspreader.n3 | 30545 (30176-31488) | 43246 (42288-46220) | 1.42 | 20.8 | 11.2 | 0 |
+| fanout.c4.mreplicant.n1 | 74734 (71979-74783) | 88204 (88106-92329) | 1.18 | 24.5 | 12.9 | 0 |
+| fanout.c4.mreplicant.n3 | 39670 (39647-40696) | 46208 (44114-46231) | 1.16 | 12.8 | 8.6 | 0 |
+| fanout.c4.mspreader.n1 | 72053 (67354-74956) | 86928 (81154-88009) | 1.21 | 24.8 | 13.2 | 0 |
+| fanout.c4.mspreader.n3 | 72209 (69500-74994) | 87997 (84685-88123) | 1.22 | 24.0 | 13.3 | 0 |
+| fanout.c8.mreplicant.n1 | 74526 (74406-77731) | 91769 (87618-91947) | 1.23 | 24.8 | 13.7 | 0 |
+| fanout.c8.mreplicant.n3 | 42154 (41961-42275) | 45013 (43903-45958) | 1.07 | 13.3 | 8.8 | 0 |
+| fanout.c8.mspreader.n1 | 77302 (74653-77701) | 87386 (84174-87714) | 1.13 | 24.4 | 13.3 | 0 |
+| fanout.c8.mspreader.n3 | 77153 (74505-77411) | 91733 (87698-92054) | 1.19 | 24.3 | 13.8 | 0 |
+| limits.n1 | 60917 (60615-61040) | 77833 (74573-80871) | 1.28 | 21.8 | 13.2 | 0 |
+| limits.n3 | 33563 (32474-35294) | 41243 (35486-42183) | 1.23 | 12.0 | 9.0 | 0 |
+| limits_time | 61060 (55806-62781) | 77745 (74922-80864) | 1.27 | 22.6 | 13.6 | 0 |
+| ordering.c1 | 7840 (7791-7916) | 15761 (15630-15798) | 2.01 | 22.6 | 10.0 | 0 |
+| ordering.c2 | 8281 (8263-8300) | 17434 (17289-17592) | 2.11 | 23.7 | 10.7 | 0 |
+| ordering.c8 | 8280 (8260-8336) | 17715 (17556-17877) | 2.14 | 24.9 | 9.5 | 0 |
+| filter.c1.froot | 34823 (32140-35475) | 55608 (50033-58733) | 1.60 | 42.2 | 17.8 | 0 |
+| filter.c1.fclient | 34093 (31597-34186) | 53993 (52586-59176) | 1.58 | 43.7 | 18.0 | 0 |
+| filter.c2.froot | 62824 (62456-64598) | 102218 (92660-102428) | 1.63 | 46.9 | 20.1 | 0 |
+| filter.c2.fclient | 59099 (57088-60696) | 102158 (102140-102203) | 1.73 | 50.4 | 22.0 | 0 |
+| filter.c8.froot | 88179 (87741-88396) | 113544 (113240-114091) | 1.29 | 52.6 | 22.1 | 0 |
+| filter.c8.fclient | 88143 (87919-88196) | 113809 (107455-113838) | 1.29 | 58.8 | 22.2 | 0 |
+| mixed_plain.i0 | 25765 (24509-26182) | 32631 (30821-32716) | 1.27 | 25.6 | 13.6 | 0 |
+| mixed_plain.i1 | 25785 (24524-26199) | 31158 (29450-33224) | 1.21 | 29.4 | 13.5 | 0 |
+| mixed_plain.i2 | 25799 (24538-26215) | 30205 (28185-30615) | 1.17 | 34.2 | 14.0 | 0 |
+| mixed_plain | 77294 (73527-78546) | 90492 (84442-91702) | 1.17 | 29.5 | 13.7 | 0 |
+| mixed.i0 | 21962 (21663-22159) | 29091 (28710-29644) | 1.32 | 28.0 | 13.8 | 0 |
+| mixed.i1 | 21726 (21433-22171) | 29555 (28732-29669) | 1.36 | 31.7 | 13.8 | 0 |
+| mixed.i2 | 7017 (6821-7451) | 11947 (11890-12042) | 1.70 | 34.2 | 12.8 | 0 |
+| mixed.i3 | 23898 (23835-24418) | 27114 (26786-27207) | 1.13 | 85.6 | 22.3 | 0 |
+| mixed | 28060 (27275-29793) | 47762 (47533-48137) | 1.70 | 39.2 | 14.7 | 0 |
+
+## fast.c1 against main (median of 10, range in brackets)
+
+| scenario | 1.0.8 msg/s | main 0a38bbf msg/s | 1.1.0 msg/s | 1.1.0/1.0.8 | 1.1.0/main 0a38bbf | CPU us/pkg 1.0.8 | CPU us/pkg main 0a38bbf | CPU us/pkg 1.1.0 | missing (worst) |
+|---|---|---|---|---|---|---|---|---|---|
+| fast.c1 | 30674 (29937-31527) | 44681 (41599-47972) | 44698 (42874-47154) | 1.46 | 1.00 | 17.3 | 11.8 | 11.9 | 0 |
+
+## Notes on 1.1.0
+
+- No scenario is slower than 1.0.8. The smallest gain is payload64k.c8
+  (packages of 64 KiB with 8 children), where both builds are bound by Redis on
+  the same machine.
+- With ordering (fast_ordering, q_ordering, ordering.*) 1.1.0 delivers about
+  twice what 1.0.8 does, in strict order for any number of children; towards a
+  target 1 ms away (fast_ordering_remote) it follows the 6000/s feed, where 1.0.8
+  delivers about 1550/s.
+- fast.c1 was also measured against main before 1.1.0 over 10 rounds because one
+  pre-release run of 5 rounds had read 0.92; over 10 rounds 1.1.0 and main are
+  equal (1.00), with the same instructions per package counted by callgrind.
