@@ -269,3 +269,40 @@ fn ordering_buffer_time_zero_holds_a_second_one_child() {
 fn ordering_buffer_time_zero_holds_a_second_four_children() {
     buffer_time_zero("ordering_zero_4", 4);
 }
+
+/// A chunk carries at most 4 MiB of packages (P3 = p3a), seen from outside (M3R-50 =
+/// R50a; the unit test `chunks` held it alone): 200 packages of 64 KiB, under the
+/// 1000-package bound, released at once by the stop to a target that reads every RPUSH and
+/// answers none. The sender writes its first chunk, waits for the replies, and the target
+/// goes down at the command timeout with the rest still to be written, so what the target
+/// received is that chunk: 64 packages (4 MiB of payload). Without the bound, all 200.
+#[test]
+fn chunk_holds_at_most_4_mib() {
+    let mute = SlowTarget::ambiguous(AfterPush::Mute);
+    let mut ctx = Ctx::new("chunk4mib");
+    let src = ctx.key("src");
+    let clients = [ctx.client_yaml_at("mute", "rmtest:mute", mute.port) + SHORT_TIMEOUTS];
+    // Held for an hour: only the stop releases them, all in one batch
+    let extra = ORDERING.replace("{T}", "3600");
+    let cfg = ctx.config(&src, 1, "replicant", &extra, &clients);
+    let mut p = ctx.spawn(&cfg);
+    let n = 200u64;
+    let input: Vec<String> = (0..n)
+        .map(|i| {
+            let head = format!("{{\"ts\": {:03}, \"v\": \"", i);
+            let pad = 64 * 1024 - head.len() - 2;
+            format!("{}{}\"}}", head, "x".repeat(pad))
+        })
+        .collect();
+    assert!(input.iter().all(|s| s.len() == 64 * 1024));
+    ctx.push(&src, &input);
+    ctx.wait_for("the source drained", |c| c.llen(&src) == 0);
+    // The last package popped is in the buffer once the worker took it; let it get there
+    thread::sleep(Duration::from_millis(300));
+    p.stop(&ctx.pid_file());
+    assert_eq!(mute.count(), 64, "{}", p.stdout());
+    let status: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(ctx.dir.join("rm.status")).unwrap()).unwrap();
+    assert_eq!(status["since_start"]["in"], n, "{}", status);
+    assert_eq!(status["since_start"]["failed"], n, "{}", status);
+}
