@@ -164,3 +164,122 @@ fn ordering_without_ts_is_counted_in_the_log() {
         .sum();
     assert_eq!(counted, n, "{}", err);
 }
+
+/// A pseudo-terminal for one of the program's streams: the program writes to the slave
+/// side, a thread reads the master side until the program and every copy of the slave
+/// are gone (EIO), so the terminal never fills up
+struct Pty {
+    slave: Option<std::os::fd::OwnedFd>,
+    reader: Option<std::thread::JoinHandle<Vec<u8>>>,
+}
+
+impl Pty {
+    fn open() -> Pty {
+        use std::io::Read;
+        use std::os::fd::FromRawFd;
+        let (mut master, mut slave) = (-1, -1);
+        // SAFETY: openpty writes the two descriptors it opens; no name, termios or size
+        let r = unsafe {
+            libc::openpty(
+                &mut master,
+                &mut slave,
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                std::ptr::null(),
+            )
+        };
+        assert_eq!(r, 0, "openpty: {}", std::io::Error::last_os_error());
+        // SAFETY: both descriptors were just opened by openpty and are owned here alone
+        let (master, slave) = unsafe {
+            (
+                std::fs::File::from_raw_fd(master),
+                std::os::fd::OwnedFd::from_raw_fd(slave),
+            )
+        };
+        let reader = std::thread::spawn(move || {
+            let mut master = master;
+            let mut got = Vec::new();
+            let mut buf = [0u8; 4096];
+            // Linux answers EIO on the master once no slave is open: the end of the output
+            while let Ok(n) = master.read(&mut buf) {
+                if n == 0 {
+                    break;
+                }
+                got.extend_from_slice(&buf[..n]);
+            }
+            got
+        });
+        Pty {
+            slave: Some(slave),
+            reader: Some(reader),
+        }
+    }
+
+    /// The slave side for the child; the parent's copy is dropped right after the spawn
+    fn stdio(&self) -> std::process::Stdio {
+        std::process::Stdio::from(self.slave.as_ref().unwrap().try_clone().unwrap())
+    }
+
+    /// What the program wrote, once it ended (carriage returns of the terminal removed)
+    fn output(mut self) -> String {
+        drop(self.slave.take());
+        let got = self.reader.take().unwrap().join().unwrap();
+        String::from_utf8_lossy(&got).replace('\r', "")
+    }
+}
+
+/// Both streams on a terminal: every line is coloured, its colour code first and the
+/// closing code before the newline (M3-j = ja; M3R-50 = R50a); the other side is
+/// `log_has_no_colour_when_not_a_terminal`
+#[test]
+fn log_has_colours_on_a_terminal() {
+    let mut ctx = Ctx::new("colour");
+    let src = ctx.key("src");
+    let t0 = ctx.key("t0");
+    let down = closed_port();
+    let clients = [
+        ctx.client_yaml("t0", &t0, ""),
+        format!(
+            "  - name: 't1'\n    ssl: false\n    hostname: '127.0.0.1'\n    port: {}\n    password: ''\n    channel: 'rmtest:down'\n{}",
+            down, SHORT_TIMEOUTS
+        ),
+    ];
+    let cfg = ctx.config(&src, 2, "replicant", "", &clients);
+    let (out, err) = (Pty::open(), Pty::open());
+    let mut child = Command::new(bin())
+        .arg(&cfg)
+        .stdin(std::process::Stdio::null())
+        .stdout(out.stdio())
+        .stderr(err.stdio())
+        .spawn()
+        .unwrap();
+    let input: Vec<String> = (0..100).map(seq_pkg).collect();
+    ctx.push(&src, &input);
+    ctx.wait_drained(&src, &[(&t0, 100)]);
+    // SAFETY: a signal to the child this test started and has not waited for yet
+    assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGINT) }, 0);
+    let status = child.wait().unwrap();
+    assert!(status.success(), "{:?}", status);
+    assert!(!ctx.pid_file().exists());
+    let (out, err) = (out.output(), err.output());
+    let reset = "\x1b[1;0m";
+    let finished = out
+        .lines()
+        .find(|l| l.contains("Program finished!"))
+        .unwrap_or_else(|| panic!("{}", out));
+    assert!(finished.starts_with("\x1b[1;32m"), "{:?}", finished);
+    assert!(finished.ends_with(reset), "{:?}", finished);
+    let error = err
+        .lines()
+        .find(|l| l.contains("Error while connecting"))
+        .unwrap_or_else(|| panic!("{}", err));
+    assert!(error.starts_with("\x1b["), "{:?}", error);
+    assert!(error.ends_with(reset), "{:?}", error);
+    for line in out.lines().chain(err.lines()).filter(|l| !l.is_empty()) {
+        assert!(
+            line.starts_with("\x1b["),
+            "a line without its colour: {:?}",
+            line
+        );
+    }
+}
