@@ -2742,10 +2742,27 @@ fn chunk_config(mode: &str, ports: &[u16]) -> Config {
     c
 }
 
+/// Connects a target before a run, waiting for the attempt however long it takes (up to
+/// a minute): ensure_link alone waits CONNECT_GRACE (100 ms), and under load a first
+/// connect that took longer failed the run "not connected" (M3F-25, M3R-56)
+fn connect_before_the_run(l: &mut RedisLink) {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !ensure_link(1, l) {
+        // An attempt that ended without a link leaves its retry time set and none running
+        assert!(
+            l.connecting.is_some() || l.retry_at.is_none(),
+            "not connected: the attempt failed ({} attempts)",
+            l.attempts
+        );
+        assert!(Instant::now() < deadline, "not connected after a minute");
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
 fn connected_links(c: &Config) -> Vec<RedisLink> {
     let mut links: Vec<RedisLink> = c.clients.iter().map(|t| new_link(1, c, t, &None)).collect();
     for l in links.iter_mut() {
-        assert!(ensure_link(1, l), "not connected");
+        connect_before_the_run(l);
     }
     links
 }
@@ -3035,7 +3052,7 @@ fn spread_with_last(down: bool, last: impl FnOnce(&mut RedisLink)) -> (Vec<Vec<V
         .map(|t| new_link(1, &c, t, &None))
         .collect();
     for l in links.iter_mut().take(if down { 2 } else { 3 }) {
-        assert!(ensure_link(1, l), "not connected");
+        connect_before_the_run(l);
     }
     last(&mut links[2]);
     let mut counts = Counts::default();
@@ -3145,6 +3162,15 @@ const SHARE_FILTERS: [Option<&str>; 4] =
 const SHARE_PACKAGES: usize = 600;
 const SHARE_CHUNK: usize = 50;
 
+/// The command timeout of a shares stand-in that answers: far above any handshake or
+/// reply under load, so a slow machine never turns a healthy target into a failing one
+/// (M3F-25, M3R-56)
+const SHARE_TIMEOUT: f64 = 10.0;
+
+/// The reply timeout of a shares stand-in that never answers (Mute), set once it is
+/// connected, and the command timeout of one nobody serves (Down): their only cost
+const SHARE_MUTE_TIMEOUT: Duration = Duration::from_millis(200);
+
 /// What each target got, in arrival order, and the counts: spreader over `filters.len()`
 /// stand-ins, the one at `bad` failing as said, `SHARE_PACKAGES` packages from cursor 0;
 /// `chunked`: through deliver_chunk() in chunks of `SHARE_CHUNK` (the sender), else one by
@@ -3193,10 +3219,13 @@ fn shares_run_with(
         }
     }
     let mut c = chunk_config("spreader", &ports);
-    for t in c.clients.iter_mut() {
-        t.command_timeout = Some(0.2);
-    }
     for (b, t) in c.clients.iter_mut().enumerate() {
+        // Down: its connects are never served, so they cost this timeout each
+        t.command_timeout = Some(if kind(b) == Some(Fails::Down) {
+            SHARE_MUTE_TIMEOUT.as_secs_f64()
+        } else {
+            SHARE_TIMEOUT
+        });
         if kind(b) == Some(Fails::Stuck) {
             (t.timelimit, t.checklimit, t.softlimit, t.hardlimit) =
                 (Some(3600), Some(7), Some(50), Some(100));
@@ -3213,19 +3242,39 @@ fn shares_run_with(
         .collect();
     for (t, l) in links.iter_mut().enumerate() {
         if kind(t) != Some(Fails::Down) {
-            assert!(ensure_link(1, l), "not connected");
+            connect_before_the_run(l);
+        }
+        if kind(t) == Some(Fails::Mute) {
+            // Connected with the long timeout; only its replies, which never come, wait short
+            l.link
+                .as_mut()
+                .unwrap()
+                .set_read_timeout(Some(SHARE_MUTE_TIMEOUT))
+                .unwrap();
         }
     }
     let mut counts = Counts::default();
     let mut cursor = 0;
     let packages = packages_n(SHARE_PACKAGES);
+    // A target that never answers or that closes is down for the rest of the run, in both
+    // runs alike, however long they take: its retry time is kept out of reach once it went
+    // down (M3R-56: after its 1 s backoff it came back at a different package in each run)
+    let keep_down = |links: &mut [RedisLink]| {
+        for (t, l) in links.iter_mut().enumerate() {
+            if matches!(kind(t), Some(Fails::Mute | Fails::Closes)) && l.link.is_none() {
+                l.retry_at = Some(Instant::now() + Duration::from_secs(3600));
+            }
+        }
+    };
     if chunked {
         for chunk in packages.chunks(SHARE_CHUNK) {
             deliver_chunk(1, &None, &c, &mut links, &mut cursor, chunk, &mut counts);
+            keep_down(&mut links);
         }
     } else {
         for package in &packages {
             deliver(1, &None, &c, &mut links, &mut cursor, package, &mut counts);
+            keep_down(&mut links);
         }
     }
     drop(closed);
@@ -3555,7 +3604,7 @@ fn spread_answers(
         })
         .collect();
     for l in links.iter_mut() {
-        assert!(ensure_link(1, l), "not connected");
+        connect_before_the_run(l);
     }
     let mut counts = Counts::default();
     let mut cursor = 0;
@@ -3809,7 +3858,7 @@ fn spreader_does_not_hold_back_a_target_that_never_answered_or_closed() {
             .map(|t| new_link(1, &c, t, &None))
             .collect();
         for l in links.iter_mut() {
-            assert!(ensure_link(1, l), "not connected");
+            connect_before_the_run(l);
         }
         let (mut counts, mut cursor) = (Counts::default(), 0);
         let packages = packages_n(3 * SHARE_CHUNK);
