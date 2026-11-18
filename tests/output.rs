@@ -228,6 +228,28 @@ impl Pty {
     }
 }
 
+/// Waits for the child at most EXIT_TIMEOUT: a program that does not exit is killed and
+/// the test fails, instead of the suite waiting for ever (M3R-55 = R55a)
+fn wait_bounded(child: &mut std::process::Child) -> std::process::ExitStatus {
+    let start = std::time::Instant::now();
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            return status;
+        }
+        if start.elapsed() > EXIT_TIMEOUT {
+            // Killed so its terminals close and the readers end before the panic
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!(
+                "process {} did not exit within {:?} of SIGINT",
+                child.id(),
+                EXIT_TIMEOUT
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
 /// Both streams on a terminal: every line is coloured, its colour code first and the
 /// closing code before the newline (M3-j = ja; M3R-50 = R50a); the other side is
 /// `log_has_no_colour_when_not_a_terminal`
@@ -258,7 +280,7 @@ fn log_has_colours_on_a_terminal() {
     ctx.wait_drained(&src, &[(&t0, 100)]);
     // SAFETY: a signal to the child this test started and has not waited for yet
     assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGINT) }, 0);
-    let status = child.wait().unwrap();
+    let status = wait_bounded(&mut child);
     assert!(status.success(), "{:?}", status);
     assert!(!ctx.pid_file().exists());
     let (out, err) = (out.output(), err.output());
