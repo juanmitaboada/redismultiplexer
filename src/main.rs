@@ -2972,7 +2972,7 @@ fn send(
     match prepare(id, client, dirty_bdata, deleted)? {
         Prepared::Ready(bdata) => match send_to_client(client, &bdata) {
             Ok(_) => Ok(Sent::Taken),
-            Err(e) => Err(format!("error while sending to the client: {}", e)),
+            Err(e) => Err(e),
         },
         Prepared::Not(sent) => Ok(sent),
     }
@@ -3212,17 +3212,17 @@ fn deliver_chunk(
         for &p in &todo {
             let bdata = data[p].as_deref().unwrap_or_default();
             for (t, client) in clients.iter_mut().enumerate() {
-                plan(id, config, client, t, p, bdata, &mut up[t], &mut st, counts);
+                plan(id, client, t, p, bdata, &mut up[t], &mut st, counts);
             }
         }
         // Every target's requests first, then the replies
         let written: Vec<Written> = clients.iter_mut().map(write_pending).collect();
         for (t, (client, w)) in clients.iter_mut().zip(written).enumerate() {
             let (replies, error) = read_pending(client, w);
-            settle(config, client, t, replies, error, &mut st);
+            settle(client, t, replies, error, &mut st);
         }
     } else {
-        spread_chunk(id, config, clients, cursor, &data, &todo, &mut st, counts);
+        spread_chunk(id, clients, cursor, &data, &todo, &mut st, counts);
     }
     for (taken, why) in st.taken.iter().zip(&st.why) {
         account(*taken, why, counts);
@@ -3251,7 +3251,6 @@ fn deliver_chunk(
 #[allow(clippy::too_many_arguments)]
 fn spread_chunk(
     id: u16,
-    config: &Config,
     clients: &mut [RedisLink],
     cursor: &mut usize,
     data: &[Option<Cow<[u8]>>],
@@ -3268,7 +3267,6 @@ fn spread_chunk(
         ($t:expr, $p:expr) => {
             plan(
                 id,
-                config,
                 &mut clients[$t],
                 $t,
                 $p,
@@ -3349,7 +3347,7 @@ fn spread_chunk(
         for &t in &order {
             if !clients[t].pending.is_empty() {
                 let (replies, error) = write_target(&mut clients[t], t, st);
-                settle(config, &mut clients[t], t, replies, error, st);
+                settle(&mut clients[t], t, replies, error, st);
             }
             let mut refused = std::mem::take(&mut st.replan);
             refused.sort_unstable();
@@ -3455,7 +3453,6 @@ fn would_take(client: &RedisLink, bdata: &[u8]) -> bool {
 #[allow(clippy::too_many_arguments)] // the planning state of one chunk, as spread_chunk holds it
 fn plan(
     id: u16,
-    config: &Config,
     client: &mut RedisLink,
     t: usize,
     p: usize,
@@ -3489,7 +3486,7 @@ fn plan(
     // sees includes every package sent before, as with one RPUSH at a time
     if !client.pending.is_empty() && check_due(client) {
         let (replies, error) = write_target(client, t, st);
-        settle(config, client, t, replies, error, st);
+        settle(client, t, replies, error, st);
         if client.link.is_none() {
             *up = Some(false);
             if accepts(client) {
@@ -3510,7 +3507,7 @@ fn plan(
         }
         Ok(Prepared::Not(_)) => false,
         Err(e) => {
-            send_error(config, &e);
+            push_error(client, &e);
             target_failed(client);
             if client.link.is_none() {
                 *up = Some(false);
@@ -3524,7 +3521,6 @@ fn plan(
 /// The replies of one target's requests: taken, or failed for it; spreader plans a
 /// package again for another target. One error line per target and flush, not per package.
 fn settle(
-    config: &Config,
     client: &mut RedisLink,
     t: usize,
     replies: Vec<(usize, Reply)>,
@@ -3532,7 +3528,7 @@ fn settle(
     st: &mut ChunkState,
 ) {
     if let Some(e) = error {
-        send_error(config, &format!("error while sending to the client: {}", e));
+        push_error(client, &e);
         target_failed(client);
     }
     st.answers[t].0 += replies.len();
@@ -3564,17 +3560,18 @@ fn write_target(
     flush_target(client)
 }
 
-/// The error line of a failed delivery (it names the source, as 1.0.8 did)
-fn send_error(config: &Config, error: &str) {
+/// The error line of a failed push or limits check: it names the target that failed, in
+/// the shape of the connect line (1.0.8 and 1.1.0 named the source, M3F-22)
+fn push_error(client: &RedisLink, error: &str) {
     print_debug!(
         PROGRAM_NAME,
         stderr(),
         COLOR_RED,
         0,
-        "Error while sending to '{}:{}@{}': {}",
-        config.hostname,
-        config.port,
-        config.channel,
+        "Error while sending to target '{}:{}@{}': {}",
+        client.config.hostname,
+        client.config.port,
+        client.config.channel,
         error
     );
 }
@@ -3688,17 +3685,7 @@ fn deliver(
                 false
             }
             Err(e) => {
-                print_debug!(
-                    PROGRAM_NAME,
-                    stderr(),
-                    COLOR_RED,
-                    0,
-                    "Error while sending to '{}:{}@{}': {}",
-                    config.hostname,
-                    config.port,
-                    config.channel,
-                    e
-                );
+                push_error(client, &e);
                 target_failed(client);
                 why.failed = true;
                 false

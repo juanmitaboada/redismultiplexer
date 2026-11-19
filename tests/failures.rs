@@ -228,6 +228,22 @@ fn wrongtype_target(test: &str, cell: Cell) {
     p.stop(&ctx.pid_file());
     assert_all(cell, &[ctx.list(&t0)], n);
     assert!(p.stderr().contains("WRONGTYPE"), "{}", p.stderr());
+    // The error line names the target that refused, not the source (M3F-22)
+    let stderr = p.stderr();
+    let errors: Vec<&str> = stderr
+        .lines()
+        .filter(|l| l.contains("Error while sending"))
+        .collect();
+    assert!(!errors.is_empty(), "{}", p.stderr());
+    for line in &errors {
+        assert!(
+            line.contains("Error while sending to target '")
+                && line.contains(&format!("@{}': ", bad))
+                && !line.contains(&src),
+            "{}",
+            line
+        );
+    }
     assert_eq!(
         links.len(),
         link_holders(cell),
