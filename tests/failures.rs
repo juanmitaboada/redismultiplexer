@@ -215,6 +215,107 @@ fn error_events(stderr: &str, key: &str) -> (usize, u64) {
     (lines, events)
 }
 
+/// A target whose server accepts every connection and closes it (M3F-27) is never "back":
+/// the connect opened again without CLIENT SETNAME counts only once a PING on it is
+/// answered. It stays in `down_targets`, each thread says once that it cannot connect,
+/// and the other target gets every package (replicant counts them failed for it).
+fn closing_peer_is_not_back(test: &str, cell: Cell) {
+    let peer = ClosingPeer::start();
+    let mut ctx = Ctx::new(test);
+    let src = ctx.key("src");
+    let t0 = ctx.key("t0");
+    let clients = [
+        ctx.client_yaml_at("peer", "rmtest:peer", peer.port) + SHORT_TIMEOUTS,
+        ctx.client_yaml("t0", &t0, ""),
+    ];
+    let cfg = ctx.config(&src, cell.children, cell.mode(), cell.extra(), &clients);
+    let mut p = ctx.spawn(&cfg);
+    let n = 200u64;
+    // Fed over a few backoff periods, so the peer is retried while packages flow
+    let feeder = feed(&ctx, &src, n);
+    feeder.join().unwrap();
+    ctx.wait_drained(&src, &[(&t0, n as usize)]);
+    p.stop(&ctx.pid_file());
+    let stderr = p.stderr();
+    let at = format!("127.0.0.1:{}@rmtest:peer'", peer.port);
+    let mine = |l: &&str| l.contains(&at);
+    assert!(
+        !stderr
+            .lines()
+            .filter(mine)
+            .any(|l| l.contains("is back after")),
+        "{}",
+        stderr
+    );
+    let threads = cell.children as usize + usize::from(cell.ordering);
+    let down = stderr
+        .lines()
+        .filter(mine)
+        .filter(|l| l.contains("Error while connecting to target"))
+        .count();
+    assert!(down >= 1 && down <= threads, "{} lines: {}", down, stderr);
+    assert!(
+        !stderr
+            .lines()
+            .filter(mine)
+            .any(|l| l.contains("Error while sending")),
+        "a push to it: {}",
+        stderr
+    );
+    let status: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(ctx.dir.join("rm.status")).unwrap()).unwrap();
+    assert_eq!(
+        status["down_targets"],
+        serde_json::json!(["peer:rmtest:peer"]),
+        "{}",
+        status
+    );
+    assert_eq!(status["since_start"]["in"], n, "{}", status);
+    assert_eq!(status["since_start"]["out"], n, "{}", status);
+}
+
+/// The source on a server that accepts every connection and closes it: nothing is popped,
+/// each child says once a second that it cannot connect, the stop is clean (M3F-27; the
+/// same connect serves the source)
+#[test]
+fn closing_source_pops_nothing() {
+    let peer = ClosingPeer::start();
+    let mut ctx = Ctx::new("closing_source");
+    let t0 = ctx.key("t0");
+    let cfg = ctx.config(
+        "rmtest:closing_src",
+        2,
+        "replicant",
+        "",
+        &[ctx.client_yaml("t0", &t0, "")],
+    );
+    let yaml = std::fs::read_to_string(&cfg).unwrap();
+    let root = format!(
+        "hostname: {}\nport: {}\npassword: {}\n",
+        q(&ctx.ep.host),
+        ctx.ep.port,
+        q(&ctx.ep.password)
+    );
+    let peer_root = format!("hostname: '127.0.0.1'\nport: {}\npassword: ''\n", peer.port);
+    std::fs::write(&cfg, yaml.replacen(&root, &peer_root, 1)).unwrap();
+    let mut p = ctx.spawn(&cfg);
+    ctx.wait_for("a connect error per child", |_| {
+        p.stderr()
+            .matches("Error while connecting to source")
+            .count()
+            >= 2
+    });
+    p.stop(&ctx.pid_file());
+    let stderr = p.stderr();
+    assert!(!stderr.contains("Error while reading from"), "{}", stderr);
+    assert!(
+        stderr.contains("the connection broke on CLIENT SETNAME"),
+        "{}",
+        stderr
+    );
+    assert_eq!(ctx.llen(&t0), 0);
+}
+
 /// An error that drops a target's link is its "down" line and is never held back by the
 /// limit (C4R-1 = a): a target whose connections are killed twice, the second time a
 /// moment after it came back (well inside the 10 s window), logs an error line for each
@@ -1143,6 +1244,7 @@ matrix!(target_unreachable, target_unreachable_from_start, 2);
 matrix!(wrongtype, wrongtype_target, 2);
 matrix!(push_errors_limited, push_errors_are_rate_limited, 2);
 matrix!(dropped_link_errors, a_dropped_link_is_always_logged, 2);
+matrix!(closing_peer, closing_peer_is_not_back, 2);
 matrix!(stop_target_down, stop_with_a_target_down, 4);
 matrix!(after_signal, push_after_the_signal, 2);
 matrix!(mute_target, mute_target_with_chunks, 2);

@@ -2676,11 +2676,38 @@ fn redis_connect(
                     name: None,
                     ..endpoint.clone()
                 };
-                return redis_connect(_id, &unnamed, is_client);
+                // The crate's connect needs no answer from the server, so the new link
+                // counts only once one command on it is answered: a peer that closes every
+                // connection is not "back" (M3F-27)
+                let mut again = redis_connect(_id, &unnamed, is_client)?;
+                let ping = redis::cmd("PING").query::<()>(&mut again);
+                return match fallback_answered(&ping) {
+                    Ok(()) => Ok(again),
+                    Err(what) => Err(format!(
+                        "the connection broke on CLIENT SETNAME ({}), and the one opened again without it {}",
+                        e, what
+                    )),
+                };
             }
         }
     }
     Ok(link)
+}
+
+/// Whether the PING on a link opened again without CLIENT SETNAME was answered: any
+/// reply, an error reply included (a user without +ping, M3R-29), proves the server is
+/// there; an I/O error (closed, reset) or no answer within the command timeout does not.
+/// The error says which, in the words the crate gives.
+fn fallback_answered(ping: &redis::RedisResult<()>) -> Result<(), String> {
+    match ping {
+        Ok(()) => Ok(()),
+        Err(e) if e.is_timeout() => Err(format!(
+            "did not answer PING within the command timeout: {}",
+            e
+        )),
+        Err(e) if breaks_link(e) => Err(format!("failed on PING: {}", e)),
+        Err(_) => Ok(()),
+    }
 }
 
 /// BLPOP with a one second timeout, sent as an integer as redis 0.19 did:

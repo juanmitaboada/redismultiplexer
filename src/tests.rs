@@ -4095,3 +4095,35 @@ fn a_push_error_that_drops_the_link_is_always_printed_with_the_count() {
         Some("WRONGTYPE d (1 since the last line)".to_string())
     );
 }
+
+// --- the link opened again without CLIENT SETNAME counts once a PING is answered (M3F-27) ---
+
+#[test]
+fn a_fallback_link_counts_once_its_ping_is_answered() {
+    let io = |kind| -> redis::RedisResult<()> {
+        Err(redis::RedisError::from(std::io::Error::new(kind, "x")))
+    };
+    // A reply, or an error reply (a user without +ping): the server is there
+    assert_eq!(fallback_answered(&Ok(())), Ok(()));
+    let refused: redis::RedisResult<()> =
+        Err((redis::ErrorKind::ResponseError, "NOPERM no +ping").into());
+    assert_eq!(fallback_answered(&refused), Ok(()));
+    // Closed or reset: not there, said as such
+    for kind in [
+        std::io::ErrorKind::ConnectionReset,
+        std::io::ErrorKind::UnexpectedEof,
+        std::io::ErrorKind::BrokenPipe,
+    ] {
+        let e = fallback_answered(&io(kind)).unwrap_err();
+        assert!(e.starts_with("failed on PING: "), "{}", e);
+    }
+    // No answer within the command timeout (the socket's read timeout)
+    for kind in [std::io::ErrorKind::TimedOut, std::io::ErrorKind::WouldBlock] {
+        let e = fallback_answered(&io(kind)).unwrap_err();
+        assert!(
+            e.starts_with("did not answer PING within the command timeout"),
+            "{}",
+            e
+        );
+    }
+}

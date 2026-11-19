@@ -854,6 +854,25 @@ impl SilentTarget {
     }
 }
 
+/// A server that accepts every connection and closes it at once (M3F-27): a connect gets
+/// through, every command on it fails
+pub struct ClosingPeer {
+    pub port: u16,
+}
+
+impl ClosingPeer {
+    pub fn start() -> ClosingPeer {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                drop(stream);
+            }
+        });
+        ClosingPeer { port }
+    }
+}
+
 /// A local port whose connections hang: its accept queue is full, so the kernel drops
 /// new SYNs as a host behind a firewall that drops packets does (no refusal, no answer).
 pub struct Blackhole {
