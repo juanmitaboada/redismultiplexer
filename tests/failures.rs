@@ -198,6 +198,150 @@ fn target_unreachable_from_start(test: &str, cell: Cell) {
     );
 }
 
+/// What a target's error lines stand for: one each, or N with "(N since the last line)"
+fn error_events(stderr: &str, key: &str) -> (usize, u64) {
+    let mut lines = 0;
+    let mut events = 0;
+    for l in stderr.lines().filter(|l| {
+        l.contains("Error while sending to target") && l.contains(&format!("@{}'", key))
+    }) {
+        lines += 1;
+        events += l
+            .rsplit_once(" (")
+            .and_then(|(_, t)| t.strip_suffix(" since the last line)"))
+            .and_then(|n| n.parse::<u64>().ok())
+            .unwrap_or(1);
+    }
+    (lines, events)
+}
+
+/// An error that drops a target's link is its "down" line and is never held back by the
+/// limit (C4R-1 = a): a target whose connections are killed twice, the second time a
+/// moment after it came back (well inside the 10 s window), logs an error line for each
+/// thread that pushes to it each time, and without ordering every "is back" comes after
+/// its error line. Only counts and order are read, no time.
+fn a_dropped_link_is_always_logged(test: &str, cell: Cell) {
+    let mut ctx = Ctx::new(test);
+    let src = ctx.key("src");
+    let keys: Vec<String> = (0..cell.targets())
+        .map(|i| ctx.key(&format!("t{}", i)))
+        .collect();
+    let clients: Vec<String> = keys.iter().map(|k| ctx.client_yaml(k, k, "")).collect();
+    let cfg = ctx.config(&src, cell.children, cell.mode(), cell.extra(), &clients);
+    let mut p = ctx.spawn(&cfg);
+    let n = 10000;
+    let feeder = feed(&ctx, &src, n);
+    let t0 = keys[0].clone();
+    let backs = |p: &Proc| {
+        p.stderr()
+            .lines()
+            .filter(|l| l.contains("is back after") && l.contains(&format!("@{}'", t0)))
+            .count()
+    };
+    // With ordering only the sender pushes; without, every worker
+    let delivering = if cell.ordering {
+        1
+    } else {
+        cell.children as usize
+    };
+    ctx.wait_for("deliveries to t0", |c| c.llen(&t0) > 200);
+    for round in 1..=2 {
+        kill_connections(&mut ctx, &t0);
+        ctx.wait_for("t0 back", |_| backs(&p) >= round * delivering);
+    }
+    feeder.join().unwrap();
+    ctx.wait_for("the source drained", |c| c.llen(&src) == 0);
+    p.stop(&ctx.pid_file());
+    let stderr = p.stderr();
+    let is_error =
+        |l: &str| l.contains("Error while sending to target") && l.contains(&format!("@{}'", t0));
+    let errors = stderr.lines().filter(|l| is_error(l)).count();
+    assert!(
+        errors >= 2 * delivering,
+        "{} error lines for 2 kills and {} delivering threads: {}",
+        errors,
+        delivering,
+        stderr
+    );
+    if !cell.ordering {
+        let (mut e, mut b) = (0, 0);
+        for l in stderr.lines() {
+            if is_error(l) {
+                e += 1;
+            } else if l.contains("is back after") && l.contains(&format!("@{}'", t0)) {
+                b += 1;
+                assert!(
+                    e >= b,
+                    "an 'is back' without its error line before it: {}",
+                    stderr
+                );
+            }
+        }
+    }
+}
+
+/// Two targets that answer every push with an error reply (their keys are not lists) are
+/// logged with a limit (M3F-23), each on its own (the key is the thread and the target):
+/// per thread, the first error at once, then at most one line per 10 s with the count, and
+/// one at the thread's end; the counts add up to the errors. Bounded by the run's own
+/// length, not by the clock.
+fn push_errors_are_rate_limited(test: &str, cell: Cell) {
+    let mut ctx = Ctx::new(test);
+    let src = ctx.key("src");
+    let t0 = ctx.key("t0");
+    let bad = ctx.key("bad");
+    let bad2 = ctx.key("bad2");
+    let _: () = ctx.cmd(&["SET", &bad, "not a list"]);
+    let _: () = ctx.cmd(&["SET", &bad2, "not a list"]);
+    let n = 2000u64;
+    let input: Vec<String> = (0..n).map(seq_pkg).collect();
+    ctx.push(&src, &input);
+    let cfg = ctx.config(
+        &src,
+        cell.children,
+        cell.mode(),
+        cell.extra(),
+        &[
+            ctx.client_yaml(&bad, &bad, ""),
+            ctx.client_yaml(&bad2, &bad2, ""),
+            ctx.client_yaml("t0", &t0, ""),
+        ],
+    );
+    let start = Instant::now();
+    let mut p = ctx.spawn(&cfg);
+    ctx.wait_for("the source drained", |c| c.llen(&src) == 0);
+    if !cell.spreader {
+        ctx.wait_drained(&src, &[(&t0, n as usize)]);
+    }
+    p.stop(&ctx.pid_file());
+    let elapsed = start.elapsed().as_secs();
+    // Every thread that can push: the workers, and the sender with ordering
+    let threads = cell.children as u64 + u64::from(cell.ordering);
+    // Per thread and target: the first, one per started 10 s of the run, the end
+    let most = threads * (2 + elapsed / 10 + 1);
+    for key in [&bad, &bad2] {
+        let (lines, events) = error_events(&p.stderr(), key);
+        assert!(lines > 0, "{} never named: {}", key, p.stderr());
+        assert!(
+            lines as u64 <= most,
+            "{}: {} lines in {} s by {} threads: {}",
+            key,
+            lines,
+            elapsed,
+            threads,
+            p.stderr()
+        );
+        if !cell.ordering && !cell.spreader {
+            // One error per package: the lines' counts add up to every package
+            assert_eq!(events, n, "{}: {}", key, p.stderr());
+        } else {
+            // Spreader passes a refusing target over, the sender counts a flush once
+            assert!(events >= 1 && events <= n, "{}: {} events", key, events);
+        }
+    }
+    assert_eq!(ctx.llen(&t0) as u64, n, "t0");
+}
+
 /// A target whose key is not a list answers every command with an error but keeps its
 /// connection: the other targets still get every package, from the workers and from the
 /// sender.
@@ -997,6 +1141,8 @@ matrix!(target_silent, silent_target, 2);
 matrix!(target_stalled, stalled_target, 2);
 matrix!(target_unreachable, target_unreachable_from_start, 2);
 matrix!(wrongtype, wrongtype_target, 2);
+matrix!(push_errors_limited, push_errors_are_rate_limited, 2);
+matrix!(dropped_link_errors, a_dropped_link_is_always_logged, 2);
 matrix!(stop_target_down, stop_with_a_target_down, 4);
 matrix!(after_signal, push_after_the_signal, 2);
 matrix!(mute_target, mute_target_with_chunks, 2);

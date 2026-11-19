@@ -175,6 +175,8 @@ struct RedisLink {
     skip_noted: bool,                // the "not connected yet" line was printed (M3R-23)
     failed_last: bool,               // the sender, spreader: a reply refused in its last chunk
     held_back: bool,                 // the sender, spreader: error replies to all of its last chunk
+    push_errors: Repeated,           // error replies to its pushes, counted between lines (M3F-23)
+    push_error_text: String,         // the last of them, for the line at the thread's end
 }
 
 /// The result of a connect attempt that runs in its own short-lived thread, so a target
@@ -1880,6 +1882,7 @@ fn sender(
             }
         }
     });
+    push_errors_left(&mut clients);
     if let Some((since, held, delivered, dropped)) = flush {
         print_debug!(
             PROGRAM_NAME,
@@ -1981,6 +1984,8 @@ fn new_link(id: u16, config: &Config, client: &ClientConfig, filter: &Option<Fil
         skip_noted: false,
         failed_last: false,
         held_back: false,
+        push_errors: Repeated::default(),
+        push_error_text: String::new(),
     }
 }
 
@@ -2342,6 +2347,7 @@ fn child(
             print_debug!(PROGRAM_NAME, stderr(), COLOR_YELLOW, 0, "{}", line);
         }
     }
+    push_errors_left(&mut clients);
 
     #[cfg(feature = "debug")]
     print_debug!(PROGRAM_NAME, stdout(), COLOR_BLUE, 0, "Child {}: Ends", id);
@@ -3507,8 +3513,8 @@ fn plan(
         }
         Ok(Prepared::Not(_)) => false,
         Err(e) => {
-            push_error(client, &e);
             target_failed(client);
+            push_error(client, &e);
             if client.link.is_none() {
                 *up = Some(false);
             }
@@ -3528,8 +3534,8 @@ fn settle(
     st: &mut ChunkState,
 ) {
     if let Some(e) = error {
-        push_error(client, &e);
         target_failed(client);
+        push_error(client, &e);
     }
     st.answers[t].0 += replies.len();
     for (p, reply) in replies {
@@ -3561,8 +3567,61 @@ fn write_target(
 }
 
 /// The error line of a failed push or limits check: it names the target that failed, in
-/// the shape of the connect line (1.0.8 and 1.1.0 named the source, M3F-22)
-fn push_error(client: &RedisLink, error: &str) {
+/// the shape of the connect line (1.0.8 and 1.1.0 named the source, M3F-22). Called after
+/// target_failed(), so the link tells what the error did.
+fn push_error(client: &mut RedisLink, error: &str) {
+    if let Some(text) = push_error_at(client, error, Instant::now()) {
+        push_error_line(client, &text);
+    }
+}
+
+/// What to print for an error at `now`, if anything (M3F-23, C4R-1 = a): an error reply
+/// keeps the link and is rate-limited as the ordering warnings are (the first at once, then
+/// at most one line per REPEAT_WINDOW with the count, per thread and target); an error that
+/// dropped the link is always printed, with the count still pending, since it is the
+/// target's "down" line (S4-4) and the backoff bounds it to one per second
+fn push_error_at(client: &mut RedisLink, error: &str, now: Instant) -> Option<String> {
+    let kept = client.link.is_some();
+    limit_push_error(
+        &mut client.push_errors,
+        &mut client.push_error_text,
+        error,
+        kept,
+        now,
+    )
+}
+
+/// push_error_at()'s rule on its own state, for the unit tests
+fn limit_push_error(
+    errors: &mut Repeated,
+    last_counted: &mut String,
+    error: &str,
+    kept: bool,
+    now: Instant,
+) -> Option<String> {
+    if kept {
+        let line = errors.hit(error, now);
+        if line.is_none() {
+            // Only a counted error is left for the thread's end line
+            error.clone_into(last_counted);
+        }
+        line
+    } else {
+        Some(errors.flush(error, now))
+    }
+}
+
+/// The line of the error replies a thread counted and did not print, at its end
+fn push_errors_left(clients: &mut [RedisLink]) {
+    for client in clients.iter_mut() {
+        let text = std::mem::take(&mut client.push_error_text);
+        if let Some(line) = client.push_errors.left(&text) {
+            push_error_line(client, &line);
+        }
+    }
+}
+
+fn push_error_line(client: &RedisLink, text: &str) {
     print_debug!(
         PROGRAM_NAME,
         stderr(),
@@ -3572,7 +3631,7 @@ fn push_error(client: &RedisLink, error: &str) {
         client.config.hostname,
         client.config.port,
         client.config.channel,
-        error
+        text
     );
 }
 
@@ -3624,6 +3683,13 @@ impl Repeated {
                 Some(repeated_line(warning, std::mem::take(&mut self.more) + 1))
             }
         }
+    }
+
+    /// A line that must be printed now (it counts this one and those not printed yet);
+    /// the window starts again from it
+    fn flush(&mut self, warning: &str, now: Instant) -> String {
+        self.last = Some(now);
+        repeated_line(warning, std::mem::take(&mut self.more) + 1)
     }
 
     /// The line for those met since the last line, when the thread ends (none if none)
@@ -3685,8 +3751,8 @@ fn deliver(
                 false
             }
             Err(e) => {
-                push_error(client, &e);
                 target_failed(client);
+                push_error(client, &e);
                 why.failed = true;
                 false
             }

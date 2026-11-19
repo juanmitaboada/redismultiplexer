@@ -4020,3 +4020,78 @@ fn remove_pid_removes_the_file_and_only_warns_when_it_is_gone() {
     remove_pid(&None);
     fs::remove_dir_all(&dir).unwrap();
 }
+
+// --- the error line of a failed push, rate-limited per thread and target (M3F-23) ---
+
+#[test]
+fn push_errors_that_keep_the_link_are_limited_and_counted() {
+    let (mut r, mut last) = (Repeated::default(), String::new());
+    let t0 = Instant::now();
+    let at = |ms: u64| t0 + Duration::from_millis(ms);
+    // The first at once, alone
+    assert_eq!(
+        limit_push_error(&mut r, &mut last, "WRONGTYPE a", true, at(0)),
+        Some("WRONGTYPE a".to_string())
+    );
+    // Inside the window: counted, the last one kept for the end line
+    for (i, e) in ["WRONGTYPE b", "OOM c", "WRONGTYPE d"].iter().enumerate() {
+        assert_eq!(
+            limit_push_error(&mut r, &mut last, e, true, at(1 + i as u64)),
+            None
+        );
+    }
+    assert_eq!(last, "WRONGTYPE d");
+    // The first after the window: its own text and the count of all since the last line
+    let due = REPEAT_WINDOW.as_millis() as u64 + 1;
+    assert_eq!(
+        limit_push_error(&mut r, &mut last, "OOM e", true, at(due)),
+        Some("OOM e (4 since the last line)".to_string())
+    );
+    // Nothing counted since: no end line
+    assert_eq!(r.left(&last), None);
+    // One more inside the new window: the end line carries the last counted error
+    assert_eq!(
+        limit_push_error(&mut r, &mut last, "OOM f", true, at(due + 1)),
+        None
+    );
+    assert_eq!(
+        r.left(&last),
+        Some("OOM f (1 since the last line)".to_string())
+    );
+}
+
+#[test]
+fn a_push_error_that_drops_the_link_is_always_printed_with_the_count() {
+    let (mut r, mut last) = (Repeated::default(), String::new());
+    let t0 = Instant::now();
+    let at = |ms: u64| t0 + Duration::from_millis(ms);
+    assert!(limit_push_error(&mut r, &mut last, "WRONGTYPE a", true, at(0)).is_some());
+    assert_eq!(
+        limit_push_error(&mut r, &mut last, "WRONGTYPE b", true, at(1)),
+        None
+    );
+    assert_eq!(
+        limit_push_error(&mut r, &mut last, "WRONGTYPE c", true, at(2)),
+        None
+    );
+    // Inside the window, but the link went: printed at once, with the two pending
+    assert_eq!(
+        limit_push_error(&mut r, &mut last, "broken pipe", false, at(3)),
+        Some("broken pipe (3 since the last line)".to_string())
+    );
+    // Back, and dropped again a moment later: printed again, alone
+    assert_eq!(
+        limit_push_error(&mut r, &mut last, "connection reset", false, at(1003)),
+        Some("connection reset".to_string())
+    );
+    // The count is the link's and survives its reconnects: an error reply after them is
+    // counted in the window the last line opened
+    assert_eq!(
+        limit_push_error(&mut r, &mut last, "WRONGTYPE d", true, at(1004)),
+        None
+    );
+    assert_eq!(
+        r.left(&last),
+        Some("WRONGTYPE d (1 since the last line)".to_string())
+    );
+}
