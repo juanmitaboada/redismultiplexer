@@ -1,3 +1,30 @@
+rust-redismultiplexer (1.1.1-1) stable; urgency=medium
+
+  Log
+  * The error line of a failed push or limits check names the target that
+    failed: "Error while sending to target '<host>:<port>@<channel>':
+    <error>". 1.0.8 and 1.1.0 named the source, and repeated "error while
+    sending to the client: " inside the line
+  * A target that answers every push with an error reply no longer logs a
+    line per package: per thread and target the first line comes at once,
+    then at most one line every 10 seconds ending in "(N since the last
+    line)", and one when the thread ends. With ordering, where it was one
+    line per chunk, the same limit applies and N counts chunks. An error
+    that drops the connection is always printed: it is the target's "down"
+    line, and the backoff bounds it to one a second per thread. Counting
+    these lines no longer counts packages; their N do
+  * A server that accepts every connection and closes it is no longer
+    logged "is back" at every retry: when CLIENT SETNAME breaks a
+    connection, the one opened again without it counts only once a PING
+    on it is answered (any reply, an error reply included). As a target it
+    stays in the status file's down_targets, with one connect error line
+    per thread; as the source it logs that connect error, instead of a read
+    error, once a second per child, and pops nothing, as before
+  Tests
+  * The stand-in tests no longer depend on the machine's speed
+
+ -- Juanmi Taboada <juanmi@juanmitaboada.com>  Fri, 20 Nov 2026 00:12:40 +0100
+
 rust-redismultiplexer (1.1.0-1) stable; urgency=medium
 
   Speed
