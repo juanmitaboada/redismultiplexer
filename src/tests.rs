@@ -2640,6 +2640,9 @@ fn recording_target(answer: Answer) -> (u16, Record) {
     use std::io::{BufRead, BufReader, Read, Write};
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
+    if matches!(answer, Answer::Never) {
+        NEVER_ANSWERS.lock().unwrap().push(port);
+    }
     let record: Record = Arc::new(Mutex::new(Vec::new()));
     let rec = record.clone();
     thread::spawn(move || {
@@ -2724,7 +2727,19 @@ fn pushed_to(record: &Record) -> Vec<Vec<u8>> {
         .collect()
 }
 
-/// A configuration whose targets are the given local ports, with short timeouts
+/// The ports of the stand-ins that never answer an RPUSH: connect_before_the_run() gives
+/// their links a short read timeout once connected (M3R-57, M3F-26)
+static NEVER_ANSWERS: Mutex<Vec<u16>> = Mutex::new(Vec::new());
+
+/// The command timeout of a stand-in: far above any handshake or reply under load, so a
+/// slow machine never turns a stand-in that answers into a failing one (M3F-26)
+const STANDIN_TIMEOUT: f64 = 10.0;
+
+/// The read timeout of a stand-in that never answers, set once it is connected: the only
+/// wait it costs
+const NEVER_READ_TIMEOUT: Duration = Duration::from_millis(200);
+
+/// A configuration whose targets are the given local ports
 fn chunk_config(mode: &str, ports: &[u16]) -> Config {
     let mut c = config();
     c.mode = mode.to_string();
@@ -2735,7 +2750,7 @@ fn chunk_config(mode: &str, ports: &[u16]) -> Config {
             let mut t = client(&format!("t{i}"), &format!("dst{i}"));
             t.hostname = "127.0.0.1".into();
             t.port = port;
-            t.command_timeout = Some(0.3);
+            t.command_timeout = Some(STANDIN_TIMEOUT);
             t
         })
         .collect();
@@ -2756,6 +2771,31 @@ fn connect_before_the_run(l: &mut RedisLink) {
         );
         assert!(Instant::now() < deadline, "not connected after a minute");
         thread::sleep(Duration::from_millis(10));
+    }
+    if NEVER_ANSWERS.lock().unwrap().contains(&l.config.port) {
+        l.link
+            .as_mut()
+            .unwrap()
+            .set_read_timeout(Some(NEVER_READ_TIMEOUT))
+            .unwrap();
+    }
+}
+
+/// One chunk through the sender's path, then every target without a link kept down for
+/// the rest of the test whatever it lasts (its retry an hour ahead): a target that never
+/// answers or closes does not come back after its 1 s backoff at a place that depends on
+/// the machine's speed (M3R-56's rule for the other stand-in tests, M3F-26). A test that
+/// wants one back says so by clearing its retry time.
+fn run_chunk(
+    c: &Config,
+    links: &mut [RedisLink],
+    cursor: &mut usize,
+    chunk: &[Vec<u8>],
+    counts: &mut Counts,
+) {
+    deliver_chunk(1, &None, c, links, cursor, chunk, counts);
+    for l in links.iter_mut().filter(|l| l.link.is_none()) {
+        l.retry_at = Some(Instant::now() + Duration::from_secs(3600));
     }
 }
 
@@ -2780,7 +2820,7 @@ fn a_chunk_is_written_before_its_replies_are_read() {
     let mut links = connected_links(&c);
     let chunk = packages_n(10);
     let mut counts = Counts::default();
-    deliver_chunk(1, &None, &c, &mut links, &mut 0, &chunk, &mut counts);
+    run_chunk(&c, &mut links, &mut 0, &chunk, &mut counts);
     assert_eq!((counts.outgoing, counts.dropped), (10, 0));
     assert_eq!(
         pushed_to(&record),
@@ -2801,7 +2841,7 @@ fn spreader_plans_again_what_a_target_refused_or_never_answered() {
         let chunk = packages_n(10);
         let mut counts = Counts::default();
         let mut cursor = 0;
-        deliver_chunk(1, &None, &c, &mut links, &mut cursor, &chunk, &mut counts);
+        run_chunk(&c, &mut links, &mut cursor, &chunk, &mut counts);
         assert_eq!((counts.outgoing, counts.dropped), (10, 0));
         let mut at_good = pushed_to(&good_rec);
         at_good.sort();
@@ -2826,7 +2866,7 @@ fn replicant_counts_an_unanswered_target_failed_and_never_resends_to_it() {
     let mut links = connected_links(&c);
     let chunk = packages_n(10);
     let mut counts = Counts::default();
-    deliver_chunk(1, &None, &c, &mut links, &mut 0, &chunk, &mut counts);
+    run_chunk(&c, &mut links, &mut 0, &chunk, &mut counts);
     assert_eq!((counts.outgoing, counts.dropped), (10, 0));
     assert_eq!(pushed_to(&mute_rec), chunk, "written once, in order");
     assert!(links[0].link.is_none() && links[1].link.is_some());
@@ -2835,7 +2875,7 @@ fn replicant_counts_an_unanswered_target_failed_and_never_resends_to_it() {
     let c = chunk_config("replicant", &[mute]);
     let mut links = connected_links(&c);
     let mut counts = Counts::default();
-    deliver_chunk(1, &None, &c, &mut links, &mut 0, &chunk, &mut counts);
+    run_chunk(&c, &mut links, &mut 0, &chunk, &mut counts);
     assert_eq!(
         (counts.outgoing, counts.dropped, counts.failed),
         (0, 10, 10)
@@ -2855,7 +2895,7 @@ fn a_limits_check_reads_the_pending_requests_first() {
     let mut links = connected_links(&c);
     let chunk = packages_n(10);
     let mut counts = Counts::default();
-    deliver_chunk(1, &None, &c, &mut links, &mut 0, &chunk, &mut counts);
+    run_chunk(&c, &mut links, &mut 0, &chunk, &mut counts);
     assert_eq!(counts.outgoing, 10);
     let seq: Vec<String> = record
         .lock()
@@ -2894,7 +2934,7 @@ fn a_limits_check_that_fails_drops_the_package_as_failed() {
         let mut links = connected_links(&c);
         let chunk = packages_n(10);
         let mut counts = Counts::default();
-        deliver_chunk(1, &None, &c, &mut links, &mut 0, &chunk, &mut counts);
+        run_chunk(&c, &mut links, &mut 0, &chunk, &mut counts);
         let llens = record
             .lock()
             .unwrap()
@@ -2936,7 +2976,7 @@ fn spread_two_chunks(bad: usize, answer: Answer) -> (Vec<Vec<Vec<u8>>>, Counts) 
     let mut cursor = 0;
     for from in [0, 30] {
         let chunk = packages_from(from, 30);
-        deliver_chunk(1, &None, &c, &mut links, &mut cursor, &chunk, &mut counts);
+        run_chunk(&c, &mut links, &mut cursor, &chunk, &mut counts);
     }
     // Never twice to one target (P1 = p1b, P2 = p2a)
     let at_bad = pushed_to(&stands[bad].1);
@@ -3059,7 +3099,7 @@ fn spread_with_last(down: bool, last: impl FnOnce(&mut RedisLink)) -> (Vec<Vec<V
     let mut cursor = 0;
     for from in [0, 30] {
         let chunk = packages_from(from, 30);
-        deliver_chunk(1, &None, &c, &mut links, &mut cursor, &chunk, &mut counts);
+        run_chunk(&c, &mut links, &mut cursor, &chunk, &mut counts);
     }
     (
         stands.iter().map(|(_, rec)| pushed_to(rec)).collect(),
@@ -3109,7 +3149,7 @@ fn spreader_never_sends_a_package_twice_to_one_target() {
     let mut counts = Counts::default();
     let mut cursor = 1;
     let chunk = packages_n(30);
-    deliver_chunk(1, &None, &c, &mut links, &mut cursor, &chunk, &mut counts);
+    run_chunk(&c, &mut links, &mut cursor, &chunk, &mut counts);
     assert_eq!(
         (counts.outgoing, counts.dropped, counts.failed),
         (0, 30, 30)
@@ -3609,7 +3649,7 @@ fn spread_answers(
     let mut counts = Counts::default();
     let mut cursor = 0;
     for chunk in packages_n(chunks * size).chunks(size) {
-        deliver_chunk(1, &None, &c, &mut links, &mut cursor, chunk, &mut counts);
+        run_chunk(&c, &mut links, &mut cursor, chunk, &mut counts);
     }
     stands.iter().map(|(_, rec)| pushed_to(rec)).collect()
 }
@@ -3848,10 +3888,7 @@ fn spreader_does_not_hold_back_a_target_that_never_answered_or_closed() {
         let (good, _) = recording_target(Answer::Int);
         let (bad, _) = recording_target(answer);
         let (later, later_rec) = recording_target(Answer::Int);
-        let mut c = chunk_config("spreader", &[good, bad, good]);
-        for t in c.clients.iter_mut() {
-            t.command_timeout = Some(0.2);
-        }
+        let c = chunk_config("spreader", &[good, bad, good]);
         let mut links: Vec<RedisLink> = c
             .clients
             .iter()
@@ -3863,9 +3900,7 @@ fn spreader_does_not_hold_back_a_target_that_never_answered_or_closed() {
         let (mut counts, mut cursor) = (Counts::default(), 0);
         let packages = packages_n(3 * SHARE_CHUNK);
         let mut chunks = packages.chunks(SHARE_CHUNK);
-        deliver_chunk(
-            1,
-            &None,
+        run_chunk(
             &c,
             &mut links,
             &mut cursor,
@@ -3879,9 +3914,9 @@ fn spreader_does_not_hold_back_a_target_that_never_answered_or_closed() {
         back.port = later;
         links[1].endpoint = new_link(1, &c, &back, &None).endpoint;
         links[1].retry_at = None;
-        assert!(ensure_link(1, &mut links[1]), "not connected again");
+        connect_before_the_run(&mut links[1]);
         for chunk in chunks {
-            deliver_chunk(1, &None, &c, &mut links, &mut cursor, chunk, &mut counts);
+            run_chunk(&c, &mut links, &mut cursor, chunk, &mut counts);
         }
         let got = pushed_to(&later_rec).len();
         assert!(
