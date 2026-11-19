@@ -4162,3 +4162,42 @@ fn a_fallback_link_counts_once_its_ping_is_answered() {
         );
     }
 }
+
+#[test]
+fn a_package_only_the_held_back_target_takes_is_tried_there() {
+    // M3R-58: t0 answers errors to every package of the first chunk, so it is held back in
+    // the second; t1's filter takes only the even packages. An odd package of the second
+    // chunk is wanted by no target that is not held back: it is tried on t0 (as 1.0.8
+    // would), which now takes it. The differential has no such case (the review found the
+    // mutant caught only by a status test of the suite).
+    let size = 10;
+    let sent = spread_answers(
+        &[Answer::ErrorIn(0, size), Answer::Int],
+        &[None, Some("[02468]$")],
+        2,
+        size,
+    );
+    let second: Vec<Vec<u8>> = packages_n(2 * size).split_off(size);
+    let (odd, even): (Vec<Vec<u8>>, Vec<Vec<u8>>) = second
+        .into_iter()
+        .partition(|p| (p.last().unwrap() - b'0') % 2 == 1);
+    for p in &odd {
+        assert!(
+            sent[0].contains(p),
+            "{} not tried on the held-back target: {:?}",
+            String::from_utf8_lossy(p),
+            sent[0]
+                .iter()
+                .map(|p| String::from_utf8_lossy(p))
+                .collect::<Vec<_>>()
+        );
+    }
+    // The even ones go to t1 as the rotation gives them, never to both
+    for p in &even {
+        assert!(
+            sent[1].contains(p) != sent[0].contains(p),
+            "{}",
+            String::from_utf8_lossy(p)
+        );
+    }
+}
