@@ -3845,7 +3845,11 @@ fn hold_back_beside(roles: [Fails; 3]) -> usize {
     let pool = shares_pool(TARGETS);
     // A target fixed at package 80 (the second chunk) comes back to its share up to one
     // chunk later (declared): compared from the fourth chunk
-    let settled = if roles[0] == Fails::ErrorsFirst { 3 } else { 2 } * SHARE_CHUNK;
+    let settled = if roles.contains(&Fails::ErrorsFirst) {
+        3
+    } else {
+        2
+    } * SHARE_CHUNK;
     let mut cases = 0;
     for at in 0..TARGETS {
         let others: Vec<usize> = (1..TARGETS).map(|k| (at + k) % TARGETS).collect();
@@ -3867,14 +3871,16 @@ fn hold_back_beside(roles: [Fails; 3]) -> usize {
                     );
                 }
             }
-            // A target held back for good gets one probe per chunk from the second on
-            if roles[0] == Fails::Errors {
+            // A target held back for good gets one probe per chunk from the second on, also
+            // when others are held back beside it (M3F-29: the probe refused by one is
+            // offered to the next, as 1.0.8 offers it)
+            for &(b, _) in bads.iter().filter(|&&(_, k)| k == Fails::Errors) {
                 for ch in 1..SHARE_PACKAGES / SHARE_CHUNK {
-                    let probes = new[at]
+                    let probes = new[b]
                         .iter()
                         .filter(|p| number(p) / SHARE_CHUNK == ch)
                         .count();
-                    assert_eq!(probes, 1, "probes in chunk {ch}: {what}");
+                    assert_eq!(probes, 1, "target {b}, probes in chunk {ch}: {what}");
                 }
             }
             let refusing = |t: usize| {
@@ -3918,6 +3924,89 @@ fn spreader_release_beside_a_stuck_and_a_silent_target() {
 fn spreader_hold_back_beside_a_down_and_a_stuck_target() {
     let n = hold_back_beside([Fails::Errors, Fails::Down, Fails::Stuck]);
     eprintln!("\nhold-back beside down and stuck: {n} cases");
+}
+
+#[test]
+fn spreader_hold_back_two_refusing_targets_side_by_side() {
+    // M3F-29: each of two held-back targets next to each other meets a probe in every
+    // chunk (one package, offered to the second once the first refused it)
+    let n = hold_back_beside([Fails::Errors, Fails::Errors, Fails::Down]);
+    eprintln!("\nhold-back of two side by side: {n} cases");
+}
+
+#[test]
+fn spreader_release_beside_a_held_back_target() {
+    // M3F-29: a target fixed while the one before it keeps refusing comes back to its
+    // share, as the old rule gives it, at most one chunk late
+    let n = hold_back_beside([Fails::Errors, Fails::ErrorsFirst, Fails::Stuck]);
+    eprintln!("\nrelease beside a held-back target: {n} cases");
+}
+
+#[test]
+fn spreader_hold_back_three_refusing_targets_in_a_row() {
+    // M3F-29, R1: a chain of three held-back targets, each its probe per chunk
+    let n = hold_back_beside([Fails::Errors, Fails::Errors, Fails::Errors]);
+    eprintln!("\nhold-back of three in a row: {n} cases");
+}
+
+#[test]
+fn spreader_hold_back_two_refusing_targets_around_a_stuck_one() {
+    // M3F-29, R1: a stuck target between them takes nothing: the chain passes over it
+    let n = hold_back_beside([Fails::Errors, Fails::Stuck, Fails::Errors]);
+    eprintln!("\nhold-back around a stuck target: {n} cases");
+}
+
+#[test]
+fn spreader_hold_back_two_refusing_targets_around_a_down_one() {
+    // M3F-29, R1: the same with a target down between them
+    let n = hold_back_beside([Fails::Errors, Fails::Down, Fails::Errors]);
+    eprintln!("\nhold-back around a down target: {n} cases");
+}
+
+#[test]
+fn spreader_hold_back_two_refusing_targets_around_a_filtered_one() {
+    // M3F-29, R1: the same with a target between them whose filter takes nothing; each
+    // refusing target meets one package per chunk from the second on
+    let got = spread_answers(
+        &[Answer::Error, Answer::Int, Answer::Error, Answer::Int],
+        &[None, Some("^none$"), None, None],
+        6,
+        30,
+    );
+    assert!(got[1].is_empty(), "the filtered target took packages");
+    for t in [0, 2] {
+        for ch in 1..6 {
+            let probes = got[t].iter().filter(|p| number(p) / 30 == ch).count();
+            assert_eq!(probes, 1, "target {t}, probes in chunk {ch}");
+        }
+    }
+}
+
+#[test]
+fn spreader_with_every_target_held_back_offers_each_package_once_to_each() {
+    // M3F-29, R1: nobody to give a probe back to (M3R-58's arm): every package is tried
+    // by the refusing targets, never twice by one, and none is lost unaccounted
+    let got = spread_answers(
+        &[Answer::Error, Answer::Error, Answer::Error],
+        &[None; 3],
+        4,
+        30,
+    );
+    let mut seen = vec![0; 120];
+    for list in &got {
+        let mut mine: Vec<usize> = list.iter().map(|p| number(p)).collect();
+        let len = mine.len();
+        mine.sort_unstable();
+        mine.dedup();
+        assert_eq!(mine.len(), len, "a package twice to one target");
+        for n in mine {
+            seen[n] += 1;
+        }
+    }
+    assert!(
+        seen.iter().all(|&k| k >= 1),
+        "a package offered to no target"
+    );
 }
 
 #[test]

@@ -3311,8 +3311,10 @@ fn spread_chunk(
         };
     }
     let held: Vec<bool> = clients.iter().map(|c| c.held_back).collect();
-    // Per held-back target: the last package the rotation offered it, and who took it
-    let mut offered: Vec<Option<(usize, Option<usize>)>> = vec![None; targets];
+    // Per held-back target: the last package the rotation offered it, who took it, and
+    // the first held-back target it was offered to (M3F-29: two held-back targets next to
+    // each other are offered the same packages, so their last one is the same)
+    let mut offered: Vec<Option<(usize, Option<usize>, usize)>> = vec![None; targets];
     let mut passed: Vec<usize> = Vec::new();
     for &p in todo {
         passed.clear();
@@ -3343,15 +3345,20 @@ fn spread_chunk(
             }
         }
         for &t in &passed {
-            offered[t] = Some((p, got));
+            offered[t] = Some((p, got, passed[0]));
         }
     }
     // The probes: taken back from the target that got the package, not written yet
     let mut probes: Vec<Option<(usize, usize, Vec<u8>)>> = vec![None; targets];
     for t in 0..targets {
-        let Some((p, Some(u))) = offered[t] else {
+        // One probe per package: the first held-back target it was offered to takes it;
+        // the others offered the same get it in turn if it is refused (the chain below)
+        let Some((p, Some(u), first)) = offered[t] else {
             continue;
         };
+        if first != t {
+            continue;
+        }
         let Some(request) = take_request(&mut clients[u], p) else {
             continue;
         };
@@ -3385,7 +3392,29 @@ fn spread_chunk(
             let mut refused = std::mem::take(&mut st.replan);
             refused.sort_unstable();
             for (p, from) in refused {
-                // A refused probe goes back to the target it was taken from
+                // A refused probe goes to the next held-back target it was offered to, as
+                // 1.0.8 would offer it (M3F-29), then back to the target it was taken from
+                if probes[from].as_ref().is_some_and(|(q, _, _)| *q == p) {
+                    let next = (1..targets).map(|k| (from + k) % targets).find(|&h| {
+                        probes[h].is_none()
+                            && !st.tried[p * targets + h]
+                            && matches!(offered[h], Some((q, Some(_), first)) if q == p && first != h)
+                    });
+                    if let Some(h) = next {
+                        // The next one is written after this one in the same pass, before
+                        // the target the probe was taken from (plan 19.5; asserted in debug
+                        // builds, R2)
+                        debug_assert!(
+                            order.iter().position(|&x| x == h)
+                                > order.iter().position(|&x| x == from),
+                            "probe chain: target {h} written before target {from}"
+                        );
+                        if plan_at!(h, p) {
+                            probes[h] = probes[from].take();
+                            continue;
+                        }
+                    }
+                }
                 if let Some((q, u, request)) = probes[from]
                     .take_if(|(q, u, _)| *q == p && st.written[*u].is_none_or(|w| w < p))
                 {
