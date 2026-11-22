@@ -4098,6 +4098,39 @@ fn push_errors_that_keep_the_link_are_limited_and_counted() {
 }
 
 #[test]
+fn a_dropped_link_line_starts_the_window_again() {
+    // M3R-61 (mutant 7): the line of a dropped link opens a new window, so an error reply
+    // inside that window, even past the end of the first one, is counted, not printed
+    let (mut r, mut last) = (Repeated::default(), String::new());
+    let t0 = Instant::now();
+    let at = |ms: u64| t0 + Duration::from_millis(ms);
+    let window = REPEAT_WINDOW.as_millis() as u64;
+    assert!(limit_push_error(&mut r, &mut last, "WRONGTYPE a", true, at(0)).is_some());
+    // The link drops at 0.9 of the first window: printed, and the window starts there
+    let drop_at = window * 9 / 10;
+    assert_eq!(
+        limit_push_error(&mut r, &mut last, "broken pipe", false, at(drop_at)),
+        Some("broken pipe".to_string())
+    );
+    // Past the first window, inside the new one: counted
+    assert_eq!(
+        limit_push_error(
+            &mut r,
+            &mut last,
+            "WRONGTYPE b",
+            true,
+            at(window + window / 20)
+        ),
+        None
+    );
+    // Past the new window: printed with its count
+    assert_eq!(
+        limit_push_error(&mut r, &mut last, "WRONGTYPE c", true, at(drop_at + window)),
+        Some("WRONGTYPE c (2 since the last line)".to_string())
+    );
+}
+
+#[test]
 fn a_push_error_that_drops_the_link_is_always_printed_with_the_count() {
     let (mut r, mut last) = (Repeated::default(), String::new());
     let t0 = Instant::now();
