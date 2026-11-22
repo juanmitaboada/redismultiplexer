@@ -20,10 +20,15 @@ rust-redismultiplexer (1.1.1-1) stable; urgency=medium
     stays in the status file's down_targets, with one connect error line
     per thread; as the source it logs that connect error, instead of a read
     error, once a second per child, and pops nothing, as before
+  * A target behind a server or proxy that closes the connection on both
+    CLIENT SETNAME and PING no longer connects, even if it would take the
+    pushes: 1.1.0 delivered to it while packages flowed. It is reported
+    once per thread and stays in down_targets; no configuration key
+    avoids it
   Tests
   * The stand-in tests no longer depend on the machine's speed
 
- -- Juanmi Taboada <juanmi@juanmitaboada.com>  Fri, 20 Nov 2026 00:12:40 +0100
+ -- Juanmi Taboada <juanmi@juanmitaboada.com>  Sun, 22 Nov 2026 11:58:49 +0100
 
 rust-redismultiplexer (1.1.0-1) stable; urgency=medium
 
