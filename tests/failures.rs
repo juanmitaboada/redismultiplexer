@@ -6,6 +6,8 @@
 mod common;
 
 use common::*;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -23,6 +25,28 @@ fn feed(ctx: &Ctx, src: &str, n: u64) -> thread::JoinHandle<()> {
             let _: usize = redis::Commands::rpush(&mut con, &src, batch).unwrap();
             thread::sleep(Duration::from_millis(50));
         }
+    })
+}
+
+/// Feeds `src` with packages in batches of 50, one batch every 50 ms, until `stop` is set
+/// (at most `cap` packages); returns how many it pushed. A test that must see a target
+/// fail while packages flow sets `stop` once it has seen what it waits for, so the feed
+/// never ends first however slow the machine is (M3R-61)
+fn feed_until(ctx: &Ctx, src: &str, stop: Arc<AtomicBool>, cap: u64) -> thread::JoinHandle<u64> {
+    let (url, src) = (ctx.ep.url.clone(), src.to_string());
+    thread::spawn(move || {
+        let mut con = redis::Client::open(url.as_str())
+            .unwrap()
+            .get_connection()
+            .unwrap();
+        let mut start = 0;
+        while !stop.load(Ordering::Relaxed) && start < cap {
+            let batch: Vec<String> = (start..(start + 50).min(cap)).map(seq_pkg).collect();
+            let _: usize = redis::Commands::rpush(&mut con, &src, batch).unwrap();
+            start = (start + 50).min(cap);
+            thread::sleep(Duration::from_millis(50));
+        }
+        start
     })
 }
 
@@ -319,8 +343,9 @@ fn closing_source_pops_nothing() {
 /// An error that drops a target's link is its "down" line and is never held back by the
 /// limit (C4R-1 = a): a target whose connections are killed twice, the second time a
 /// moment after it came back (well inside the 10 s window), logs an error line for each
-/// thread that pushes to it each time, and without ordering every "is back" comes after
-/// its error line. Only counts and order are read, no time.
+/// thread that pushes to it each time, and every "is back" comes after its error line,
+/// with ordering too. The feed lasts until both kills were met. Only counts and order are
+/// read, no time.
 fn a_dropped_link_is_always_logged(test: &str, cell: Cell) {
     let mut ctx = Ctx::new(test);
     let src = ctx.key("src");
@@ -330,8 +355,10 @@ fn a_dropped_link_is_always_logged(test: &str, cell: Cell) {
     let clients: Vec<String> = keys.iter().map(|k| ctx.client_yaml(k, k, "")).collect();
     let cfg = ctx.config(&src, cell.children, cell.mode(), cell.extra(), &clients);
     let mut p = ctx.spawn(&cfg);
-    let n = 10000;
-    let feeder = feed(&ctx, &src, n);
+    // Fed until both kills have been met and the target is back: the cap is only a
+    // guard (200000 packages are 200 s of feed)
+    let stop = Arc::new(AtomicBool::new(false));
+    let feeder = feed_until(&ctx, &src, stop.clone(), 200_000);
     let t0 = keys[0].clone();
     let backs = |p: &Proc| {
         p.stderr()
@@ -350,7 +377,12 @@ fn a_dropped_link_is_always_logged(test: &str, cell: Cell) {
         kill_connections(&mut ctx, &t0);
         ctx.wait_for("t0 back", |_| backs(&p) >= round * delivering);
     }
-    feeder.join().unwrap();
+    stop.store(true, Ordering::Relaxed);
+    let fed = feeder.join().unwrap();
+    assert!(
+        fed < 200_000,
+        "the feed reached its cap before both kills were met"
+    );
     ctx.wait_for("the source drained", |c| c.llen(&src) == 0);
     p.stop(&ctx.pid_file());
     let stderr = p.stderr();
@@ -364,7 +396,9 @@ fn a_dropped_link_is_always_logged(test: &str, cell: Cell) {
         delivering,
         stderr
     );
-    if !cell.ordering {
+    // Every "is back" has its error line before it, with ordering too (M3R-61): a dropped
+    // link's line is never held for the window
+    {
         let (mut e, mut b) = (0, 0);
         for l in stderr.lines() {
             if is_error(l) {
@@ -384,8 +418,9 @@ fn a_dropped_link_is_always_logged(test: &str, cell: Cell) {
 /// Two targets that answer every push with an error reply (their keys are not lists) are
 /// logged with a limit (M3F-23), each on its own (the key is the thread and the target):
 /// per thread, the first error at once, then at most one line per 10 s with the count, and
-/// one at the thread's end; the counts add up to the errors. Bounded by the run's own
-/// length, not by the clock.
+/// one at the thread's end; the counts add up to the errors (with ordering, to at least
+/// one per chunk, which the sender's end line completes). Bounded by the run's own length
+/// and the chunk's size, not by the clock.
 fn push_errors_are_rate_limited(test: &str, cell: Cell) {
     let mut ctx = Ctx::new(test);
     let src = ctx.key("src");
@@ -435,8 +470,22 @@ fn push_errors_are_rate_limited(test: &str, cell: Cell) {
         if !cell.ordering && !cell.spreader {
             // One error per package: the lines' counts add up to every package
             assert_eq!(events, n, "{}: {}", key, p.stderr());
+        } else if cell.ordering {
+            // The sender counts a flush once, and a chunk holds at most CHUNK_PACKAGES
+            // (1000): each refusing target meets at least n / 1000 flushes (a held-back
+            // one still gets its probe in each), so with the sender's end line the counts
+            // add up to at least that (M3R-61)
+            let least = n.div_ceil(1000);
+            assert!(
+                events >= least && events <= n,
+                "{}: {} events, at least {}: {}",
+                key,
+                events,
+                least,
+                p.stderr()
+            );
         } else {
-            // Spreader passes a refusing target over, the sender counts a flush once
+            // Spreader passes a refusing target over
             assert!(events >= 1 && events <= n, "{}: {} events", key, events);
         }
     }
