@@ -2772,7 +2772,9 @@ fn connect_before_the_run(l: &mut RedisLink) {
         assert!(Instant::now() < deadline, "not connected after a minute");
         thread::sleep(Duration::from_millis(10));
     }
-    if NEVER_ANSWERS.lock().unwrap().contains(&l.config.port) {
+    // By the port the link connected to, not its configuration's: a test that moves a link
+    // to another stand-in keeps the configuration (M3R-60)
+    if NEVER_ANSWERS.lock().unwrap().contains(&l.endpoint.port) {
         l.link
             .as_mut()
             .unwrap()
