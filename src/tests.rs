@@ -2632,7 +2632,34 @@ enum Answer {
     ErrorIn(usize, usize),
 }
 
-type Record = Arc<Mutex<Vec<(String, Vec<u8>)>>>;
+/// What a recording stand-in got, held by its test. The stand-in lives as long as a
+/// handle does: once the test drops the last one its listener closes, and each of its
+/// connections ends when its client closes. Before, no stand-in ever closed, so a test
+/// process only gathered sockets and ran out of file descriptors at the common soft
+/// limit of 1024 with 12 test threads
+#[derive(Clone)]
+struct Record(Arc<Recorded>);
+
+struct Recorded {
+    commands: Mutex<Vec<(String, Vec<u8>)>>,
+    port: u16,
+}
+
+impl std::ops::Deref for Record {
+    type Target = Mutex<Vec<(String, Vec<u8>)>>;
+    fn deref(&self) -> &Self::Target {
+        &self.0.commands
+    }
+}
+
+impl Drop for Recorded {
+    fn drop(&mut self) {
+        // A port taken again by a later stand-in must not keep the short read timeout
+        NEVER_ANSWERS.lock().unwrap().retain(|&p| p != self.port);
+        // Wakes the accept loop, which finds no handle left and closes the listener
+        let _ = std::net::TcpStream::connect(("127.0.0.1", self.port));
+    }
+}
 
 /// A stand-in target that records every command (name, last argument) in arrival order;
 /// +OK to anything but RPUSH and LLEN (0)
@@ -2643,11 +2670,18 @@ fn recording_target(answer: Answer) -> (u16, Record) {
     if matches!(answer, Answer::Never) {
         NEVER_ANSWERS.lock().unwrap().push(port);
     }
-    let record: Record = Arc::new(Mutex::new(Vec::new()));
-    let rec = record.clone();
+    let record = Record(Arc::new(Recorded {
+        commands: Mutex::new(Vec::new()),
+        port,
+    }));
+    let weak = Arc::downgrade(&record.0);
     thread::spawn(move || {
         for stream in listener.incoming().flatten() {
-            let rec = rec.clone();
+            // The test dropped its last handle: no client of it is left to serve
+            if weak.strong_count() == 0 {
+                return;
+            }
+            let rec = weak.clone();
             // Each reply is its own write: without this a pipelined chunk waits on the
             // client's delayed ACK at every reply after the first
             let _ = stream.set_nodelay(true);
@@ -2674,9 +2708,14 @@ fn recording_target(answer: Answer) -> (u16, Record) {
                         args.push(buf);
                     }
                     let cmd = String::from_utf8_lossy(&args[0]).to_ascii_uppercase();
-                    rec.lock()
+                    let Some(rec) = rec.upgrade() else {
+                        return;
+                    };
+                    rec.commands
+                        .lock()
                         .unwrap()
                         .push((cmd.clone(), args.last().unwrap().clone()));
+                    drop(rec);
                     let reply = match (cmd.as_str(), answer) {
                         ("LLEN", Answer::LlenError) => "-ERR no length\r\n".to_string(),
                         ("LLEN", Answer::Full) => ":1000000\r\n".to_string(),
@@ -2863,7 +2902,7 @@ fn replicant_counts_an_unanswered_target_failed_and_never_resends_to_it() {
     // P1 = p1b, replicant: the other target takes every package (outgoing); the one whose
     // replies never came is not sent them again; its link is dropped
     let (mute, mute_rec) = recording_target(Answer::Never);
-    let (good, _) = recording_target(Answer::Int);
+    let (good, _good_rec) = recording_target(Answer::Int);
     let c = chunk_config("replicant", &[mute, good]);
     let mut links = connected_links(&c);
     let chunk = packages_n(10);
@@ -2873,7 +2912,7 @@ fn replicant_counts_an_unanswered_target_failed_and_never_resends_to_it() {
     assert_eq!(pushed_to(&mute_rec), chunk, "written once, in order");
     assert!(links[0].link.is_none() && links[1].link.is_some());
     // Every package lost on the only target: dropped as failed, once each
-    let (mute, _) = recording_target(Answer::Never);
+    let (mute, _mute_rec) = recording_target(Answer::Never);
     let c = chunk_config("replicant", &[mute]);
     let mut links = connected_links(&c);
     let mut counts = Counts::default();
@@ -3887,8 +3926,8 @@ fn spreader_does_not_hold_back_a_target_that_never_answered_or_closed() {
     // link kept is held back. One that never answered (or whose link went) is down, not
     // held back: when it comes back it gets its share, not one probe per chunk
     for answer in [Answer::Never, Answer::Close] {
-        let (good, _) = recording_target(Answer::Int);
-        let (bad, _) = recording_target(answer);
+        let (good, _good_rec) = recording_target(Answer::Int);
+        let (bad, _bad_rec) = recording_target(answer);
         let (later, later_rec) = recording_target(Answer::Int);
         let c = chunk_config("spreader", &[good, bad, good]);
         let mut links: Vec<RedisLink> = c
