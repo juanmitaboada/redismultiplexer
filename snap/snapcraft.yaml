@@ -1,6 +1,6 @@
 name: redismultiplexer
 base: core26
-version: '1.1.1'
+version: '1.1.2'
 summary: A flexible Redis queue manager
 description: |
   RedisMultiplexer will take care of your queues in Redis.

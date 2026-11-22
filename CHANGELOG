@@ -1,3 +1,20 @@
+rust-redismultiplexer (1.1.2-1) stable; urgency=medium
+
+  Spreader with ordering
+  * A target that answers errors to every package is offered one package
+    per chunk again when it comes after another such target in the turn,
+    also with a filtered, stuck or down target between them: it was
+    offered none, so once fixed it got nothing for as long as the first
+    kept refusing (1.1.0, 1.1.1). The package the first refuses is now
+    offered to the next one, as 1.0.8 does. Nothing was lost: the
+    packages it did not get went to the other targets
+  Tests
+  * A stand-in moved to another port in a test keeps its own read timeout;
+    the order and the counts of the push error lines are pinned with
+    ordering too
+
+ -- Juanmi Taboada <juanmi@juanmitaboada.com>  Sun, 22 Nov 2026 18:15:24 +0100
+
 rust-redismultiplexer (1.1.1-1) stable; urgency=medium
 
   Log
