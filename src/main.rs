@@ -3401,14 +3401,10 @@ fn spread_chunk(
                             && matches!(offered[h], Some((q, Some(_), first)) if q == p && first != h)
                     });
                     if let Some(h) = next {
-                        // The next one is written after this one in the same pass, before
-                        // the target the probe was taken from (plan 19.5; asserted in debug
-                        // builds, R2)
-                        debug_assert!(
-                            order.iter().position(|&x| x == h)
-                                > order.iter().position(|&x| x == from),
-                            "probe chain: target {h} written before target {from}"
-                        );
+                        // Written after this one in this pass when the turn allows it;
+                        // when a chunk started between them (a target there took some of
+                        // its packages) it was written already, and the probe goes out
+                        // one pass later (M3R-62)
                         if plan_at!(h, p) {
                             probes[h] = probes[from].take();
                             continue;

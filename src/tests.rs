@@ -4009,6 +4009,47 @@ fn spreader_with_every_target_held_back_offers_each_package_once_to_each() {
     );
 }
 
+/// The chunked run against the old rule for one case (the review's generated cases):
+/// the same counts, the same packages delivered by the targets that do not refuse
+/// everything (the shares may differ in a chunk with a refusal), nothing twice on any
+/// target
+fn chunked_as_the_old_rule(filters: &[Option<&'static str>], bads: &[(usize, Fails)]) {
+    let pool = shares_pool(filters.len());
+    let old = shares_run_with(&pool, filters, bads, false);
+    let new = shares_run_with(&pool, filters, bads, true);
+    assert_eq!(
+        (new.1.outgoing, new.1.dropped),
+        (old.1.outgoing, old.1.dropped),
+        "counts (outgoing, dropped)"
+    );
+    let mut seen_old = std::collections::BTreeSet::new();
+    let mut seen_new = std::collections::BTreeSet::new();
+    for t in 0..filters.len() {
+        let mut mine: Vec<usize> = new.0[t].iter().map(|p| number(p)).collect();
+        let len = mine.len();
+        mine.sort_unstable();
+        mine.dedup();
+        assert_eq!(mine.len(), len, "a package twice to target {t}");
+        if !bads.iter().any(|&(b, k)| b == t && k == Fails::Errors) {
+            seen_new.extend(mine);
+            seen_old.extend(old.0[t].iter().map(|p| number(p)));
+        }
+    }
+    assert_eq!(seen_new, seen_old, "packages delivered");
+}
+
+#[test]
+fn spreader_chain_with_a_taking_target_between_two_refusing_ones() {
+    // M3R-62: the target between the two refusing ones takes some packages (its filter),
+    // so a chunk can start between them and the second of the chain is written before
+    // the first: its probe goes out one pass later. A debug build stopped there at an
+    // assertion of the write order
+    chunked_as_the_old_rule(
+        &[Some("[02468]$"), Some("[0369]$"), None, None],
+        &[(0, Fails::Errors), (2, Fails::Errors)],
+    );
+}
+
 #[test]
 fn spreader_does_not_hold_back_a_target_that_never_answered_or_closed() {
     // M3R-47, mutant 7: only a target that answered errors to all of its chunk with its
