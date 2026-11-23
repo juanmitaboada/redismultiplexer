@@ -3411,9 +3411,11 @@ fn spread_chunk(
                         }
                     }
                 }
-                if let Some((q, u, request)) = probes[from]
-                    .take_if(|(q, u, _)| *q == p && st.written[*u].is_none_or(|w| w < p))
-                {
+                // Back to the target it was taken from, also when that target already wrote
+                // later packages of the chunk: then in the next pass, after them. It never
+                // had it, and nothing else can take it there: the carry skips every target
+                // tried for it, that one included (M3R-63)
+                if let Some((q, u, request)) = probes[from].take_if(|(q, _, _)| *q == p) {
                     put_request(&mut clients[u], q, &request);
                     st.planned[q * targets + u] = true;
                     continue;

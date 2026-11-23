@@ -4051,6 +4051,19 @@ fn spreader_chain_with_a_taking_target_between_two_refusing_ones() {
 }
 
 #[test]
+fn spreader_gives_a_refused_probe_back_after_later_packages() {
+    // M3R-63, the review's trace: the probe of the last target (it refuses everything) is
+    // taken from the third, which refuses the packages below 80 and so is written first
+    // in the turn; when the last refuses it, the third has already written later
+    // packages. It went nowhere (package 145, counted failed); it goes back to the third,
+    // after them, as the old rule gives it there
+    chunked_as_the_old_rule(
+        &[Some("[02468]$"), Some("[0369]$"), None, Some("[13579]$")],
+        &[(3, Fails::Errors), (2, Fails::ErrorsFirst)],
+    );
+}
+
+#[test]
 fn spreader_does_not_hold_back_a_target_that_never_answered_or_closed() {
     // M3R-47, mutant 7: only a target that answered errors to all of its chunk with its
     // link kept is held back. One that never answered (or whose link went) is down, not
