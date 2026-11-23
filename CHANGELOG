@@ -8,12 +8,22 @@ rust-redismultiplexer (1.1.2-1) stable; urgency=medium
     kept refusing (1.1.0, 1.1.1). The package the first refuses is now
     offered to the next one, as 1.0.8 does. Nothing was lost: the
     packages it did not get went to the other targets
+  * A package that a held-back target refused as its probe is no longer
+    dropped when the target it was taken from had already written later
+    packages of the chunk: it goes back to that target, after them (1.1.0,
+    1.1.1: with a target that refuses part of every chunk beside a
+    held-back one, up to one package a chunk was lost and counted failed).
+    The order at that target then breaks once a chunk while this lasts, by
+    that one package
+  * A debug build no longer stops at an assertion of the probe chain when
+    a target between two held-back ones takes packages (release builds
+    were not affected)
   Tests
   * A stand-in moved to another port in a test keeps its own read timeout;
     the order and the counts of the push error lines are pinned with
     ordering too
 
- -- Juanmi Taboada <juanmi@juanmitaboada.com>  Sun, 22 Nov 2026 18:15:24 +0100
+ -- Juanmi Taboada <juanmi@juanmitaboada.com>  Mon, 23 Nov 2026 16:48:27 +0100
 
 rust-redismultiplexer (1.1.1-1) stable; urgency=medium
 
